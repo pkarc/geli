@@ -1,0 +1,5 @@
+/target
+
+# Per-directory workspace binding. Local to each machine: it names a workspace
+# from ~/.config/geli/workspaces/, which differs per developer.
+.geli.json
