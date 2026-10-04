@@ -162,8 +162,11 @@ your Claude plan:
 geli claude
 ```
 
-Only that one file is copied. The rest of `~/.claude` — conversation transcripts, prompt history,
-file snapshots across every project you have worked on — stays on the host.
+Alongside it geli seeds the agent's first-run state — machine and user ids, the config migration
+version, your cached account profile — so each session does not come up as a brand-new install.
+
+Nothing else is copied. Conversation transcripts, prompt history and file snapshots across every
+project you have worked on stay on the host.
 
 Use an API key instead by exporting one; it takes precedence over the copied credentials, and
 bills API credits rather than your plan:
