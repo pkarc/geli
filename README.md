@@ -29,6 +29,8 @@ Early. It works, with caveats worth knowing before you rely on it:
 - **Network is open.** The guest has unrestricted outbound access. This is a deliberate choice
   for now, not an oversight — see [Security notes](#security-notes).
 - **The agent version is frozen into the image.** Rebuild with `geli --build-image` to update it.
+- **`geli claude` needs `ANTHROPIC_API_KEY`.** Host OAuth credentials are not forwarded — see
+  [Authentication](#authentication).
 
 ## Requirements
 
@@ -145,6 +147,25 @@ sessions.
 | `OPENAI_API_KEY` | Forwarded into the guest. |
 | `GELI_KEEP=1` | Keep the session disk and cloud-init files on exit, for debugging. |
 
+## Authentication
+
+The sandbox is a fresh machine with no Claude state, so the agent inside it needs credentials
+passed in:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+geli claude
+```
+
+**If you normally sign in to Claude Code with your Anthropic account, that is not enough on its
+own.** Those OAuth credentials live in `~/.claude/.credentials.json` on your host, and geli does
+not forward them — handing an agent your account credentials is a bigger grant than handing it a
+scoped API key, and the whole point of the sandbox is to narrow what the agent gets.
+
+Without a key, `claude` starts its first-run login flow inside the VM and waits for input that
+never arrives, so the session looks like it has hung. geli checks for this before booting and
+warns you rather than letting you wait for it.
+
 ## Security notes
 
 The VM boundary protects your host filesystem. It does not protect everything, and the gaps are
@@ -154,7 +175,8 @@ worth stating plainly:
   given can do so. Restricting egress to an allowlist is planned; today the only reason it is open
   is that `apt` and `npm` run on every boot.
 - **Your API keys are handed to the agent.** They are written into the guest environment, because
-  the agent needs them. The sandbox does not protect the credential, only the host.
+  the agent needs them. The sandbox does not protect the credential, only the host. Your host
+  `~/.claude` OAuth credentials are deliberately *not* forwarded.
 - **Only the directories in the workspace are visible.** Everything else on your machine is not
   reachable from inside.
 

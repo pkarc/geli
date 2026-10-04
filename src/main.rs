@@ -357,6 +357,40 @@ fn build_mount_script(dirs: &[PathBuf], current_canonical: &Path) -> MountPlan {
     }
 }
 
+/// True if the command's first word is the agent, however it is pathed.
+fn command_invokes_claude(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .next()
+        .map(|word| word.rsplit('/').next().unwrap_or(word) == "claude")
+        .unwrap_or(false)
+}
+
+/// Warning shown *before* booting, so a doomed run costs a few seconds rather than a full boot
+/// followed by a console that sits there silently.
+///
+/// geli deliberately does not forward the host's `~/.claude` OAuth credentials into the sandbox,
+/// so an agent with no API key reaches its first-run login flow and waits for input that never
+/// arrives — which looks exactly like a hang.
+fn credential_warning(command: &str, has_credentials: bool) -> Option<String> {
+    if has_credentials {
+        return None;
+    }
+
+    if command_invokes_claude(command) {
+        Some(
+            "[!] No ANTHROPIC_API_KEY is set.\n\
+             \x20   geli does not forward your host's ~/.claude credentials into the sandbox, so\n\
+             \x20   `claude` will stop at its first-run login flow and wait for input that never\n\
+             \x20   arrives. The session will look like it has hung.\n\
+             \x20   Export ANTHROPIC_API_KEY before running geli."
+                .to_string(),
+        )
+    } else {
+        Some("[!] No ANTHROPIC_API_KEY or OPENAI_API_KEY set; the sandbox will have no API credentials.".to_string())
+    }
+}
+
 fn build_env_exports(vars: &[(&str, String)]) -> String {
     vars.iter()
         .map(|(key, value)| format!("export {}={}", key, shell_quote(value)))
@@ -412,7 +446,14 @@ runcmd:
 
 /// cloud-config for one sandbox session. Installs nothing: the golden image already has it.
 fn build_cloud_init(plan: &MountPlan, command: &str, env_exports: &str) -> String {
-    let session = format!("cd /workspace/{} || true\n{}\n", plan.active_folder, command);
+    // The echo proves the plumbing worked. Without it, a command that produces no output is
+    // indistinguishable from a sandbox that failed to run it at all.
+    let session = format!(
+        "cd /workspace/{} || true\n\
+         echo '[geli] workspace ready; starting your command.'\n\
+         {}\n",
+        plan.active_folder, command
+    );
 
     format!(
         r#"#cloud-config
@@ -736,9 +777,19 @@ fn execute_sandbox(ws: &str, cur: &Path, dirs: Vec<PathBuf>, cmd: &str) -> io::R
         "virtio-9p-pci,fsdev=pipcache,mount_tag=pipcache".to_string(),
     ]);
 
+    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+
+    if let Some(warning) = credential_warning(
+        cmd,
+        !anthropic_key.trim().is_empty() || !openai_key.trim().is_empty(),
+    ) {
+        eprintln!("\n{}\n", warning);
+    }
+
     let env_exports = build_env_exports(&[
-        ("ANTHROPIC_API_KEY", std::env::var("ANTHROPIC_API_KEY").unwrap_or_default()),
-        ("OPENAI_API_KEY", std::env::var("OPENAI_API_KEY").unwrap_or_default()),
+        ("ANTHROPIC_API_KEY", anthropic_key),
+        ("OPENAI_API_KEY", openai_key),
     ]);
 
     let user_data = build_cloud_init(&plan, cmd, &env_exports);
@@ -901,6 +952,40 @@ mod tests {
         let recipe = build_golden_cloud_init();
         assert_eq!(recipe_hash(&recipe), recipe_hash(&recipe));
         assert_ne!(recipe_hash(&recipe), recipe_hash(&format!("{}\n# extra", recipe)));
+    }
+
+    /// Regression: `geli claude` with no key booted fine and then sat silently in the agent's
+    /// first-run login flow, which is indistinguishable from a broken sandbox.
+    #[test]
+    fn warns_before_booting_an_agent_with_no_credentials() {
+        let warning = credential_warning("claude", false).expect("expected a warning");
+        assert!(warning.contains("ANTHROPIC_API_KEY"));
+        assert!(warning.contains("first-run login"));
+
+        assert!(credential_warning("claude", true).is_none());
+        assert!(credential_warning("/usr/local/bin/claude --resume", false)
+            .unwrap()
+            .contains("first-run login"));
+
+        // Unrelated commands still get a note, but not the agent-specific explanation.
+        let generic = credential_warning("ls -la", false).unwrap();
+        assert!(!generic.contains("first-run login"));
+    }
+
+    #[test]
+    fn command_invokes_claude_matches_only_the_agent() {
+        assert!(command_invokes_claude("claude"));
+        assert!(command_invokes_claude("claude --resume"));
+        assert!(command_invokes_claude("/usr/local/bin/claude"));
+        assert!(!command_invokes_claude("claudette"));
+        assert!(!command_invokes_claude("echo claude"));
+        assert!(!command_invokes_claude(""));
+    }
+
+    #[test]
+    fn session_announces_itself_before_running_the_command() {
+        let yaml = session_cloud_init(&["/home/u/proj"], "/home/u/proj", "claude");
+        assert!(yaml.contains("[geli] workspace ready"));
     }
 
     #[test]
