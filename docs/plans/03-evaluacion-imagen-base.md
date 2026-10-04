@@ -48,10 +48,43 @@ mount: /workspace/geli-boot: unknown filesystem type '9p'
 Sin 9p no hay workspace, que es la razón de ser de geli. Queda pendiente probar
 `debian-13-generic` (sin el sufijo «cloud»), que usa kernel completo y sí debería traerlos.
 
-**Alpine no se evaluó.** Es la más pequeña (178 MB), pero usa OpenRC en vez de systemd y musl en
-vez de glibc: habría que reescribir la capa de programación del invitado (drop-in de autologin,
-getty serie) y verificar Node sobre musl. Solo merece la pena si los números de las otras no
-bastan.
+## Alpine 3.22 — evaluada, descartada
+
+Se evaluó después, por petición. Las suposiciones previas resultaron equivocadas en ambas
+direcciones.
+
+**Lo que funciona, contra lo esperado:**
+
+- **9p funciona.** El kernel `-virt` trae los módulos; montó y leyó un fichero del host. Era el
+  bloqueo que mató a Debian.
+- **cloud-init funciona**, con el mismo patrón `write_files` + `runcmd`.
+- **Claude Code corre sobre musl.** `apk add nodejs npm` da Node 22.23.2 (cumple el `>=22`),
+  `npm install -g @anthropic-ai/claude-code` sale con exit 0 y `claude --version` responde
+  `2.1.289`. No empaqueta binarios enlazados a glibc.
+
+**Lo que no funciona, también contra lo esperado — es más lenta:**
+
+| | uptime al comando |
+|---|---|
+| Alpine sin tocar | **16,8 s** |
+| Alpine con red estática y sin chronyd | 6,5-7,9 s |
+| Ubuntu minimal sin tocar | 7,09 s |
+
+De fábrica tarda **2,4 veces más que Ubuntu minimal**. La causa no es la distribución: los módulos
+de cloud-init suman 0,7 s y el kernel termina a los 2,8 s. Son `dhcpcd` negociando DHCP y
+`chronyd` ajustando el reloj (4 s de *slew*).
+
+Afinada con red estática iguala a Ubuntu minimal **sin afinar**, no la supera. Y el precio es una
+segunda vía de programación del invitado: receta `apk` en vez de `apt`, autologin por
+`/etc/inittab` con busybox getty en vez del drop-in de systemd, y musl como riesgo a futuro para
+cualquier módulo npm nativo que el agente quiera compilar en un proyecto.
+
+**Conclusión: no compensa.** Ubuntu minimal da casi el mismo arranque sin añadir una segunda
+receta que mantener. La palanca que de verdad queda —red estática en vez de DHCP— aplica igual a
+Ubuntu, donde `systemd-networkd-wait-online` cuesta 1,8 s.
+
+Nota: la configuración estática que probé dejó el DNS sin salida (`DNS_OK=no`). Si alguna vez se
+retoma Alpine, hay que resolver eso.
 
 ## Pendiente
 
