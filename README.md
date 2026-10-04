@@ -6,7 +6,7 @@ Run an AI coding agent inside a disposable virtual machine.
 geli claude
 ```
 
-That boots a fresh Ubuntu VM, mounts your project into it, runs the agent interactively on the
+That boots a fresh Alpine VM, mounts your project into it, runs the agent interactively on the
 serial console, and destroys the machine when you exit. The agent gets a real root shell and a
 real filesystem — just not yours.
 
@@ -47,7 +47,7 @@ cd geli
 ./setup.sh
 ```
 
-`setup.sh` installs the host packages, downloads the Ubuntu 24.04 cloud image into
+`setup.sh` installs the host packages, downloads the Alpine cloud image into
 `~/qemu-sandbox/`, builds the release binary, copies it to `/usr/local/bin/`, and provisions the
 golden image. It uses `sudo` for the package install and the final copy.
 
@@ -110,7 +110,7 @@ happens once, into a reusable image:
 
 | File in `~/qemu-sandbox/` | Role |
 |---|---|
-| `ubuntu-24.04-server-cloudimg-amd64.img` | Pristine base from Canonical. Never written to. |
+| `nocloud_alpine-3.22.2-...qcow2` | Pristine Alpine cloud image. Never written to. |
 | `geli-golden.qcow2` | Overlay on the base with the toolchain, the agent and autologin baked in. |
 | `geli-golden.recipe` | Hash of the recipe it was built from. |
 
