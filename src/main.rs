@@ -868,7 +868,13 @@ fn build_golden_image() -> io::Result<()> {
     check_host_tools();
 
     let dir = images_dir();
-    let base_img = dir.join(BASE_IMAGE_NAME);
+    // GELI_BASE_IMAGE points the build at a different cloud image — for comparing distros, or
+    // for anyone who would rather not start from Ubuntu Server. The recipe assumes apt and
+    // cloud-init, so Debian-family images work; others would need the recipe changed.
+    let base_img = match std::env::var_os("GELI_BASE_IMAGE") {
+        Some(path) => PathBuf::from(path),
+        None => dir.join(BASE_IMAGE_NAME),
+    };
     if !base_img.exists() {
         eprintln!("Error: Base image not found at {}", base_img.display());
         eprintln!("Run ./setup.sh, or place the Ubuntu cloud image in {}", dir.display());
