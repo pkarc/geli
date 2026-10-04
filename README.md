@@ -26,17 +26,16 @@ Early. It works, with caveats worth knowing before you rely on it:
 - **Linux only.** macOS and Windows have stubs that print "not implemented".
 - **KVM is required**, not optional — `-enable-kvm` is hardcoded, so this will not run on a host
   without hardware virtualization exposed.
-- **Boot takes ~4.5 minutes.** Every run installs node, npm, python and the agent from scratch.
-  A prebuilt golden image is the next planned change.
 - **Network is open.** The guest has unrestricted outbound access. This is a deliberate choice
   for now, not an oversight — see [Security notes](#security-notes).
+- **The agent version is frozen into the image.** Rebuild with `geli --build-image` to update it.
 
 ## Requirements
 
 - A Linux host with KVM (`/dev/kvm` accessible)
 - `qemu-system-x86_64`, `qemu-img`, `genisoimage`
 - Rust toolchain, to build
-- ~20 GB of free disk for the session overlay (sparse; actual use is far lower)
+- ~3 GB of disk for the base and golden images, plus a sparse 20 GB session overlay
 
 ## Install
 
@@ -47,15 +46,22 @@ cd geli
 ```
 
 `setup.sh` installs the host packages, downloads the Ubuntu 24.04 cloud image into
-`~/qemu-sandbox/`, builds the release binary and copies it to `/usr/local/bin/`. It uses `sudo`
-for the package install and the final copy.
+`~/qemu-sandbox/`, builds the release binary, copies it to `/usr/local/bin/`, and provisions the
+golden image. It uses `sudo` for the package install and the final copy.
+
+That last step boots a VM once to install node, npm, python, git and the agent, and takes a few
+minutes. It is what makes every subsequent session start in seconds.
 
 ## Usage
 
 ```bash
 geli <command> [args...]    # run a command inside the sandbox
 geli --list                 # show the workspace registry
+geli --build-image          # rebuild the golden image (also how you update the agent)
 ```
+
+A session starts in **~15 seconds**, because it installs nothing — see
+[The golden image](#the-golden-image).
 
 The first run in a directory asks how to namespace it and writes a `.geli.json`:
 
@@ -94,15 +100,36 @@ Two pieces of state back this:
 There is no command to remove a directory from a workspace yet — edit the `.txt` file. Paths that
 no longer exist are skipped automatically.
 
+## The golden image
+
+Installing node, npm, python and the agent on every boot cost ~4.5 minutes per run. Instead that
+happens once, into a reusable image:
+
+| File in `~/qemu-sandbox/` | Role |
+|---|---|
+| `ubuntu-24.04-server-cloudimg-amd64.img` | Pristine base from Canonical. Never written to. |
+| `geli-golden.qcow2` | Overlay on the base with the toolchain, the agent and autologin baked in. |
+| `geli-golden.recipe` | Hash of the recipe it was built from. |
+
+Sessions are overlays on the golden image, so a session boot is just a kernel boot plus mounting
+your directories: **~15 seconds instead of ~4.5 minutes.**
+
+If the recipe in the binary no longer matches `geli-golden.recipe`, geli warns and keeps going —
+a stale image is out of date, not broken. If the image is missing it stops and tells you to run
+`geli --build-image`.
+
+Moving `~/qemu-sandbox/` breaks the golden image: qcow2 records its backing file by absolute
+path. Rebuild it rather than trying to repair the chain.
+
 ## How it works
 
 Each invocation:
 
-1. Creates a copy-on-write qcow2 overlay on top of the Ubuntu base image. The base is never
-   written to.
+1. Creates a copy-on-write qcow2 overlay on top of the golden image. Neither the golden image nor
+   the base is written to.
 2. Attaches each workspace directory as a virtio-9p share, mounted at `/workspace/<folder>`.
-3. Generates a cloud-init ISO that installs the toolchain, performs the mounts, enables autologin
-   on `ttyS0`, runs your command and powers off.
+3. Generates a cloud-init ISO that performs the mounts and drops in your command. Autologin and
+   the login profile already live in the image.
 4. Launches QEMU with 4 GB RAM, 2 vCPUs and inherited stdio, so the agent is fully interactive in
    your terminal.
 5. Deletes the overlay and temporary files on exit.
@@ -150,6 +177,6 @@ See [CLAUDE.md](CLAUDE.md) for architecture detail and [docs/plans/](docs/plans/
 ## Roadmap
 
 1. ~~Make the sandbox boot and run the command~~ — done
-2. Golden image, to cut boot from minutes to seconds
+2. ~~Golden image, to cut boot from minutes to seconds~~ — done (~4.5 min → ~15 s)
 3. Network egress policy
 4. Optional KVM, for hosts without hardware virtualization

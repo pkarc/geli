@@ -35,6 +35,10 @@ cargo build --release
 echo "[*] Installing geli to /usr/local/bin/..."
 sudo cp target/release/geli /usr/local/bin/
 
+# 5. Provision the golden image once, so individual sandbox sessions install nothing
+echo "[*] Building the golden sandbox image (one-time, a few minutes)..."
+geli --build-image
+
 echo "============================================="
 echo "[✓] Geli installation complete!"
 echo "    You can now run: geli <command>"
