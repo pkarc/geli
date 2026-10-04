@@ -248,30 +248,6 @@ const GOLDEN_BUILD_LOG: &str = "geli-golden-build.log";
 /// abort runcmd on failure, so a sentinel that is merely "reached" would prove nothing.
 const GOLDEN_OK_MARKER: &str = "GELI_GOLDEN_OK";
 
-/// Keys copied verbatim from the host's ~/.claude.json into the guest's.
-///
-/// These are exactly what Claude Code writes for itself on first run, plus the cached account
-/// profile. Seeding them stops the agent repeating that work — including replaying the config
-/// migrations up to `migrationVersion` — on every single session.
-///
-/// Deliberately absent: `projects`, `history`, `tipsHistory`, `cachedGrowthBookFeatures` and
-/// everything else. Those carry conversation and usage history across every project on the host,
-/// which has nothing to do with the task the agent was given.
-const SEEDED_CONFIG_KEYS: &[&str] = &[
-    "firstStartTime",
-    "firstStartVersion",
-    "machineID",
-    "userID",
-    "migrationVersion",
-    "opusProMigrationComplete",
-    "sonnet1m45MigrationComplete",
-    "seenNotifications",
-    "hasResetAutoModeOptInForDefaultOffer",
-    "pluginUsage",
-    // The account the forwarded credential already belongs to; saves a profile fetch at startup.
-    "oauthAccount",
-];
-
 /// Major Node version the agent requires. Ubuntu 24.04 ships Node 18, and `npm install -g`
 /// installs onto it anyway with only a warning — the agent then runs on an unsupported runtime
 /// and its startup connectivity checks time out despite a working network. Install Node from
@@ -439,25 +415,10 @@ fn build_mount_script(dirs: &[PathBuf], current_canonical: &Path) -> MountPlan {
 /// the API key, then trust the folder, every time.
 ///
 /// `approved` holds the last 20 characters of the key rather than the key itself.
-fn build_claude_config(
-    folders: &[String],
-    api_key: &str,
-    host_config: Option<&serde_json::Value>,
-) -> String {
+fn build_claude_config(folders: &[String], api_key: &str) -> String {
     use serde_json::{json, Map, Value};
 
     let mut document = Map::new();
-
-    // Seed the first-run state from the host. Without it the agent redoes initialisation every
-    // session — regenerating machineID/userID and replaying the config migrations — and every
-    // session registers as a brand-new install against the user's account.
-    if let Some(Value::Object(host)) = host_config {
-        for key in SEEDED_CONFIG_KEYS {
-            if let Some(value) = host.get(*key) {
-                document.insert((*key).to_string(), value.clone());
-            }
-        }
-    }
 
     let mut projects = Map::new();
     for folder in folders {
@@ -1055,20 +1016,7 @@ fn execute_sandbox(
         host_terminal_size(),
     ));
 
-    // Seeded only alongside credentials: --no-credentials means nothing personal leaves the host.
-    let host_claude_config = if forward_credentials {
-        fs::read_to_string(home.join(".claude.json"))
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-    } else {
-        None
-    };
-
-    let claude_config = build_claude_config(
-        &plan.folders,
-        &api_key_for_config,
-        host_claude_config.as_ref(),
-    );
+    let claude_config = build_claude_config(&plan.folders, &api_key_for_config);
     let user_data = build_cloud_init(
         &plan,
         cmd,
@@ -1141,7 +1089,7 @@ mod tests {
         let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
         let plan = build_mount_script(&dirs, Path::new(current));
         let env = build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]);
-        let config = build_claude_config(&plan.folders, "sk-ant-test-key-0123456789", None);
+        let config = build_claude_config(&plan.folders, "sk-ant-test-key-0123456789");
         build_cloud_init(&plan, cmd, &env, &config, None)
     }
 
@@ -1327,7 +1275,7 @@ mod tests {
     #[test]
     fn claude_config_preapproves_key_and_trusts_every_workspace() {
         let folders = vec!["proj".to_string(), "other".to_string()];
-        let config = build_claude_config(&folders, "sk-ant-api03-ABCDEFGHIJKLMNOPQRST", None);
+        let config = build_claude_config(&folders, "sk-ant-api03-ABCDEFGHIJKLMNOPQRST");
         let parsed: serde_json::Value = serde_json::from_str(&config).expect("valid JSON");
 
         assert_eq!(parsed["hasCompletedOnboarding"], true);
@@ -1343,7 +1291,7 @@ mod tests {
 
     #[test]
     fn claude_config_without_a_key_approves_nothing() {
-        let config = build_claude_config(&["proj".to_string()], "", None);
+        let config = build_claude_config(&["proj".to_string()], "");
         let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
         assert_eq!(
             parsed["customApiKeyResponses"]["approved"].as_array().unwrap().len(),
@@ -1360,61 +1308,23 @@ mod tests {
         assert!(yaml.contains("hasTrustDialogAccepted"));
     }
 
-    /// Shaped like a real host config: the first-run keys we want, surrounded by the history we
-    /// must never copy.
-    fn fake_host_config() -> serde_json::Value {
-        serde_json::json!({
-            "machineID": "host-machine",
-            "userID": "host-user",
-            "migrationVersion": 14,
-            "firstStartTime": "2026-07-06T18:42:51.380Z",
-            "oauthAccount": { "emailAddress": "someone@example.com" },
-            "pluginUsage": { "a": 1 },
-            // Everything below is history and must stay on the host.
-            "projects": { "/home/u/secret-client-work": { "hasTrustDialogAccepted": true } },
-            "tipsHistory": { "tip": 1 },
-            "cachedGrowthBookFeatures": { "flag": true },
-            "history": ["what the user typed last week"]
-        })
-    }
-
+    /// The guest config holds exactly what suppresses the first-run prompts, and nothing else.
+    ///
+    /// Verified on a real sandbox: with credentials present but this file absent, the agent still
+    /// runs its onboarding. Seeding anything further from the host — machine/user ids, the cached
+    /// account profile — was tried and reverted: it changed no prompt and no measurable startup
+    /// time, so it only put more of the user's data in the guest.
     #[test]
-    fn claude_config_seeds_first_run_state_from_the_host() {
-        let host = fake_host_config();
-        let config = build_claude_config(&["proj".to_string()], "", Some(&host));
+    fn claude_config_holds_only_what_suppresses_the_prompts() {
+        let config = build_claude_config(&["proj".to_string()], "");
         let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+        let keys: Vec<&String> = parsed.as_object().unwrap().keys().collect();
 
-        // Seeded, so the agent stops redoing first-run init every session.
-        assert_eq!(parsed["machineID"], "host-machine");
-        assert_eq!(parsed["userID"], "host-user");
-        assert_eq!(parsed["migrationVersion"], 14);
-        assert_eq!(parsed["oauthAccount"]["emailAddress"], "someone@example.com");
-    }
-
-    /// The whole point of seeding from an allowlist: history must not ride along.
-    #[test]
-    fn claude_config_never_copies_history_from_the_host() {
-        let host = fake_host_config();
-        let config = build_claude_config(&["proj".to_string()], "", Some(&host));
-        let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
-
-        for leaked in ["tipsHistory", "cachedGrowthBookFeatures", "history"] {
-            assert!(parsed.get(leaked).is_none(), "{} leaked into the guest", leaked);
-        }
-        assert!(!config.contains("secret-client-work"));
-
-        // `projects` must describe this sandbox's mounts, never the host's project list.
-        let projects = parsed["projects"].as_object().unwrap();
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects["/workspace/proj"]["hasTrustDialogAccepted"], true);
-    }
-
-    #[test]
-    fn claude_config_works_without_a_host_config() {
-        let config = build_claude_config(&["proj".to_string()], "", None);
-        let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
-        assert_eq!(parsed["hasCompletedOnboarding"], true);
-        assert!(parsed.get("machineID").is_none());
+        assert_eq!(
+            keys,
+            vec!["customApiKeyResponses", "hasCompletedOnboarding", "projects"],
+            "guest config grew beyond the keys that suppress prompts"
+        );
     }
 
     #[test]

@@ -162,11 +162,12 @@ your Claude plan:
 geli claude
 ```
 
-Alongside it geli seeds the agent's first-run state — machine and user ids, the config migration
-version, your cached account profile — so each session does not come up as a brand-new install.
+That one file is all geli copies. Your account profile, conversation transcripts, prompt history
+and file snapshots across every project you have worked on stay on the host.
 
-Nothing else is copied. Conversation transcripts, prompt history and file snapshots across every
-project you have worked on stay on the host.
+The sandbox is disposable, so the agent would otherwise re-run its first-run prompts every
+session — approve the key, pick a theme, trust the folder. geli writes a small config into the
+guest that answers exactly those three, and nothing more.
 
 Use an API key instead by exporting one; it takes precedence over the copied credentials, and
 bills API credits rather than your plan:
