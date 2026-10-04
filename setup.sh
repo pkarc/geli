@@ -14,18 +14,18 @@ sudo apt install -y qemu-system-x86 qemu-utils genisoimage curl
 SANDBOX_DIR="$HOME/qemu-sandbox"
 mkdir -p "$SANDBOX_DIR"
 
-# 3. Download the Ubuntu Cloud Image if it doesn't exist
-IMG_NAME="ubuntu-24.04-server-cloudimg-amd64.img"
+# 3. Download the Alpine cloud image if it does not exist
+IMG_NAME="nocloud_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2"
 TARGET_IMG="$SANDBOX_DIR/$IMG_NAME"
 
-IMG_URL="https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
+IMG_URL="https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/nocloud_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2"
 
 if [ ! -f "$TARGET_IMG" ]; then
-    echo "[*] Downloading Ubuntu 24.04 LTS Gold Master Image (approx. 400MB)..."
+    echo "[*] Downloading Alpine 3.22 cloud image (approx. 185MB)..."
     curl -L -o "$TARGET_IMG" "$IMG_URL"
     echo "[+] Image downloaded successfully."
 else
-    echo "[+] Ubuntu Master Image already present."
+    echo "[+] Alpine base image already present."
 fi
 
 # 4. Build and install the Rust binary globally

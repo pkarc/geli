@@ -239,7 +239,7 @@ const MOUNT_OPTS: &str = "trans=virtio,version=9p2000.L,msize=1048576";
 /// overlays inherit this size from their backing file.
 const SANDBOX_DISK_SIZE: &str = "20G";
 
-const BASE_IMAGE_NAME: &str = "ubuntu-24.04-server-cloudimg-amd64.img";
+const BASE_IMAGE_NAME: &str = "nocloud_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2";
 const GOLDEN_IMAGE_NAME: &str = "geli-golden.qcow2";
 const GOLDEN_RECIPE_NAME: &str = "geli-golden.recipe";
 const GOLDEN_BUILD_LOG: &str = "geli-golden-build.log";
@@ -248,30 +248,84 @@ const GOLDEN_BUILD_LOG: &str = "geli-golden-build.log";
 /// abort runcmd on failure, so a sentinel that is merely "reached" would prove nothing.
 const GOLDEN_OK_MARKER: &str = "GELI_GOLDEN_OK";
 
-/// Major Node version the agent requires. Ubuntu 24.04 ships Node 18, and `npm install -g`
-/// installs onto it anyway with only a warning — the agent then runs on an unsupported runtime
-/// and its startup connectivity checks time out despite a working network. Install Node from
-/// nodejs.org instead of apt.
+/// Major Node version the agent requires. Alpine's own `nodejs` package satisfies it, so unlike
+/// on Ubuntu there is no tarball to fetch — apt's Node 18 was the reason that existed.
 const REQUIRED_NODE_MAJOR: u32 = 22;
 
-const GOLDEN_INSTALL_NODE: &str = r#"#!/bin/bash
-set -euxo pipefail
+/// The uid the guest's `sandbox` user must take: files arrive over 9p owned by the host user,
+/// so a mismatch leaves the agent unable to write to the project it was given.
+fn host_uid() -> u32 {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1000)
+}
 
-# Resolve the current v22 release rather than pinning a patch that goes stale.
-TARBALL=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt \
-  | grep -oE 'node-v22\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz' | head -1)
-test -n "$TARBALL"
+/// Provisioning run once by `--build-image`.
+///
+/// `bash` is not optional: Alpine's default shell is busybox ash, and the agent's Bash tool
+/// needs real bash. Everything else is the same toolchain the Ubuntu recipe installed.
+fn golden_setup_script(host_uid: u32) -> String {
+    format!(
+        r#"#!/bin/sh
+set -eux
 
-curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/latest-v22.x/${TARBALL}"
-tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
-rm -f /tmp/node.tar.xz
+apk update
+apk add --no-cache bash nodejs npm git python3 py3-pip sudo
+
+# The user is created here, not through cloud-init: Alpine's users module cannot set an explicit
+# uid and fails the whole module when asked to. The uid has to match the host's, because files
+# arrive over 9p owned by the host user — otherwise the agent can read the project but not write.
+deluser alpine 2>/dev/null || true
+rm -rf /home/alpine
+adduser -D -u {host_uid} -s /bin/bash sandbox
+printf 'sandbox ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/sandbox
+chmod 0440 /etc/sudoers.d/sandbox
+
+npm install -g @anthropic-ai/claude-code
+
+install -o sandbox -g sandbox -m 0644 /etc/geli/bash_profile /home/sandbox/.bash_profile
+
+# Autologin on the serial console. Alpine has no systemd, so this is an inittab line plus a
+# login helper rather than a getty drop-in.
+sed -i 's|^ttyS0::respawn:.*|ttyS0::respawn:/sbin/getty -L -n -l /usr/local/bin/geli-autologin 115200 ttyS0 vt100|' /etc/inittab
+
+# A disposable VM has no use for a clock daemon or an ssh server, and chronyd alone cost ~4s of
+# boot slewing the clock the host already provides.
+rc-update del chronyd default || true
+rc-update del sshd default || true
+rc-update del rdate default || true
+
+# QEMU's user networking always hands out the same addresses, so DHCP is pure latency:
+# dhcpcd negotiating a lease was most of this image's boot time.
+printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet static\n    address 10.0.2.15\n    netmask 255.255.255.0\n    gateway 10.0.2.2\n' > /etc/network/interfaces
+printf 'nameserver 10.0.2.3\n' > /etc/resolv.conf
+printf 'network:\n  config: disabled\n' > /etc/cloud/cloud.cfg.d/99-geli-network.cfg
+
+# Alpine's cloud image ships a 10-second boot menu. On a disposable VM that is 10 seconds of
+# every single session spent waiting for a keypress nobody will make.
+sed -i 's/^timeout=.*/timeout=1/' /etc/update-extlinux.conf || true
+update-extlinux || true
+sed -i 's/^TIMEOUT .*/TIMEOUT 1/; s/^PROMPT .*/PROMPT 0/' /boot/extlinux.conf || true
+
+rm -rf /var/cache/apk/*
+"#,
+        host_uid = host_uid,
+    )
+}
+
+const GOLDEN_AUTOLOGIN: &str = r#"#!/bin/sh
+exec /bin/login -f sandbox
 "#;
 
 /// Printed only when every tool is present *and* Node is new enough. cloud-init does not abort
 /// runcmd on failure, so the host greps for this rather than trusting the build "finished".
 fn golden_verify_script() -> String {
     format!(
-        r#"#!/bin/bash
+        r#"#!/bin/sh
 command -v claude >/dev/null || exit 0
 command -v git >/dev/null || exit 0
 command -v node >/dev/null || exit 0
@@ -551,42 +605,29 @@ fn build_credentials_entry(credentials: Option<&str>) -> String {
 }
 
 /// cloud-config for `--build-image`. Everything slow and workspace-independent lives here.
-fn build_golden_cloud_init() -> String {
+///
+/// Alpine, not Ubuntu: measured at a third of the disk footprint (632 MB against 1.9 GB) with a
+/// newer kernel and far fewer packages — which is the point of a sandbox. The differences from
+/// the Ubuntu recipe are apk instead of apt, an inittab line instead of a systemd drop-in, and
+/// no Node tarball, since Alpine already ships Node 22.
+fn build_golden_cloud_init(host_uid: u32) -> String {
     format!(
         r#"#cloud-config
-users:
-  - default
-  - name: sandbox
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /bin/bash
-    lock_passwd: true
-
-package_update: true
-packages:
-  - python3
-  - python3-pip
-  - git
-  - curl
-  - ca-certificates
-  - xz-utils
-
 write_files:
-  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
-    permissions: '0644'
+  - path: /usr/local/bin/geli-autologin
+    permissions: '0755'
     content: |
-      [Service]
-      ExecStart=
-      ExecStart=-/sbin/agetty --autologin sandbox --noclear %I $TERM
+{autologin}
 
   - path: /etc/geli/bash_profile
     permissions: '0644'
     content: |
 {profile}
 
-  - path: /etc/geli/install-node.sh
+  - path: /etc/geli/setup.sh
     permissions: '0755'
     content: |
-{install_node}
+{setup}
 
   - path: /etc/geli/verify.sh
     permissions: '0755'
@@ -594,17 +635,14 @@ write_files:
 {verify}
 
 runcmd:
-  - bash /etc/geli/install-node.sh
-  - [npm, install, -g, "@anthropic-ai/claude-code"]
-  - install -o sandbox -g sandbox -m 0644 /etc/geli/bash_profile /home/sandbox/.bash_profile
-  - apt-get clean
-  - rm -rf /var/lib/apt/lists/*
-  - bash /etc/geli/verify.sh
+  - sh /etc/geli/setup.sh
+  - sh /etc/geli/verify.sh
   - cloud-init clean --logs --seed
-  - poweroff
+  - poweroff -f
 "#,
+        autologin = indent_block(GOLDEN_AUTOLOGIN, 6),
         profile = indent_block(GOLDEN_PROFILE, 6),
-        install_node = indent_block(GOLDEN_INSTALL_NODE, 6),
+        setup = indent_block(&golden_setup_script(host_uid), 6),
         verify = indent_block(&golden_verify_script(), 6),
     )
 }
@@ -877,11 +915,12 @@ fn build_golden_image() -> io::Result<()> {
     };
     if !base_img.exists() {
         eprintln!("Error: Base image not found at {}", base_img.display());
-        eprintln!("Run ./setup.sh, or place the Ubuntu cloud image in {}", dir.display());
+        eprintln!("Run ./setup.sh, or place the base cloud image in {}", dir.display());
         std::process::exit(1);
     }
 
-    let recipe = build_golden_cloud_init();
+    let host_uid = host_uid();
+    let recipe = build_golden_cloud_init(host_uid);
     let pid = std::process::id();
     let stage = staging_dir(&format!("geli-build-{}", pid))?;
     let iso = make_cloud_init_iso(&stage, &recipe, &format!("geli-build-{}", pid), "geli-golden")?;
@@ -895,7 +934,7 @@ fn build_golden_image() -> io::Result<()> {
     create_overlay(&base_img, &pending, Some(SANDBOX_DISK_SIZE))?;
 
     println!("[*] Building golden image. This takes a few minutes, once.");
-    println!("[*] Installing: Node {REQUIRED_NODE_MAJOR}, python3, pip, git, @anthropic-ai/claude-code");
+    println!("[*] Installing: bash, Node {REQUIRED_NODE_MAJOR}, python3, pip, git, @anthropic-ai/claude-code");
     println!("[*] Follow along with:  tail -f {}", log_path.display());
 
     run_qemu(&pending, &iso, vec![], QemuIo::LogTo(log_path.clone()))?;
@@ -944,7 +983,7 @@ fn execute_sandbox(
     }
 
     // Stale images still boot — they are merely out of date, not broken.
-    let expected = recipe_hash(&build_golden_cloud_init());
+    let expected = recipe_hash(&build_golden_cloud_init(host_uid()));
     let recorded = fs::read_to_string(images.join(GOLDEN_RECIPE_NAME)).unwrap_or_default();
     if recorded.trim() != expected {
         eprintln!("[!] Golden image was built from a different recipe than this binary expects.");
@@ -1136,7 +1175,7 @@ mod tests {
 
     #[test]
     fn golden_cloud_init_parses() {
-        let yaml = build_golden_cloud_init();
+        let yaml = build_golden_cloud_init(1000);
         let parsed = YamlLoader::load_from_str(&yaml);
         assert!(parsed.is_ok(), "{:?}\n---\n{}", parsed.err(), yaml);
     }
@@ -1152,19 +1191,21 @@ mod tests {
 
     #[test]
     fn golden_cloud_init_bakes_tooling_and_login() {
-        let yaml = build_golden_cloud_init();
-        for expected in ["- git", "@anthropic-ai/claude-code", "--autologin sandbox"] {
+        let yaml = build_golden_cloud_init(1000);
+        for expected in ["git", "@anthropic-ai/claude-code", "geli-autologin"] {
             assert!(yaml.contains(expected), "golden recipe missing {:?}", expected);
         }
         // The marker must be guarded by a real check, not echoed unconditionally.
         assert!(yaml.contains("command -v claude"));
         assert!(yaml.contains(GOLDEN_OK_MARKER));
 
-        // Node must come from nodejs.org: Ubuntu ships 18, the agent requires 22.
-        assert!(!yaml.contains("- nodejs"), "apt nodejs is too old for the agent");
-        assert!(!yaml.contains("- npm"));
-        assert!(yaml.contains("nodejs.org/dist/latest-v22.x"));
+        // Alpine ships Node 22, so no tarball — but the version is still checked, because
+        // npm installs onto a too-old runtime with only a warning.
+        assert!(yaml.contains("apk add"));
+        assert!(!yaml.contains("apt-get"), "apt leaked into the Alpine recipe");
         assert!(yaml.contains(&format!("-ge {}", REQUIRED_NODE_MAJOR)));
+        // bash is not optional: Alpine defaults to busybox ash and the agent's Bash tool needs bash.
+        assert!(yaml.contains("bash"), "bash missing from the Alpine recipe");
     }
 
     #[test]
@@ -1196,6 +1237,24 @@ mod tests {
     /// Regression: Claude Code's Bash tool spawns login shells, which read .bash_profile. Without
     /// a guard, every command the agent ran re-entered the session and hit `sudo poweroff`,
     /// shutting the VM down mid-task.
+    /// Regression: Alpine's default user takes uid 1000, pushing `sandbox` to 1001. Files
+    /// arrive over 9p owned by the host user, so the agent could read the project but not
+    /// write to it.
+    #[test]
+    fn golden_user_takes_the_host_uid() {
+        let yaml = build_golden_cloud_init(1000);
+        assert!(yaml.contains("adduser -D -u 1000"));
+        // Alpine's own default user holds uid 1000 and has to go, or sandbox lands on 1001.
+        assert!(yaml.contains("deluser alpine"));
+        // The stock image waits 10s at a boot menu nobody is there to answer.
+        assert!(yaml.contains("TIMEOUT 1"), "boot menu timeout not disabled");
+
+        let other = build_golden_cloud_init(1234);
+        assert!(other.contains("adduser -D -u 1234"));
+        // A different uid must produce a different image, or stale images go undetected.
+        assert_ne!(recipe_hash(&yaml), recipe_hash(&other));
+    }
+
     #[test]
     fn login_profile_runs_the_session_only_once() {
         assert!(GOLDEN_PROFILE.contains("GELI_SESSION_ACTIVE"));
@@ -1237,7 +1296,8 @@ mod tests {
 
     #[test]
     fn recipe_hash_tracks_recipe_changes() {
-        let recipe = build_golden_cloud_init();
+        let host_uid = host_uid();
+    let recipe = build_golden_cloud_init(host_uid);
         assert_eq!(recipe_hash(&recipe), recipe_hash(&recipe));
         assert_ne!(recipe_hash(&recipe), recipe_hash(&format!("{}\n# extra", recipe)));
     }
