@@ -303,8 +303,10 @@ retry npm install -g @anthropic-ai/claude-code
 install -o sandbox -g sandbox -m 0644 /etc/geli/bash_profile /home/sandbox/.bash_profile
 
 # Autologin on the serial console. Alpine has no systemd, so this is an inittab line plus a
-# login helper rather than a getty drop-in.
-sed -i 's|^ttyS0::respawn:.*|ttyS0::respawn:/sbin/getty -L -n -i -l /usr/local/bin/geli-autologin 115200 ttyS0 vt100|' /etc/inittab
+# login helper rather than a getty drop-in. No getty at all: busybox init already opens ttyS0
+# as the controlling tty with sane modes, and `getty -n` unconditionally writes a CRLF, which
+# was the stray blank line at the top of every session's stdout.
+sed -i 's|^ttyS0::respawn:.*|ttyS0::respawn:/usr/local/bin/geli-autologin|' /etc/inittab
 
 # A disposable VM has no use for a clock daemon or an ssh server, and chronyd alone cost ~4s of
 # boot slewing the clock the host already provides.
@@ -622,7 +624,7 @@ fn credential_warning(command: &str, has_credentials: bool) -> Option<String> {
     }
 }
 
-/// The serial getty hands the guest `TERM=vt220` and a fixed 80x24, regardless of the terminal
+/// The serial console hands the guest a generic `TERM` and a fixed 80x24, regardless of the terminal
 /// geli was launched from. A TUI then renders in eight colours in a cramped window. Forwarding
 /// the host's terminal identity fixes both.
 ///
@@ -1671,7 +1673,7 @@ mod tests {
         assert!(yaml.contains("> /dev/ttyS1"), "breadcrumb would land on the user's terminal");
     }
 
-    /// Regression: the guest inherited TERM=vt220 and a fixed 80x24 from the serial getty, so
+    /// Regression: the guest inherited TERM=vt220 and a fixed 80x24 from the serial console, so
     /// agent TUIs rendered in eight colours in a cramped window.
     #[test]
     fn terminal_setup_forwards_identity_and_size() {
@@ -1887,6 +1889,9 @@ mod tests {
         // Nothing of the distro's own chatter should reach a clean session.
         assert!(yaml.contains("rm -f /etc/motd"));
         assert!(yaml.contains("/etc/issue"));
+        // `getty -n` writes a CRLF before handing over, a blank line on the user's stdout.
+        assert!(yaml.contains("ttyS0::respawn:/usr/local/bin/geli-autologin"));
+        assert!(!yaml.contains("/sbin/getty"), "autologin went back through getty");
         // Direct boot needs these out of the image.
         assert!(yaml.contains(KERNEL_NAME));
         assert!(yaml.contains(INITRD_NAME));
