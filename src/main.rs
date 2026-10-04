@@ -289,22 +289,35 @@ echo {marker}
 /// Baked into the golden image as /home/sandbox/.bash_profile.
 ///
 /// `.bash_profile`, not `.bashrc`: `.bashrc` runs for *every* shell, so a subshell spawned by
-/// the agent would re-run the command and poweroff mid-session. Autologin gives a login shell,
-/// which is what reads `.bash_profile`.
+/// the agent would re-run the command and poweroff mid-session.
+///
+/// That is not enough on its own. Claude Code's Bash tool spawns *login* shells, which read
+/// `.bash_profile` too — so every command the agent ran re-entered the session, re-ran the
+/// user's command, and hit `sudo poweroff`, killing the VM out from under it. The guard below
+/// makes only the boot's first login shell own the session; nested ones just load the
+/// environment, so the agent's commands still get TERM and the API keys.
 const GOLDEN_PROFILE: &str = r#"[ -f ~/.bashrc ] && . ~/.bashrc
 
-# Autologin is baked into the image, so the getty can hand us a shell before this session's
-# cloud-init has written /etc/geli/session. Wait for it rather than racing it.
-cloud-init status --wait >/dev/null 2>&1
+if [ -z "$GELI_SESSION_ACTIVE" ] && [ ! -e /tmp/.geli-session-active ]; then
+    export GELI_SESSION_ACTIVE=1
+    : > /tmp/.geli-session-active 2>/dev/null
 
-[ -f /etc/geli/env ] && . /etc/geli/env
+    # Autologin is baked into the image, so the getty can hand us a shell before this session's
+    # cloud-init has written /etc/geli/session. Wait for it rather than racing it.
+    cloud-init status --wait >/dev/null 2>&1
 
-if [ -f /etc/geli/session ]; then
-    . /etc/geli/session
-    sudo poweroff
+    [ -f /etc/geli/env ] && . /etc/geli/env
+
+    if [ -f /etc/geli/session ]; then
+        . /etc/geli/session
+        sudo poweroff
+    else
+        echo "[!] geli: no session script found; cloud-init may have failed."
+        echo "[!] See /var/log/cloud-init-output.log. Dropping to a shell."
+    fi
 else
-    echo "[!] geli: no session script found; cloud-init may have failed."
-    echo "[!] See /var/log/cloud-init-output.log. Dropping to a shell."
+    # Nested login shell, e.g. an agent's Bash tool. Load the environment, own nothing.
+    [ -f /etc/geli/env ] && . /etc/geli/env
 fi
 "#;
 
@@ -1172,6 +1185,25 @@ mod tests {
         assert!(GOLDEN_PROFILE.contains("/etc/geli/session"));
         // Sourcing ~/.bashrc is fine; appending the command to it is not.
         assert!(!GOLDEN_PROFILE.contains(">> ~/.bashrc"));
+    }
+
+    /// Regression: Claude Code's Bash tool spawns login shells, which read .bash_profile. Without
+    /// a guard, every command the agent ran re-entered the session and hit `sudo poweroff`,
+    /// shutting the VM down mid-task.
+    #[test]
+    fn login_profile_runs_the_session_only_once() {
+        assert!(GOLDEN_PROFILE.contains("GELI_SESSION_ACTIVE"));
+        assert!(GOLDEN_PROFILE.contains("/tmp/.geli-session-active"));
+
+        // The poweroff must sit inside the guard, never at top level.
+        let guard = GOLDEN_PROFILE
+            .find("GELI_SESSION_ACTIVE")
+            .expect("guard missing");
+        let poweroff = GOLDEN_PROFILE.find("sudo poweroff").expect("poweroff missing");
+        assert!(poweroff > guard, "poweroff runs before the guard");
+
+        // Both branches source the environment, or the agent's commands lose TERM and keys.
+        assert_eq!(GOLDEN_PROFILE.matches(". /etc/geli/env").count(), 2);
     }
 
     #[test]
