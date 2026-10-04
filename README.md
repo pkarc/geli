@@ -113,6 +113,8 @@ happens once, into a reusable image:
 | `nocloud_alpine-3.22.2-...qcow2` | Pristine Alpine cloud image. Never written to. |
 | `geli-golden.qcow2` | Overlay on the base with the toolchain, the agent and autologin baked in. |
 | `geli-golden.recipe` | Hash of the recipe it was built from. |
+| `geli-vmlinuz`, `geli-initramfs` | Kernel and initramfs handed out by the build. Sessions boot these directly, skipping firmware and bootloader. |
+| `geli-golden.meta` | The kernel command line and the versions inside the image. |
 
 Sessions are overlays on the golden image, so a session boot is just a kernel boot plus mounting
 your directories: **~15 seconds instead of ~4.5 minutes.**
@@ -133,6 +135,9 @@ Each invocation:
 2. Attaches each workspace directory as a virtio-9p share, mounted at `/workspace/<folder>`.
 3. Generates a cloud-init ISO that performs the mounts and drops in your command. Autologin and
    the login profile already live in the image.
+   The guest's boot console goes to a log file, not your terminal, so a session prints geli's own
+   lines and your command's output — nothing else. geli's status goes to stderr, so stdout is
+   yours alone.
 4. Launches QEMU with 4 GB RAM, 2 vCPUs and inherited stdio, so the agent is fully interactive in
    your terminal.
 5. Deletes the overlay and temporary files on exit.
@@ -235,13 +240,8 @@ See [CLAUDE.md](CLAUDE.md) for architecture detail and [docs/plans/](docs/plans/
 1. ~~Make the sandbox boot and run the command~~ — done
 2. ~~Golden image, to cut boot from minutes to seconds~~ — done (~4.5 min → ~15 s)
 3. ~~Alpine as the guest base~~ — done (1.9 GB → 656 MB, same session time)
-4. **Quiet output.** A session prints 615 lines, of which 613 are a kernel log, service startup,
-   a distro MOTD and a shutdown sequence. Two are yours. Boot and shutdown consoles should go to
-   a log file on a second serial port — leaving the stream you see untouched for the agent's TUI —
-   with geli printing its own short lines around your command's output.
+4. ~~Quiet output and direct kernel boot~~ — done (615 lines → 8; ~14 s → ~7.5 s)
 5. Network egress policy. The guest currently reaches anything; the file boundary holds but
    confidentiality of what the agent *was* given does not.
 6. Optional KVM, for hosts without hardware virtualization.
-7. Faster boot: direct kernel boot (`-kernel`/`-initrd`) skips SeaBIOS, iPXE and SYSLINUX
-   entirely. Dropping the unused iPXE option ROM (`romfile=`) and trimming the 4 GB RAM ceiling
-   (the guest uses 476 MB) are smaller versions of the same idea.
+7. Trim the 4 GB RAM ceiling — the guest uses 476 MB.

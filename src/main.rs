@@ -1,7 +1,7 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -273,8 +273,21 @@ fn golden_setup_script(host_uid: u32) -> String {
         r#"#!/bin/sh
 set -eux
 
-apk update
-apk add --no-cache bash nodejs npm git python3 py3-pip sudo
+# Roughly a fifth of outbound connections on a given network can time out or drop mid-TLS, and
+# `set -e` turns any one of them into a failed build. Every network step gets retries.
+retry() {{
+  n=0
+  until [ "$n" -ge 5 ]; do
+    "$@" && return 0
+    n=$((n + 1))
+    echo "geli: network step failed, retry $n/5: $*"
+    sleep 3
+  done
+  return 1
+}}
+
+retry apk update
+retry apk add --no-cache bash nodejs npm git python3 py3-pip sudo
 
 # The user is created here, not through cloud-init: Alpine's users module cannot set an explicit
 # uid and fails the whole module when asked to. The uid has to match the host's, because files
@@ -285,13 +298,13 @@ adduser -D -u {host_uid} -s /bin/bash sandbox
 printf 'sandbox ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/sandbox
 chmod 0440 /etc/sudoers.d/sandbox
 
-npm install -g @anthropic-ai/claude-code
+retry npm install -g @anthropic-ai/claude-code
 
 install -o sandbox -g sandbox -m 0644 /etc/geli/bash_profile /home/sandbox/.bash_profile
 
 # Autologin on the serial console. Alpine has no systemd, so this is an inittab line plus a
 # login helper rather than a getty drop-in.
-sed -i 's|^ttyS0::respawn:.*|ttyS0::respawn:/sbin/getty -L -n -l /usr/local/bin/geli-autologin 115200 ttyS0 vt100|' /etc/inittab
+sed -i 's|^ttyS0::respawn:.*|ttyS0::respawn:/sbin/getty -L -n -i -l /usr/local/bin/geli-autologin 115200 ttyS0 vt100|' /etc/inittab
 
 # A disposable VM has no use for a clock daemon or an ssh server, and chronyd alone cost ~4s of
 # boot slewing the clock the host already provides.
@@ -305,17 +318,61 @@ printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet static\n  
 printf 'nameserver 10.0.2.3\n' > /etc/resolv.conf
 printf 'network:\n  config: disabled\n' > /etc/cloud/cloud.cfg.d/99-geli-network.cfg
 
-# Alpine's cloud image ships a 10-second boot menu. On a disposable VM that is 10 seconds of
-# every single session spent waiting for a keypress nobody will make.
+# Sessions boot the kernel directly, so the boot menu never runs — but a hand-booted image
+# still shouldn't sit for 10 seconds waiting for a keypress nobody will make.
 sed -i 's/^timeout=.*/timeout=1/' /etc/update-extlinux.conf || true
 update-extlinux || true
 sed -i 's/^TIMEOUT .*/TIMEOUT 1/; s/^PROMPT .*/PROMPT 0/' /boot/extlinux.conf || true
 
+# The login banner and MOTD are the last guest output the user would see on a clean session.
+# Removed rather than emptied: busybox login still prints a newline for an empty motd.
+rm -f /etc/motd
+: > /etc/issue
+
+# Hand the kernel, the initramfs and the cmdline out to the host: sessions boot them directly
+# with -kernel/-initrd, which skips SeaBIOS, iPXE and the bootloader entirely. This is the only
+# point where we run as root, and those files are 0600 root-only.
+mkdir -p /mnt/geli-out
+mount -t 9p -o {mount_opts} {out_tag} /mnt/geli-out
+cp /boot/vmlinuz-virt /mnt/geli-out/{kernel_name}
+cp /boot/initramfs-virt /mnt/geli-out/{initrd_name}
+
+# Captured, never hardcoded: `root=` depends on how the image labels its filesystem.
+{{
+  printf 'cmdline=%s\n' "$(cat /proc/cmdline)"
+  printf 'alpine=%s\n' "$(cut -d' ' -f1-2 /etc/alpine-release 2>/dev/null || echo unknown)"
+  printf 'node=%s\n' "$(node --version 2>/dev/null | tr -d v)"
+  printf 'claude=%s\n' "$(claude --version 2>/dev/null | cut -d' ' -f1)"
+}} > /mnt/geli-out/{meta_name}
+
+chown -R {host_uid}:{host_uid} /mnt/geli-out
+sync
+umount /mnt/geli-out
+
 rm -rf /var/cache/apk/*
 "#,
+        mount_opts = MOUNT_OPTS,
+        out_tag = GOLDEN_OUT_TAG,
+        kernel_name = KERNEL_NAME,
+        initrd_name = INITRD_NAME,
+        meta_name = GOLDEN_META_NAME,
         host_uid = host_uid,
     )
 }
+
+/// 9p tag the build VM uses to hand the kernel, initramfs and metadata back to the host.
+const GOLDEN_OUT_TAG: &str = "geliout";
+const KERNEL_NAME: &str = "geli-vmlinuz";
+const INITRD_NAME: &str = "geli-initramfs";
+const GOLDEN_META_NAME: &str = "geli-golden.meta";
+
+/// Console the kernel and OpenRC write to. The user's terminal is ttyS0; everything the guest
+/// says while booting goes here instead, into a log file on the host.
+const BOOT_CONSOLE: &str = "ttyS1,115200n8";
+
+/// Written by `mounts.sh` as its last act. The host polls the boot log for it to know the
+/// sandbox is ready — `runcmd` output lands in that log, so no extra channel is needed.
+const READY_MARKER: &str = "geli:ready";
 
 const GOLDEN_AUTOLOGIN: &str = r#"#!/bin/sh
 exec /bin/login -f sandbox
@@ -332,6 +389,10 @@ command -v node >/dev/null || exit 0
 
 major=$(node -p 'process.versions.node.split(".")[0]')
 [ "$major" -ge {required} ] || exit 0
+
+# Without these the host cannot boot the kernel directly, so the image is not publishable.
+[ -s /boot/vmlinuz-virt ] || exit 0
+[ -s /boot/initramfs-virt ] || exit 0
 
 echo {marker}
 "#,
@@ -364,7 +425,10 @@ if [ -z "$GELI_SESSION_ACTIVE" ] && [ ! -e /tmp/.geli-session-active ]; then
 
     if [ -f /etc/geli/session ]; then
         . /etc/geli/session
-        sudo poweroff
+        # The project lives on 9p, so flush before cutting power. `poweroff -f` skips the wall
+        # broadcast and the orderly-shutdown log, neither of which belongs on the user's screen.
+        sync
+        sudo poweroff -f
     else
         echo "[!] geli: no session script found; cloud-init may have failed."
         echo "[!] See /var/log/cloud-init-output.log. Dropping to a shell."
@@ -463,6 +527,15 @@ fn build_mount_script(dirs: &[PathBuf], current_canonical: &Path) -> MountPlan {
     script.push_str(&format!(
         "mount -t 9p -o {MOUNT_OPTS} pipcache /home/sandbox/.cache/pip\n"
     ));
+
+    // /dev is recreated on every boot, so the session's write access to the boot console has to
+    // be granted here rather than baked into the image.
+    let console = BOOT_CONSOLE.split(',').next().unwrap_or("ttyS1");
+    script.push_str(&format!("\nchmod 0666 /dev/{console} || true\n"));
+
+    // Last line on purpose: this lands in the boot console log, which the host polls to know the
+    // sandbox is ready. runcmd output goes there, so no extra channel is needed.
+    script.push_str(&format!("echo {READY_MARKER}\n"));
 
     // If the current directory could not be canonicalized it never matched above; fall back to
     // its name so we never emit a bare `cd /workspace/`.
@@ -604,6 +677,99 @@ fn build_credentials_entry(credentials: Option<&str>) -> String {
     }
 }
 
+/// What `--build-image` recorded about the image it produced.
+#[derive(Default, Debug, PartialEq)]
+struct GoldenMeta {
+    /// The kernel command line the image boots itself with, captured rather than invented.
+    cmdline: String,
+    alpine: String,
+    node: String,
+    claude: String,
+}
+
+fn parse_golden_meta(raw: &str) -> GoldenMeta {
+    let mut meta = GoldenMeta::default();
+    for line in raw.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().to_string();
+        match key.trim() {
+            "cmdline" => meta.cmdline = value,
+            "alpine" => meta.alpine = value,
+            "node" => meta.node = value,
+            "claude" => meta.claude = value,
+            _ => {}
+        }
+    }
+    meta
+}
+
+/// Rewrite the image's own command line for a direct boot: the guest's console moves off the
+/// user's terminal, and the kernel stops narrating.
+///
+/// `root=` and `modules=` are carried over untouched — they describe how this particular image
+/// finds its filesystem, and hardcoding them is the kind of guess that breaks silently. The
+/// bootloader's own `BOOT_IMAGE=` and `initrd=` are dropped, since there is no bootloader now.
+fn boot_cmdline(original: &str) -> String {
+    let mut tokens: Vec<String> = original
+        .split_whitespace()
+        .filter(|t| {
+            !t.starts_with("console=")
+                && !t.starts_with("BOOT_IMAGE=")
+                && !t.starts_with("initrd=")
+                && !t.starts_with("loglevel=")
+                && *t != "quiet"
+        })
+        .map(str::to_string)
+        .collect();
+
+    tokens.push(format!("console={}", BOOT_CONSOLE));
+    tokens.push("quiet".to_string());
+    tokens.push("loglevel=0".to_string());
+    tokens.join(" ")
+}
+
+/// One mounted directory, as the status block shows it.
+struct StatusMount {
+    host: String,
+    guest: String,
+    active: bool,
+}
+
+/// The facts worth printing before handing the terminal over: what is mounted, which credential
+/// the agent will use, and what is inside the image. Everything else about a session is identical
+/// every time, and identical output is noise even when geli writes it.
+fn render_status(workspace: &str, mounts: &[StatusMount], auth: &str, image: &str) -> String {
+    let mut out = format!("geli · workspace {}\n", workspace);
+    for m in mounts {
+        out.push_str(&format!(
+            "  mount  {} → {}{}\n",
+            m.host,
+            m.guest,
+            if m.active { "  (active)" } else { "" }
+        ));
+    }
+    out.push_str(&format!("  auth   {}\n", auth));
+    if !image.is_empty() {
+        out.push_str(&format!("  image  {}\n", image));
+    }
+    out
+}
+
+fn describe_image(meta: &GoldenMeta) -> String {
+    [
+        ("alpine", &meta.alpine),
+        ("node", &meta.node),
+        ("claude", &meta.claude),
+    ]
+    .iter()
+    .filter(|(_, v)| !v.is_empty())
+    .map(|(k, v)| format!("{} {}", k, v))
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
 /// cloud-config for `--build-image`. Everything slow and workspace-independent lives here.
 ///
 /// Alpine, not Ubuntu: measured at a third of the disk footprint (632 MB against 1.9 GB) with a
@@ -655,13 +821,17 @@ fn build_cloud_init(
     claude_config: &str,
     credentials: Option<&str>,
 ) -> String {
-    // The echo proves the plumbing worked. Without it, a command that produces no output is
-    // indistinguishable from a sandbox that failed to run it at all.
+    // The breadcrumb goes to the boot console, not stdout. It exists so a command that produces
+    // no output is still distinguishable from a sandbox that never ran it — but the user's stdout
+    // belongs to the command alone, and geli's own status block now covers the visible case.
     let session = format!(
         "cd /workspace/{} || true\n\
-         echo '[geli] workspace ready; starting your command.'\n\
+         echo '[geli] running: {}' > /dev/{} 2>/dev/null || true\n\
          {}\n",
-        plan.active_folder, command
+        plan.active_folder,
+        plan.active_folder,
+        BOOT_CONSOLE.split(',').next().unwrap_or("ttyS1"),
+        command
     );
 
     format!(
@@ -710,7 +880,8 @@ runcmd:
 mod linux {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Stdio;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
 
     /// Where QEMU's console goes. Sessions inherit the terminal so the agent is interactive;
     /// image builds are unattended and go to a log we can inspect afterwards.
@@ -842,12 +1013,23 @@ mod linux {
         Ok(())
     }
 
+    /// Boots the kernel directly instead of going through the firmware and bootloader, with the
+    /// guest's console on a second serial port.
+    pub struct DirectBoot {
+        pub kernel: PathBuf,
+        pub initrd: PathBuf,
+        pub cmdline: String,
+        /// Where the guest's boot console goes. Never the user's terminal.
+        pub console_log: PathBuf,
+    }
+
     pub fn run_qemu(
         disk: &Path,
         iso: &Path,
         extra_args: Vec<String>,
         io_mode: QemuIo,
-    ) -> io::Result<()> {
+        direct: Option<&DirectBoot>,
+    ) -> io::Result<Child> {
         let mut args: Vec<String> = vec![
             "-m".into(),
             "4G".into(),
@@ -866,23 +1048,55 @@ mod linux {
             format!("file={},format=raw,if=virtio", iso.display()),
             "-netdev".into(),
             "user,id=net0".into(),
-            "-device".into(),
-            "virtio-net-pci,netdev=net0".into(),
-            "-serial".into(),
-            "mon:stdio".into(),
         ];
+
+        if direct.is_some() {
+            // The iPXE option ROM prints a banner and is never used — nothing here network-boots.
+            args.push("-device".into());
+            args.push("virtio-net-pci,netdev=net0,romfile=".into());
+            // Silences SeaBIOS's own serial banner.
+            args.push("-fw_cfg".into());
+            args.push("name=etc/sercon-port,string=0".into());
+        } else {
+            args.push("-device".into());
+            args.push("virtio-net-pci,netdev=net0".into());
+        }
+
+        // Order matters: the first -serial is ttyS0, the second ttyS1.
+        args.push("-serial".into());
+        args.push("mon:stdio".into());
+
+        if let Some(d) = direct {
+            args.push("-serial".into());
+            args.push(format!("file:{}", d.console_log.display()));
+            args.push("-kernel".into());
+            args.push(d.kernel.to_string_lossy().into_owned());
+            args.push("-initrd".into());
+            args.push(d.initrd.to_string_lossy().into_owned());
+            args.push("-append".into());
+            args.push(d.cmdline.clone());
+        }
+
         args.extend(extra_args);
 
         let mut command = Command::new("qemu-system-x86_64");
         command.args(&args);
 
         match io_mode {
-            // Inherit the terminal so the agent gets a real interactive TTY.
+            // Inherit the terminal so the agent gets a real interactive TTY. QEMU's own stderr
+            // goes to the console log when there is one: its warnings are not the user's problem,
+            // and the whole point here is that nothing but geli and the command reach the screen.
             QemuIo::Interactive => {
-                command
-                    .stdin(Stdio::inherit())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit());
+                command.stdin(Stdio::inherit()).stdout(Stdio::inherit());
+                match direct.map(|d| &d.console_log) {
+                    Some(log) => {
+                        let f = fs::OpenOptions::new().create(true).append(true).open(log)?;
+                        command.stderr(Stdio::from(f));
+                    }
+                    None => {
+                        command.stderr(Stdio::inherit());
+                    }
+                }
             }
             QemuIo::LogTo(path) => {
                 let log = File::create(&path)?;
@@ -893,9 +1107,23 @@ mod linux {
             }
         }
 
-        let mut child = command.spawn()?;
-        child.wait()?;
-        Ok(())
+        command.spawn()
+    }
+
+    /// Wait for the guest to say it is ready, by polling the boot console log for the marker
+    /// `mounts.sh` writes. Returns false on timeout — the caller must hand the terminal over
+    /// anyway rather than spin forever on a guest that will never answer.
+    pub fn wait_for_ready(log: &Path, marker: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok(text) = fs::read_to_string(log) {
+                if text.contains(marker) {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        false
     }
 }
 
@@ -931,13 +1159,26 @@ fn build_golden_image() -> io::Result<()> {
     let pending = dir.join(format!("{}.building", GOLDEN_IMAGE_NAME));
     let log_path = dir.join(GOLDEN_BUILD_LOG);
 
+    // The build VM hands the kernel, initramfs and metadata back through this share.
+    let out_dir = staging_dir(&format!("geli-out-{}", pid))?;
+    let out_share = vec![
+        "-fsdev".to_string(),
+        format!(
+            "local,path={},id={},security_model=none",
+            out_dir.display(),
+            GOLDEN_OUT_TAG
+        ),
+        "-device".to_string(),
+        format!("virtio-9p-pci,fsdev={},mount_tag={}", GOLDEN_OUT_TAG, GOLDEN_OUT_TAG),
+    ];
+
     create_overlay(&base_img, &pending, Some(SANDBOX_DISK_SIZE))?;
 
     println!("[*] Building golden image. This takes a few minutes, once.");
     println!("[*] Installing: bash, Node {REQUIRED_NODE_MAJOR}, python3, pip, git, @anthropic-ai/claude-code");
     println!("[*] Follow along with:  tail -f {}", log_path.display());
 
-    run_qemu(&pending, &iso, vec![], QemuIo::LogTo(log_path.clone()))?;
+    run_qemu(&pending, &iso, out_share, QemuIo::LogTo(log_path.clone()), None)?.wait()?;
 
     let console = fs::read_to_string(&log_path).unwrap_or_default();
     if !console.contains(GOLDEN_OK_MARKER) {
@@ -947,12 +1188,26 @@ fn build_golden_image() -> io::Result<()> {
         std::process::exit(1);
     }
 
+    // Direct boot is useless without these, so a build that did not produce them is a failure
+    // even if the guest reported every tool present.
+    for name in [KERNEL_NAME, INITRD_NAME, GOLDEN_META_NAME] {
+        let produced = out_dir.join(name);
+        if !produced.exists() {
+            let _ = fs::remove_file(&pending);
+            eprintln!("\n[!] Golden image build failed: the guest did not hand back {}.", name);
+            eprintln!("    Console log kept at {}", log_path.display());
+            std::process::exit(1);
+        }
+        fs::copy(&produced, dir.join(name))?;
+    }
+
     fs::rename(&pending, &target)?;
     fs::write(dir.join(GOLDEN_RECIPE_NAME), recipe_hash(&recipe))?;
     let _ = fs::remove_dir_all(&stage);
+    let _ = fs::remove_dir_all(&out_dir);
 
     println!("\n[✓] Golden image ready at {}", target.display());
-    println!("    Sandbox sessions now boot from it without installing anything.");
+    println!("    Sandbox sessions boot its kernel directly, installing nothing.");
     Ok(())
 }
 
@@ -971,7 +1226,7 @@ fn execute_sandbox(
     // Set GELI_KEEP=1 to preserve the session disk and cloud-init files for debugging.
     let keep_session = std::env::var_os("GELI_KEEP").is_some();
 
-    println!("[*] Verifying system hypervisor requirements...");
+    let started = std::time::Instant::now();
     check_host_tools();
 
     let images = images_dir();
@@ -981,6 +1236,19 @@ fn execute_sandbox(
         eprintln!("Build it once with:\n  geli --build-image\n");
         std::process::exit(1);
     }
+
+    let meta_path = images.join(GOLDEN_META_NAME);
+    let kernel = images.join(KERNEL_NAME);
+    let initrd = images.join(INITRD_NAME);
+    for required in [&meta_path, &kernel, &initrd] {
+        if !required.exists() {
+            eprintln!("\n[!] Error: {} is missing.", required.display());
+            eprintln!("Sessions boot the image's kernel directly. Rebuild it once with:");
+            eprintln!("  geli --build-image\n");
+            std::process::exit(1);
+        }
+    }
+    let meta = parse_golden_meta(&fs::read_to_string(&meta_path).unwrap_or_default());
 
     // Stale images still boot — they are merely out of date, not broken.
     let expected = recipe_hash(&build_golden_cloud_init(host_uid()));
@@ -999,21 +1267,20 @@ fn execute_sandbox(
     let vm_share_dir = staging_dir(&format!("sandbox-share-{}", pid))?;
     let sandbox_img = PathBuf::from(format!("/tmp/sandbox-session-{}.qcow2", pid));
 
-    println!("[*] Initializing workspace [{}] with paths:", ws);
-
     let cur_canon = cur.canonicalize()?;
     let plan = build_mount_script(&dirs, &cur_canon);
 
     let mut qemu_args: Vec<String> = Vec::new();
+    let mut status_mounts: Vec<StatusMount> = Vec::new();
     for (i, dir) in dirs.iter().enumerate() {
         let tag = share_tag(i);
         let name = folder_name(dir);
 
-        if is_active_dir(dir, &cur_canon) {
-            println!("    -> [ACTIVE] {} => /workspace/{}", dir.display(), name);
-        } else {
-            println!("    -> [SHARED] {} => /workspace/{}", dir.display(), name);
-        }
+        status_mounts.push(StatusMount {
+            host: dir.display().to_string(),
+            guest: format!("/workspace/{}", name),
+            active: is_active_dir(dir, &cur_canon),
+        });
 
         qemu_args.push("-fsdev".to_string());
         qemu_args.push(format!(
@@ -1043,13 +1310,7 @@ fn execute_sandbox(
     // credits. Opt out with --no-credentials.
     let credentials = if forward_credentials {
         let path = home.join(".claude").join(".credentials.json");
-        match fs::read_to_string(&path) {
-            Ok(contents) => {
-                println!("[*] Forwarding Claude credentials from {}", path.display());
-                Some(contents)
-            }
-            Err(_) => None,
-        }
+        fs::read_to_string(&path).ok()
     } else {
         None
     };
@@ -1092,19 +1353,86 @@ fn execute_sandbox(
     // Session overlays sit on top of the golden image and inherit its size.
     create_overlay(&golden_img, &sandbox_img, None)?;
 
-    println!("[*] Launching hardware sandbox via QEMU...");
-    run_qemu(&sandbox_img, &iso, qemu_args, QemuIo::Interactive)?;
+    let auth = if credentials.is_some() {
+        "claude.ai credentials · bills your plan"
+    } else if !api_key_for_config.trim().is_empty() {
+        "ANTHROPIC_API_KEY · bills API credits"
+    } else {
+        "none"
+    };
+    eprint!(
+        "{}",
+        render_status(ws, &status_mounts, auth, &describe_image(&meta))
+    );
 
+    let console_log = vm_share_dir.join("console.log");
+    let direct = DirectBoot {
+        kernel,
+        initrd,
+        cmdline: boot_cmdline(&meta.cmdline),
+        console_log: console_log.clone(),
+    };
+
+    let mut child = run_qemu(
+        &sandbox_img,
+        &iso,
+        qemu_args,
+        QemuIo::Interactive,
+        Some(&direct),
+    )?;
+
+    // The guest writes nothing to this terminal while it boots — its console is on ttyS1 — so
+    // the spinner has the screen to itself until the sandbox is ready.
+    let spinning = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let spinner = {
+        let spinning = spinning.clone();
+        let animate = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+        if !animate {
+            eprintln!("  booting sandbox…");
+        }
+        std::thread::spawn(move || {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let mut i = 0;
+            while spinning.load(std::sync::atomic::Ordering::Relaxed) {
+                if animate {
+                    eprint!("\r  {} booting sandbox…", frames[i % frames.len()]);
+                    let _ = io::stderr().flush();
+                    i += 1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(90));
+            }
+            if animate {
+                eprint!("\r\x1b[2K");
+                let _ = io::stderr().flush();
+            }
+        })
+    };
+
+    let ready = wait_for_ready(&console_log, READY_MARKER, std::time::Duration::from_secs(90));
+    spinning.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = spinner.join();
+    if !ready {
+        eprintln!("[!] The sandbox never reported ready. Console log: {}", console_log.display());
+        eprintln!("    Re-run with GELI_KEEP=1 to keep it after exit.");
+    }
+
+    let qemu_status = child.wait()?;
+    if !qemu_status.success() {
+        eprintln!("[!] QEMU exited with {}. Console log: {}", qemu_status, console_log.display());
+    }
+
+    let elapsed = started.elapsed().as_secs_f32();
     if keep_session {
-        println!(
-            "[*] GELI_KEEP set; preserving {} and {}",
+        eprintln!(
+            "geli · done in {:.1}s · kept {} and {}",
+            elapsed,
             sandbox_img.display(),
             vm_share_dir.display()
         );
     } else {
         let _ = fs::remove_file(&sandbox_img);
         let _ = fs::remove_dir_all(&vm_share_dir);
-        println!("[*] Sandbox wiped cleanly.");
+        eprintln!("geli · done in {:.1}s · sandbox destroyed", elapsed);
     }
     Ok(())
 }
@@ -1202,6 +1530,11 @@ mod tests {
         // Alpine ships Node 22, so no tarball — but the version is still checked, because
         // npm installs onto a too-old runtime with only a warning.
         assert!(yaml.contains("apk add"));
+        // Every network step must be retried: a single dropped TLS handshake would otherwise
+        // fail the whole build under `set -e`.
+        assert!(yaml.contains("retry apk update"));
+        assert!(yaml.contains("retry apk add"));
+        assert!(yaml.contains("retry npm install"));
         assert!(!yaml.contains("apt-get"), "apt leaked into the Alpine recipe");
         assert!(yaml.contains(&format!("-ge {}", REQUIRED_NODE_MAJOR)));
         // bash is not optional: Alpine defaults to busybox ash and the agent's Bash tool needs bash.
@@ -1330,10 +1663,12 @@ mod tests {
         assert!(!command_invokes_claude(""));
     }
 
+    /// The breadcrumb must stay out of stdout: that stream belongs to the user's command.
     #[test]
-    fn session_announces_itself_before_running_the_command() {
+    fn session_breadcrumb_goes_to_the_boot_console_not_stdout() {
         let yaml = session_cloud_init(&["/home/u/proj"], "/home/u/proj", "claude");
-        assert!(yaml.contains("[geli] workspace ready"));
+        assert!(yaml.contains("[geli] running:"));
+        assert!(yaml.contains("> /dev/ttyS1"), "breadcrumb would land on the user's terminal");
     }
 
     /// Regression: the guest inherited TERM=vt220 and a fixed 80x24 from the serial getty, so
@@ -1468,6 +1803,104 @@ mod tests {
     fn forwarded_credentials_count_as_credentials() {
         // No API key, but credentials were copied in: nothing to warn about.
         assert!(credential_warning("claude", true).is_none());
+    }
+
+    /// The guest's console must never land on the user's terminal, and `root=` must survive:
+    /// hardcoding it is how a boot breaks silently on a differently-labelled image.
+    #[test]
+    fn boot_cmdline_moves_the_console_and_keeps_root() {
+        let original = "BOOT_IMAGE=vmlinuz-virt root=LABEL=/ modules=sd-mod,usb-storage,ext4 \
+                        console=ttyS0,115200n8 console=ttyAMA0,115200n8 initrd=initramfs-virt";
+        let out = boot_cmdline(original);
+
+        assert!(out.contains("root=LABEL=/"));
+        assert!(out.contains("modules=sd-mod,usb-storage,ext4"));
+        assert!(out.contains(&format!("console={}", BOOT_CONSOLE)));
+        assert!(out.contains("quiet"));
+
+        // Nothing may route the guest console back to ttyS0, and the bootloader's own keys are
+        // meaningless without a bootloader.
+        assert!(!out.contains("ttyS0"));
+        assert!(!out.contains("BOOT_IMAGE="));
+        assert!(!out.contains("initrd="));
+    }
+
+    #[test]
+    fn boot_cmdline_is_idempotent() {
+        let once = boot_cmdline("root=LABEL=/ console=ttyS0,115200n8");
+        assert_eq!(once, boot_cmdline(&once), "re-deriving must not stack flags");
+        assert_eq!(once.matches("quiet").count(), 1);
+    }
+
+    #[test]
+    fn golden_meta_round_trips() {
+        let meta = parse_golden_meta(
+            "cmdline=root=LABEL=/ console=ttyS0\nalpine=3.22.2\nnode=22.23.2\nclaude=2.1.289\n",
+        );
+        assert_eq!(meta.alpine, "3.22.2");
+        assert_eq!(meta.node, "22.23.2");
+        assert_eq!(meta.claude, "2.1.289");
+        assert!(meta.cmdline.starts_with("root=LABEL=/"));
+        assert_eq!(describe_image(&meta), "alpine 3.22.2 · node 22.23.2 · claude 2.1.289");
+    }
+
+    #[test]
+    fn golden_meta_tolerates_a_missing_or_partial_file() {
+        assert_eq!(parse_golden_meta(""), GoldenMeta::default());
+        let partial = parse_golden_meta("node=22.23.2\ngarbage line\n");
+        assert_eq!(partial.node, "22.23.2");
+        // An image line with holes in it should not print empty fields.
+        assert_eq!(describe_image(&partial), "node 22.23.2");
+    }
+
+    #[test]
+    fn status_block_shows_mounts_auth_and_image() {
+        let mounts = vec![
+            StatusMount { host: "/home/u/proj".into(), guest: "/workspace/proj".into(), active: true },
+            StatusMount { host: "/home/u/api".into(), guest: "/workspace/api".into(), active: false },
+        ];
+        let out = render_status("acme", &mounts, "claude.ai credentials", "alpine 3.22");
+
+        assert!(out.starts_with("geli · workspace acme\n"));
+        assert!(out.contains("/home/u/proj → /workspace/proj  (active)"));
+        assert!(out.contains("/home/u/api → /workspace/api\n"));
+        assert!(out.contains("auth   claude.ai credentials"));
+        assert!(out.contains("image  alpine 3.22"));
+    }
+
+    /// Regression guard for the point of this change: the session must leave the guest's console
+    /// somewhere other than the terminal, and signal readiness through it.
+    #[test]
+    fn mount_script_ends_with_the_ready_marker() {
+        let plan = build_mount_script(&[PathBuf::from("/home/u/proj")], Path::new("/home/u/proj"));
+        assert_eq!(
+            plan.script.trim_end().lines().last().unwrap().trim(),
+            format!("echo {}", READY_MARKER)
+        );
+        // The session writes its breadcrumb there, and /dev is rebuilt every boot.
+        assert!(plan.script.contains("chmod 0666 /dev/ttyS1"));
+    }
+
+    #[test]
+    fn golden_recipe_silences_the_guest_and_hands_out_the_kernel() {
+        let yaml = build_golden_cloud_init(1000);
+        // Nothing of the distro's own chatter should reach a clean session.
+        assert!(yaml.contains("rm -f /etc/motd"));
+        assert!(yaml.contains("/etc/issue"));
+        // Direct boot needs these out of the image.
+        assert!(yaml.contains(KERNEL_NAME));
+        assert!(yaml.contains(INITRD_NAME));
+        assert!(yaml.contains(GOLDEN_META_NAME));
+        assert!(yaml.contains("/proc/cmdline"), "the cmdline must be captured, not invented");
+    }
+
+    #[test]
+    fn login_profile_flushes_before_cutting_power() {
+        // The project lives on 9p; a forced poweroff without sync can lose writes.
+        // Match the commands, not the comment that mentions them.
+        let sync = GOLDEN_PROFILE.find("\n        sync\n").expect("no sync before poweroff");
+        let off = GOLDEN_PROFILE.find("sudo poweroff -f").expect("not a forced poweroff");
+        assert!(sync < off, "sync must run before power is cut");
     }
 
     #[test]
