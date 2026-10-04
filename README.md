@@ -29,8 +29,8 @@ Early. It works, with caveats worth knowing before you rely on it:
 - **Network is open.** The guest has unrestricted outbound access. This is a deliberate choice
   for now, not an oversight — see [Security notes](#security-notes).
 - **The agent version is frozen into the image.** Rebuild with `geli --build-image` to update it.
-- **`geli claude` needs `ANTHROPIC_API_KEY`.** Host OAuth credentials are not forwarded — see
-  [Authentication](#authentication).
+- **Your Claude account token is copied into the sandbox** by default so the agent can work —
+  see [Authentication](#authentication) for the trade and how to opt out.
 
 ## Requirements
 
@@ -60,6 +60,7 @@ minutes. It is what makes every subsequent session start in seconds.
 geli <command> [args...]    # run a command inside the sandbox
 geli --list                 # show the workspace registry
 geli --build-image          # rebuild the golden image (also how you update the agent)
+geli --no-credentials <cmd>  # do not copy your Claude credentials into the sandbox
 ```
 
 A session starts in **~15 seconds**, because it installs nothing — see
@@ -153,22 +154,47 @@ the window mid-session will not reach the guest — restart the session to pick 
 
 ## Authentication
 
-The sandbox is a fresh machine with no Claude state, so the agent inside it needs credentials
-passed in:
+The sandbox is a fresh machine with no Claude state, so credentials have to come from the host.
+By default geli copies `~/.claude/.credentials.json` in, so `geli claude` just works and bills
+your Claude plan:
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
 geli claude
 ```
 
-**If you normally sign in to Claude Code with your Anthropic account, that is not enough on its
-own.** Those OAuth credentials live in `~/.claude/.credentials.json` on your host, and geli does
-not forward them — handing an agent your account credentials is a bigger grant than handing it a
-scoped API key, and the whole point of the sandbox is to narrow what the agent gets.
+Only that one file is copied. The rest of `~/.claude` — conversation transcripts, prompt history,
+file snapshots across every project you have worked on — stays on the host.
 
-Without a key, `claude` starts its first-run login flow inside the VM and waits for input that
-never arrives, so the session looks like it has hung. geli checks for this before booting and
-warns you rather than letting you wait for it.
+Use an API key instead by exporting one; it takes precedence over the copied credentials, and
+bills API credits rather than your plan:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...   # scope it to geli, see below
+geli claude
+```
+
+`geli --no-credentials claude` forwards neither. With no credentials at all, `claude` starts its
+first-run login flow inside the VM and waits for input that never arrives, so the session looks
+like it has hung — geli checks before booting and warns you instead.
+
+> **Careful with a global `export ANTHROPIC_API_KEY`.** It also takes precedence over your *host*
+> Claude Code login, silently switching your everyday `claude` from your plan to API billing. To
+> scope it to geli alone, wrap it in your shell rc instead:
+>
+> ```zsh
+> geli() { ANTHROPIC_API_KEY="sk-ant-..." command geli "$@"; }
+> ```
+
+### What copying the credential means
+
+The agent inside the sandbox can read your Claude account token, and the guest network is
+currently unrestricted. That is a deliberate trade: geli's job is to keep the agent away from
+files you did not give it, and a credential is not one of those. If you would rather not make it,
+`--no-credentials` plus a scoped API key gives you a revocable credential instead.
+
+One caveat: the copy is one-way. If the token is refreshed inside the sandbox, the new one dies
+with the VM. Should a refresh ever invalidate the host's copy, re-run `claude` on the host to log
+back in.
 
 ## Security notes
 
@@ -178,9 +204,9 @@ worth stating plainly:
 - **The guest has unrestricted network access.** An agent that wants to exfiltrate the code it was
   given can do so. Restricting egress to an allowlist is planned; today the only reason it is open
   is that `apt` and `npm` run on every boot.
-- **Your API keys are handed to the agent.** They are written into the guest environment, because
-  the agent needs them. The sandbox does not protect the credential, only the host. Your host
-  `~/.claude` OAuth credentials are deliberately *not* forwarded.
+- **Your credentials are handed to the agent.** An API key, or your copied Claude account token,
+  is written into the guest because the agent needs it. The sandbox protects your files, not your
+  credential. Only `.credentials.json` is copied — never your Claude history or transcripts.
 - **Only the directories in the workspace are visible.** Everything else on your machine is not
   reachable from inside.
 

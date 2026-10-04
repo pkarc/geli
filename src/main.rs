@@ -18,6 +18,10 @@ struct Cli {
     #[arg(long)]
     build_image: bool,
 
+    /// Do not copy the host's Claude credentials into the sandbox
+    #[arg(long)]
+    no_credentials: bool,
+
     /// Command and arguments passed to execute inside the sandbox
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     agent_args: Vec<String>,
@@ -53,7 +57,13 @@ fn main() -> io::Result<()> {
     let mapped_dirs = get_directories_in_workspace(&workspace_name)?;
     let command_to_run = args.agent_args.join(" ");
 
-    execute_sandbox(&workspace_name, &current_dir, mapped_dirs, &command_to_run)?;
+    execute_sandbox(
+        &workspace_name,
+        &current_dir,
+        mapped_dirs,
+        &command_to_run,
+        !args.no_credentials,
+    )?;
     Ok(())
 }
 
@@ -455,11 +465,33 @@ fn build_terminal_setup(term: &str, colorterm: &str, size: Option<(u16, u16)>) -
     out
 }
 
+/// Empty values are skipped rather than exported blank: Claude Code treats a set
+/// `ANTHROPIC_API_KEY` as taking precedence over an OAuth login, so exporting an empty one would
+/// shadow forwarded credentials.
 fn build_env_exports(vars: &[(&str, String)]) -> String {
     vars.iter()
+        .filter(|(_, value)| !value.trim().is_empty())
         .map(|(key, value)| format!("export {}={}", key, shell_quote(value)))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Optional extra `write_files` entry carrying the host's Claude credentials.
+///
+/// Copied, not mounted: the sandbox's job is to protect files the agent was not given, and a
+/// credential is not one of those. The copy is what makes the agent bill the user's plan instead
+/// of API credits.
+fn build_credentials_entry(credentials: Option<&str>) -> String {
+    match credentials {
+        None => String::new(),
+        Some(json) => format!(
+            "  - path: /home/sandbox/.claude/.credentials.json\n    \
+             permissions: '0600'\n    \
+             owner: sandbox:sandbox\n    \
+             content: |\n{}\n",
+            indent_block(json, 6)
+        ),
+    }
 }
 
 /// cloud-config for `--build-image`. Everything slow and workspace-independent lives here.
@@ -514,6 +546,7 @@ fn build_cloud_init(
     command: &str,
     env_exports: &str,
     claude_config: &str,
+    credentials: Option<&str>,
 ) -> String {
     // The echo proves the plumbing worked. Without it, a command that produces no output is
     // indistinguishable from a sandbox that failed to run it at all.
@@ -550,14 +583,17 @@ write_files:
     content: |
 {claude_config}
 
+{credentials}
 runcmd:
   - bash /etc/geli/mounts.sh
+  - chown -R sandbox:sandbox /home/sandbox/.claude /home/sandbox/.claude.json || true
   - chown -R sandbox:sandbox /home/sandbox/.cache /workspace || true
 "#,
         env = indent_block(env_exports, 6),
         mounts = indent_block(&plan.script, 6),
         session = indent_block(&session, 6),
         claude_config = indent_block(claude_config, 6),
+        credentials = build_credentials_entry(credentials),
     )
 }
 
@@ -807,7 +843,13 @@ fn build_golden_image() -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn execute_sandbox(ws: &str, cur: &Path, dirs: Vec<PathBuf>, cmd: &str) -> io::Result<()> {
+fn execute_sandbox(
+    ws: &str,
+    cur: &Path,
+    dirs: Vec<PathBuf>,
+    cmd: &str,
+    forward_credentials: bool,
+) -> io::Result<()> {
     use linux::*;
 
     let pid = std::process::id();
@@ -883,10 +925,26 @@ fn execute_sandbox(ws: &str, cur: &Path, dirs: Vec<PathBuf>, cmd: &str) -> io::R
     let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
     let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
 
-    if let Some(warning) = credential_warning(
-        cmd,
-        !anthropic_key.trim().is_empty() || !openai_key.trim().is_empty(),
-    ) {
+    // Copied in so the agent authenticates as the user and bills their plan rather than API
+    // credits. Opt out with --no-credentials.
+    let credentials = if forward_credentials {
+        let path = home.join(".claude").join(".credentials.json");
+        match fs::read_to_string(&path) {
+            Ok(contents) => {
+                println!("[*] Forwarding Claude credentials from {}", path.display());
+                Some(contents)
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let has_credentials = !anthropic_key.trim().is_empty()
+        || !openai_key.trim().is_empty()
+        || credentials.is_some();
+
+    if let Some(warning) = credential_warning(cmd, has_credentials) {
         eprintln!("\n{}\n", warning);
     }
 
@@ -903,7 +961,13 @@ fn execute_sandbox(ws: &str, cur: &Path, dirs: Vec<PathBuf>, cmd: &str) -> io::R
     ));
 
     let claude_config = build_claude_config(&plan.folders, &api_key_for_config);
-    let user_data = build_cloud_init(&plan, cmd, &env_exports, &claude_config);
+    let user_data = build_cloud_init(
+        &plan,
+        cmd,
+        &env_exports,
+        &claude_config,
+        credentials.as_deref(),
+    );
     let iso = make_cloud_init_iso(
         &vm_share_dir,
         &user_data,
@@ -938,12 +1002,24 @@ fn build_golden_image() -> io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn execute_sandbox(_ws: &str, _cur: &Path, _dirs: Vec<PathBuf>, _cmd: &str) -> io::Result<()> {
+fn execute_sandbox(
+    _ws: &str,
+    _cur: &Path,
+    _dirs: Vec<PathBuf>,
+    _cmd: &str,
+    _forward_credentials: bool,
+) -> io::Result<()> {
     eprintln!("macOS backend is not yet implemented.");
     Ok(())
 }
 #[cfg(target_os = "windows")]
-fn execute_sandbox(_ws: &str, _cur: &Path, _dirs: Vec<PathBuf>, _cmd: &str) -> io::Result<()> {
+fn execute_sandbox(
+    _ws: &str,
+    _cur: &Path,
+    _dirs: Vec<PathBuf>,
+    _cmd: &str,
+    _forward_credentials: bool,
+) -> io::Result<()> {
     eprintln!("Windows backend is not yet implemented.");
     Ok(())
 }
@@ -958,7 +1034,7 @@ mod tests {
         let plan = build_mount_script(&dirs, Path::new(current));
         let env = build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]);
         let config = build_claude_config(&plan.folders, "sk-ant-test-key-0123456789");
-        build_cloud_init(&plan, cmd, &env, &config)
+        build_cloud_init(&plan, cmd, &env, &config, None)
     }
 
     /// The bug that made geli never work: a YAML document that does not parse.
@@ -1125,7 +1201,7 @@ mod tests {
             build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]),
             build_terminal_setup("screen-256color", "truecolor", Some((24, 100)))
         );
-        let yaml = build_cloud_init(&plan, "claude", &env, "{}");
+        let yaml = build_cloud_init(&plan, "claude", &env, "{}", None);
 
         assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
         assert!(yaml.contains("screen-256color"));
@@ -1168,6 +1244,51 @@ mod tests {
         assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
         assert!(yaml.contains("/home/sandbox/.claude.json"));
         assert!(yaml.contains("hasTrustDialogAccepted"));
+    }
+
+    #[test]
+    fn forwarded_credentials_land_in_cloud_init() {
+        let dirs = [PathBuf::from("/home/u/proj")];
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"));
+        let creds = r#"{"claudeAiOauth":{"accessToken":"tok","refreshToken":"ref"}}"#;
+        let yaml = build_cloud_init(&plan, "claude", "", "{}", Some(creds));
+
+        assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
+        assert!(yaml.contains("/home/sandbox/.claude/.credentials.json"));
+        assert!(yaml.contains("accessToken"));
+        // Must not be world-readable inside the guest.
+        let block = yaml.split("/home/sandbox/.claude/.credentials.json").nth(1).unwrap();
+        assert!(block.contains("permissions: '0600'"));
+    }
+
+    #[test]
+    fn omitting_credentials_leaves_the_document_valid() {
+        let yaml = session_cloud_init(&["/home/u/proj"], "/home/u/proj", "claude");
+        assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
+        assert!(!yaml.contains(".credentials.json"));
+    }
+
+    /// A blank ANTHROPIC_API_KEY would shadow forwarded OAuth credentials, because Claude Code
+    /// treats the variable's presence as taking precedence over a claude.ai login.
+    #[test]
+    fn empty_env_vars_are_not_exported() {
+        let exports = build_env_exports(&[
+            ("ANTHROPIC_API_KEY", String::new()),
+            ("OPENAI_API_KEY", "   ".to_string()),
+        ]);
+        assert_eq!(exports, "");
+
+        let exports = build_env_exports(&[
+            ("ANTHROPIC_API_KEY", "sk-real".to_string()),
+            ("OPENAI_API_KEY", String::new()),
+        ]);
+        assert_eq!(exports, "export ANTHROPIC_API_KEY='sk-real'");
+    }
+
+    #[test]
+    fn forwarded_credentials_count_as_credentials() {
+        // No API key, but credentials were copied in: nothing to warn about.
+        assert!(credential_warning("claude", true).is_none());
     }
 
     #[test]
