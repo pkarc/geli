@@ -234,5 +234,14 @@ See [CLAUDE.md](CLAUDE.md) for architecture detail and [docs/plans/](docs/plans/
 
 1. ~~Make the sandbox boot and run the command~~ — done
 2. ~~Golden image, to cut boot from minutes to seconds~~ — done (~4.5 min → ~15 s)
-3. Network egress policy
-4. Optional KVM, for hosts without hardware virtualization
+3. ~~Alpine as the guest base~~ — done (1.9 GB → 656 MB, same session time)
+4. **Quiet output.** A session prints 615 lines, of which 613 are a kernel log, service startup,
+   a distro MOTD and a shutdown sequence. Two are yours. Boot and shutdown consoles should go to
+   a log file on a second serial port — leaving the stream you see untouched for the agent's TUI —
+   with geli printing its own short lines around your command's output.
+5. Network egress policy. The guest currently reaches anything; the file boundary holds but
+   confidentiality of what the agent *was* given does not.
+6. Optional KVM, for hosts without hardware virtualization.
+7. Faster boot: direct kernel boot (`-kernel`/`-initrd`) skips SeaBIOS, iPXE and SYSLINUX
+   entirely. Dropping the unused iPXE option ROM (`romfile=`) and trimming the 4 GB RAM ceiling
+   (the guest uses 476 MB) are smaller versions of the same idea.
