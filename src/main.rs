@@ -372,6 +372,16 @@ const GOLDEN_META_NAME: &str = "geli-golden.meta";
 /// says while booting goes here instead, into a log file on the host.
 const BOOT_CONSOLE: &str = "ttyS1,115200n8";
 
+/// Phases the host can actually observe, in order, each identified by something the guest itself
+/// writes to the boot console. Progress is read from the guest's own output, never guessed from a
+/// timer — a progress bar that advances on a clock lies exactly when it matters.
+const BOOT_PHASES: &[(&str, &str)] = &[
+    ("boot", "OpenRC"),
+    ("network", "Starting networking"),
+    ("cloud-init", "running 'init'"),
+    ("mounts", "mount -t 9p"),
+];
+
 /// Written by `mounts.sh` as its last act. The host polls the boot log for it to know the
 /// sandbox is ready — `runcmd` output lands in that log, so no extra channel is needed.
 const READY_MARKER: &str = "geli:ready";
@@ -705,6 +715,28 @@ fn parse_golden_meta(raw: &str) -> GoldenMeta {
         }
     }
     meta
+}
+
+/// Furthest phase the boot log shows evidence of.
+fn boot_phase(log: &str) -> &'static str {
+    BOOT_PHASES
+        .iter()
+        .rev()
+        .find(|(_, marker)| log.contains(marker))
+        .map(|(name, _)| *name)
+        .unwrap_or("starting")
+}
+
+/// One frame of the loading line. Pure so the colour handling is testable: escape codes in a
+/// piped log are noise, and `NO_COLOR` exists.
+fn render_spinner_line(frame: char, phase: &str, elapsed: f32, color: bool) -> String {
+    if color {
+        format!(
+            "  \x1b[36m{frame}\x1b[0m booting · \x1b[1m{phase}\x1b[0m \x1b[2m· {elapsed:.1}s\x1b[0m"
+        )
+    } else {
+        format!("  {frame} booting · {phase} · {elapsed:.1}s")
+    }
 }
 
 /// Rewrite the image's own command line for a direct boot: the guest's console moves off the
@@ -1112,18 +1144,47 @@ mod linux {
         command.spawn()
     }
 
-    /// Wait for the guest to say it is ready, by polling the boot console log for the marker
-    /// `mounts.sh` writes. Returns false on timeout — the caller must hand the terminal over
-    /// anyway rather than spin forever on a guest that will never answer.
-    pub fn wait_for_ready(log: &Path, marker: &str, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
+    /// Show which phase the guest is in and return once it reports ready.
+    ///
+    /// Returns false on timeout. That matters: a guest whose cloud-init broke will never write
+    /// the marker, and the terminal has to be handed over regardless rather than spin forever.
+    pub fn track_boot(log: &Path, animate: bool, color: bool, timeout: Duration) -> bool {
+        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let mut frame = 0usize;
+        let mut announced = "";
+
         while Instant::now() < deadline {
-            if let Ok(text) = fs::read_to_string(log) {
-                if text.contains(marker) {
-                    return true;
+            let text = fs::read_to_string(log).unwrap_or_default();
+            if text.contains(READY_MARKER) {
+                if animate {
+                    eprint!("\r\x1b[2K");
+                    let _ = io::stderr().flush();
                 }
+                return true;
             }
-            std::thread::sleep(Duration::from_millis(60));
+
+            let phase = boot_phase(&text);
+            if animate {
+                eprint!(
+                    "\r\x1b[2K{}",
+                    render_spinner_line(
+                        FRAMES[frame % FRAMES.len()],
+                        phase,
+                        started.elapsed().as_secs_f32(),
+                        color
+                    )
+                );
+                let _ = io::stderr().flush();
+                frame += 1;
+            } else if phase != announced {
+                // Piped or logged: one line per phase instead of an animation nobody will see.
+                eprintln!("  booting · {}", phase);
+                announced = phase;
+            }
+
+            std::thread::sleep(Duration::from_millis(90));
         }
         false
     }
@@ -1384,35 +1445,19 @@ fn execute_sandbox(
     )?;
 
     // The guest writes nothing to this terminal while it boots — its console is on ttyS1 — so
-    // the spinner has the screen to itself until the sandbox is ready.
-    let spinning = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let spinner = {
-        let spinning = spinning.clone();
-        let animate = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-        if !animate {
-            eprintln!("  booting sandbox…");
-        }
+    // the loading line has the screen to itself. It also owns the readiness poll: the phase it
+    // displays and the signal to hand over come from the same log.
+    let ready = {
+        let log = console_log.clone();
+        let animate = std::io::stderr().is_terminal();
+        let color = animate && std::env::var_os("NO_COLOR").is_none();
         std::thread::spawn(move || {
-            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            let mut i = 0;
-            while spinning.load(std::sync::atomic::Ordering::Relaxed) {
-                if animate {
-                    eprint!("\r  {} booting sandbox…", frames[i % frames.len()]);
-                    let _ = io::stderr().flush();
-                    i += 1;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(90));
-            }
-            if animate {
-                eprint!("\r\x1b[2K");
-                let _ = io::stderr().flush();
-            }
+            track_boot(&log, animate, color, std::time::Duration::from_secs(90))
         })
+        .join()
+        .unwrap_or(false)
     };
 
-    let ready = wait_for_ready(&console_log, READY_MARKER, std::time::Duration::from_secs(90));
-    spinning.store(false, std::sync::atomic::Ordering::Relaxed);
-    let _ = spinner.join();
     if !ready {
         eprintln!("[!] The sandbox never reported ready. Console log: {}", console_log.display());
         eprintln!("    Re-run with GELI_KEEP=1 to keep it after exit.");
@@ -1809,6 +1854,42 @@ mod tests {
 
     /// The guest's console must never land on the user's terminal, and `root=` must survive:
     /// hardcoding it is how a boot breaks silently on a differently-labelled image.
+    /// Phases must come from the guest's own output. A loader that advances on a timer is
+    /// confidently wrong exactly when the boot is stuck, which is the only time anyone reads it.
+    #[test]
+    fn boot_phase_tracks_the_guest_not_a_clock() {
+        assert_eq!(boot_phase(""), "starting");
+        assert_eq!(boot_phase("   OpenRC 0.62.6 is starting up"), "boot");
+        assert_eq!(boot_phase("OpenRC\n * Starting networking ... [ ok ]"), "network");
+        assert_eq!(
+            boot_phase("OpenRC\nStarting networking\nCloud-init v. 24.3.1 running 'init' at"),
+            "cloud-init"
+        );
+        assert_eq!(
+            boot_phase("OpenRC\nStarting networking\nrunning 'init'\n+ mount -t 9p -o trans=virtio"),
+            "mounts"
+        );
+    }
+
+    /// `running 'init-local'` is an earlier stage and must not be mistaken for `running 'init'`.
+    #[test]
+    fn boot_phase_does_not_confuse_init_local_with_init() {
+        let early = "OpenRC\nCloud-init v. 24.3.1 running 'init-local' at Sun";
+        assert_eq!(boot_phase(early), "boot");
+    }
+
+    #[test]
+    fn spinner_line_honours_no_color() {
+        let plain = render_spinner_line('⠹', "cloud-init", 2.44, false);
+        assert_eq!(plain, "  ⠹ booting · cloud-init · 2.4s");
+        assert!(!plain.contains('\x1b'), "escape codes in a piped log are noise");
+
+        let colored = render_spinner_line('⠹', "mounts", 7.0, true);
+        assert!(colored.contains('\x1b'));
+        assert!(colored.contains("mounts"));
+        assert!(colored.contains("7.0s"));
+    }
+
     #[test]
     fn boot_cmdline_moves_the_console_and_keeps_root() {
         let original = "BOOT_IMAGE=vmlinuz-virt root=LABEL=/ modules=sd-mod,usb-storage,ext4 \

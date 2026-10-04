@@ -55,9 +55,11 @@ The Linux path builds a VM per invocation, keyed by host PID to avoid collisions
 
 ### Output
 
-geli's own status goes to **stderr**, the command owns **stdout**. `geli claude > out.txt` must capture the command and nothing else. Before launch it prints a block with what is mounted, which credential is in play, and what is inside the image — the facts that change per invocation; anything identical every session is noise even when geli writes it. A spinner runs until the guest signals readiness, then clears its line.
+geli's own status goes to **stderr**, the command owns **stdout**. `geli claude > out.txt` must capture the command and nothing else. Before launch it prints a block with what is mounted, which credential is in play, and what is inside the image — the facts that change per invocation; anything identical every session is noise even when geli writes it. A loading line runs until the guest signals readiness, then clears itself. It names the phase the guest is actually in — `starting`, `boot`, `network`, `cloud-init`, `mounts` — and every one of those is a string the guest writes to its own boot console (`BOOT_PHASES`). **Never advance it on a timer:** a progress indicator that moves on a clock is confidently wrong exactly when the boot is stuck, which is the only time anyone reads it.
 
-Readiness is a marker `mounts.sh` echoes as its last act. `runcmd` output lands in the boot console log, which the host polls — so no extra channel is needed. The poll **must** keep its timeout: a guest whose cloud-init broke will never answer, and the terminal has to be handed over anyway.
+Readiness is a marker `mounts.sh` echoes as its last act. `runcmd` output lands in the boot console log, which `track_boot` polls for both the phase and the signal. The poll **must** keep its timeout: a guest whose cloud-init broke will never answer, and the terminal has to be handed over anyway.
+
+Colour is on only when stderr is a terminal and `NO_COLOR` is unset; piped, the same phases print one line each so a CI log still shows where a boot died.
 
 ### Things to know when editing
 
