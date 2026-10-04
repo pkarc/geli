@@ -611,6 +611,11 @@ mod linux {
             "-m".into(),
             "4G".into(),
             "-enable-kvm".into(),
+            // Without this QEMU emulates `qemu64`, a deliberately conservative CPU model missing
+            // most modern instruction sets. Passing the host CPU through is both much faster and
+            // avoids guest userspace that feature-detects its way into bad paths.
+            "-cpu".into(),
+            "host".into(),
             "-smp".into(),
             "2".into(),
             "-nographic".into(),
