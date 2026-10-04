@@ -391,6 +391,32 @@ fn credential_warning(command: &str, has_credentials: bool) -> Option<String> {
     }
 }
 
+/// The serial getty hands the guest `TERM=vt220` and a fixed 80x24, regardless of the terminal
+/// geli was launched from. A TUI then renders in eight colours in a cramped window. Forwarding
+/// the host's terminal identity fixes both.
+///
+/// Serial lines carry no SIGWINCH, so this is a snapshot: resizing the window mid-session will
+/// not propagate.
+fn build_terminal_setup(term: &str, colorterm: &str, size: Option<(u16, u16)>) -> String {
+    let term = if term.trim().is_empty() {
+        "xterm-256color"
+    } else {
+        term.trim()
+    };
+
+    let mut out = format!("export TERM={}", shell_quote(term));
+
+    if !colorterm.trim().is_empty() {
+        out.push_str(&format!("\nexport COLORTERM={}", shell_quote(colorterm.trim())));
+    }
+
+    if let Some((rows, cols)) = size {
+        out.push_str(&format!("\nstty rows {} cols {} 2>/dev/null || true", rows, cols));
+    }
+
+    out
+}
+
 fn build_env_exports(vars: &[(&str, String)]) -> String {
     vars.iter()
         .map(|(key, value)| format!("export {}={}", key, shell_quote(value)))
@@ -498,6 +524,28 @@ mod linux {
     pub enum QemuIo {
         Interactive,
         LogTo(PathBuf),
+    }
+
+    /// Size of the terminal geli was launched from, if it was launched from one at all.
+    pub fn host_terminal_size() -> Option<(u16, u16)> {
+        let out = Command::new("stty")
+            .arg("size")
+            .stdin(Stdio::inherit())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut parts = text.split_whitespace();
+        let rows: u16 = parts.next()?.parse().ok()?;
+        let cols: u16 = parts.next()?.parse().ok()?;
+
+        if rows == 0 || cols == 0 {
+            return None;
+        }
+        Some((rows, cols))
     }
 
     pub fn images_dir() -> PathBuf {
@@ -792,10 +840,16 @@ fn execute_sandbox(ws: &str, cur: &Path, dirs: Vec<PathBuf>, cmd: &str) -> io::R
         eprintln!("\n{}\n", warning);
     }
 
-    let env_exports = build_env_exports(&[
+    let mut env_exports = build_env_exports(&[
         ("ANTHROPIC_API_KEY", anthropic_key),
         ("OPENAI_API_KEY", openai_key),
     ]);
+    env_exports.push('\n');
+    env_exports.push_str(&build_terminal_setup(
+        &std::env::var("TERM").unwrap_or_default(),
+        &std::env::var("COLORTERM").unwrap_or_default(),
+        host_terminal_size(),
+    ));
 
     let user_data = build_cloud_init(&plan, cmd, &env_exports);
     let iso = make_cloud_init_iso(
@@ -991,6 +1045,38 @@ mod tests {
     fn session_announces_itself_before_running_the_command() {
         let yaml = session_cloud_init(&["/home/u/proj"], "/home/u/proj", "claude");
         assert!(yaml.contains("[geli] workspace ready"));
+    }
+
+    /// Regression: the guest inherited TERM=vt220 and a fixed 80x24 from the serial getty, so
+    /// agent TUIs rendered in eight colours in a cramped window.
+    #[test]
+    fn terminal_setup_forwards_identity_and_size() {
+        let setup = build_terminal_setup("xterm-256color", "truecolor", Some((50, 200)));
+        assert!(setup.contains("export TERM='xterm-256color'"));
+        assert!(setup.contains("export COLORTERM='truecolor'"));
+        assert!(setup.contains("stty rows 50 cols 200"));
+
+        // No terminal to copy from (piped, cron): fall back rather than emitting a broken stty.
+        let headless = build_terminal_setup("", "", None);
+        assert!(headless.contains("export TERM='xterm-256color'"));
+        assert!(!headless.contains("stty"));
+        assert!(!headless.contains("COLORTERM"));
+    }
+
+    #[test]
+    fn terminal_setup_survives_cloud_init() {
+        let dirs = [PathBuf::from("/home/u/proj")];
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"));
+        let env = format!(
+            "{}\n{}",
+            build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]),
+            build_terminal_setup("screen-256color", "truecolor", Some((24, 100)))
+        );
+        let yaml = build_cloud_init(&plan, "claude", &env);
+
+        assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
+        assert!(yaml.contains("screen-256color"));
+        assert!(yaml.contains("stty rows 24 cols 100"));
     }
 
     #[test]

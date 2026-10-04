@@ -146,6 +146,10 @@ sessions.
 | `ANTHROPIC_API_KEY` | Forwarded into the guest. |
 | `OPENAI_API_KEY` | Forwarded into the guest. |
 | `GELI_KEEP=1` | Keep the session disk and cloud-init files on exit, for debugging. |
+| `TERM`, `COLORTERM` | Forwarded, so the agent's TUI gets your colours instead of the serial console's `vt220`. |
+
+Your terminal's size is forwarded too, at launch. Serial consoles carry no `SIGWINCH`, so resizing
+the window mid-session will not reach the guest — restart the session to pick up a new size.
 
 ## Authentication
 
