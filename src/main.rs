@@ -272,6 +272,44 @@ const SEEDED_CONFIG_KEYS: &[&str] = &[
     "oauthAccount",
 ];
 
+/// Major Node version the agent requires. Ubuntu 24.04 ships Node 18, and `npm install -g`
+/// installs onto it anyway with only a warning — the agent then runs on an unsupported runtime
+/// and its startup connectivity checks time out despite a working network. Install Node from
+/// nodejs.org instead of apt.
+const REQUIRED_NODE_MAJOR: u32 = 22;
+
+const GOLDEN_INSTALL_NODE: &str = r#"#!/bin/bash
+set -euxo pipefail
+
+# Resolve the current v22 release rather than pinning a patch that goes stale.
+TARBALL=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt \
+  | grep -oE 'node-v22\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz' | head -1)
+test -n "$TARBALL"
+
+curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/latest-v22.x/${TARBALL}"
+tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
+rm -f /tmp/node.tar.xz
+"#;
+
+/// Printed only when every tool is present *and* Node is new enough. cloud-init does not abort
+/// runcmd on failure, so the host greps for this rather than trusting the build "finished".
+fn golden_verify_script() -> String {
+    format!(
+        r#"#!/bin/bash
+command -v claude >/dev/null || exit 0
+command -v git >/dev/null || exit 0
+command -v node >/dev/null || exit 0
+
+major=$(node -p 'process.versions.node.split(".")[0]')
+[ "$major" -ge {required} ] || exit 0
+
+echo {marker}
+"#,
+        required = REQUIRED_NODE_MAJOR,
+        marker = GOLDEN_OK_MARKER,
+    )
+}
+
 /// Baked into the golden image as /home/sandbox/.bash_profile.
 ///
 /// `.bash_profile`, not `.bashrc`: `.bashrc` runs for *every* shell, so a subshell spawned by
@@ -551,11 +589,12 @@ users:
 
 package_update: true
 packages:
-  - nodejs
-  - npm
   - python3
   - python3-pip
   - git
+  - curl
+  - ca-certificates
+  - xz-utils
 
 write_files:
   - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
@@ -570,17 +609,29 @@ write_files:
     content: |
 {profile}
 
+  - path: /etc/geli/install-node.sh
+    permissions: '0755'
+    content: |
+{install_node}
+
+  - path: /etc/geli/verify.sh
+    permissions: '0755'
+    content: |
+{verify}
+
 runcmd:
+  - bash /etc/geli/install-node.sh
   - [npm, install, -g, "@anthropic-ai/claude-code"]
   - install -o sandbox -g sandbox -m 0644 /etc/geli/bash_profile /home/sandbox/.bash_profile
   - apt-get clean
   - rm -rf /var/lib/apt/lists/*
-  - bash -c 'command -v claude >/dev/null && command -v git >/dev/null && command -v node >/dev/null && echo {marker}'
+  - bash /etc/geli/verify.sh
   - cloud-init clean --logs --seed
   - poweroff
 "#,
         profile = indent_block(GOLDEN_PROFILE, 6),
-        marker = GOLDEN_OK_MARKER,
+        install_node = indent_block(GOLDEN_INSTALL_NODE, 6),
+        verify = indent_block(&golden_verify_script(), 6),
     )
 }
 
@@ -864,7 +915,7 @@ fn build_golden_image() -> io::Result<()> {
     create_overlay(&base_img, &pending, Some(SANDBOX_DISK_SIZE))?;
 
     println!("[*] Building golden image. This takes a few minutes, once.");
-    println!("[*] Installing: nodejs, npm, python3, pip, git, @anthropic-ai/claude-code");
+    println!("[*] Installing: Node {REQUIRED_NODE_MAJOR}, python3, pip, git, @anthropic-ai/claude-code");
     println!("[*] Follow along with:  tail -f {}", log_path.display());
 
     run_qemu(&pending, &iso, vec![], QemuIo::LogTo(log_path.clone()))?;
@@ -1135,12 +1186,18 @@ mod tests {
     #[test]
     fn golden_cloud_init_bakes_tooling_and_login() {
         let yaml = build_golden_cloud_init();
-        for expected in ["- git", "- nodejs", "@anthropic-ai/claude-code", "--autologin sandbox"] {
+        for expected in ["- git", "@anthropic-ai/claude-code", "--autologin sandbox"] {
             assert!(yaml.contains(expected), "golden recipe missing {:?}", expected);
         }
         // The marker must be guarded by a real check, not echoed unconditionally.
         assert!(yaml.contains("command -v claude"));
         assert!(yaml.contains(GOLDEN_OK_MARKER));
+
+        // Node must come from nodejs.org: Ubuntu ships 18, the agent requires 22.
+        assert!(!yaml.contains("- nodejs"), "apt nodejs is too old for the agent");
+        assert!(!yaml.contains("- npm"));
+        assert!(yaml.contains("nodejs.org/dist/latest-v22.x"));
+        assert!(yaml.contains(&format!("-ge {}", REQUIRED_NODE_MAJOR)));
     }
 
     #[test]
