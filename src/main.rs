@@ -265,6 +265,8 @@ struct MountPlan {
     script: String,
     /// Folder under /workspace the user's command should run in.
     active_folder: String,
+    /// Every folder mounted under /workspace, active one included.
+    folders: Vec<String>,
 }
 
 /// Prefix every non-empty line with `spaces` spaces. Empty lines are left empty rather than
@@ -323,10 +325,12 @@ fn recipe_hash(recipe: &str) -> String {
 fn build_mount_script(dirs: &[PathBuf], current_canonical: &Path) -> MountPlan {
     let mut script = String::from("#!/bin/bash\nset -x\n\nmkdir -p /workspace\n");
     let mut active_folder = String::new();
+    let mut folders = Vec::new();
 
     for (i, dir) in dirs.iter().enumerate() {
         let tag = share_tag(i);
         let name = folder_name(dir);
+        folders.push(name.clone());
 
         if is_active_dir(dir, current_canonical) {
             active_folder = name.clone();
@@ -354,7 +358,41 @@ fn build_mount_script(dirs: &[PathBuf], current_canonical: &Path) -> MountPlan {
     MountPlan {
         script,
         active_folder,
+        folders,
     }
+}
+
+/// Claude Code keeps its "already answered that" state in ~/.claude.json. The sandbox is
+/// disposable, so without seeding it the agent re-runs onboarding every single session: approve
+/// the API key, then trust the folder, every time.
+///
+/// `approved` holds the last 20 characters of the key rather than the key itself.
+fn build_claude_config(folders: &[String], api_key: &str) -> String {
+    use serde_json::{json, Map, Value};
+
+    let mut projects = Map::new();
+    for folder in folders {
+        projects.insert(
+            format!("/workspace/{}", folder),
+            json!({ "hasTrustDialogAccepted": true }),
+        );
+    }
+
+    let chars: Vec<char> = api_key.trim().chars().collect();
+    let approved: Vec<Value> = if chars.is_empty() {
+        Vec::new()
+    } else {
+        let start = chars.len().saturating_sub(20);
+        vec![Value::String(chars[start..].iter().collect())]
+    };
+
+    let document = json!({
+        "hasCompletedOnboarding": true,
+        "customApiKeyResponses": { "approved": approved, "rejected": [] },
+        "projects": Value::Object(projects),
+    });
+
+    serde_json::to_string_pretty(&document).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// True if the command's first word is the agent, however it is pathed.
@@ -471,7 +509,12 @@ runcmd:
 }
 
 /// cloud-config for one sandbox session. Installs nothing: the golden image already has it.
-fn build_cloud_init(plan: &MountPlan, command: &str, env_exports: &str) -> String {
+fn build_cloud_init(
+    plan: &MountPlan,
+    command: &str,
+    env_exports: &str,
+    claude_config: &str,
+) -> String {
     // The echo proves the plumbing worked. Without it, a command that produces no output is
     // indistinguishable from a sandbox that failed to run it at all.
     let session = format!(
@@ -501,6 +544,12 @@ write_files:
     content: |
 {session}
 
+  - path: /home/sandbox/.claude.json
+    permissions: '0600'
+    owner: sandbox:sandbox
+    content: |
+{claude_config}
+
 runcmd:
   - bash /etc/geli/mounts.sh
   - chown -R sandbox:sandbox /home/sandbox/.cache /workspace || true
@@ -508,6 +557,7 @@ runcmd:
         env = indent_block(env_exports, 6),
         mounts = indent_block(&plan.script, 6),
         session = indent_block(&session, 6),
+        claude_config = indent_block(claude_config, 6),
     )
 }
 
@@ -840,6 +890,7 @@ fn execute_sandbox(ws: &str, cur: &Path, dirs: Vec<PathBuf>, cmd: &str) -> io::R
         eprintln!("\n{}\n", warning);
     }
 
+    let api_key_for_config = anthropic_key.clone();
     let mut env_exports = build_env_exports(&[
         ("ANTHROPIC_API_KEY", anthropic_key),
         ("OPENAI_API_KEY", openai_key),
@@ -851,7 +902,8 @@ fn execute_sandbox(ws: &str, cur: &Path, dirs: Vec<PathBuf>, cmd: &str) -> io::R
         host_terminal_size(),
     ));
 
-    let user_data = build_cloud_init(&plan, cmd, &env_exports);
+    let claude_config = build_claude_config(&plan.folders, &api_key_for_config);
+    let user_data = build_cloud_init(&plan, cmd, &env_exports, &claude_config);
     let iso = make_cloud_init_iso(
         &vm_share_dir,
         &user_data,
@@ -905,7 +957,8 @@ mod tests {
         let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
         let plan = build_mount_script(&dirs, Path::new(current));
         let env = build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]);
-        build_cloud_init(&plan, cmd, &env)
+        let config = build_claude_config(&plan.folders, "sk-ant-test-key-0123456789");
+        build_cloud_init(&plan, cmd, &env, &config)
     }
 
     /// The bug that made geli never work: a YAML document that does not parse.
@@ -1072,11 +1125,49 @@ mod tests {
             build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]),
             build_terminal_setup("screen-256color", "truecolor", Some((24, 100)))
         );
-        let yaml = build_cloud_init(&plan, "claude", &env);
+        let yaml = build_cloud_init(&plan, "claude", &env, "{}");
 
         assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
         assert!(yaml.contains("screen-256color"));
         assert!(yaml.contains("stty rows 24 cols 100"));
+    }
+
+    /// Regression: the sandbox is disposable, so without seeded state the agent re-ran
+    /// onboarding every session — approve the API key, then trust the folder, every time.
+    #[test]
+    fn claude_config_preapproves_key_and_trusts_every_workspace() {
+        let folders = vec!["proj".to_string(), "other".to_string()];
+        let config = build_claude_config(&folders, "sk-ant-api03-ABCDEFGHIJKLMNOPQRST");
+        let parsed: serde_json::Value = serde_json::from_str(&config).expect("valid JSON");
+
+        assert_eq!(parsed["hasCompletedOnboarding"], true);
+        assert_eq!(parsed["projects"]["/workspace/proj"]["hasTrustDialogAccepted"], true);
+        assert_eq!(parsed["projects"]["/workspace/other"]["hasTrustDialogAccepted"], true);
+
+        // Only the last 20 characters are recorded, never the whole key.
+        let approved = parsed["customApiKeyResponses"]["approved"][0].as_str().unwrap();
+        assert_eq!(approved, "ABCDEFGHIJKLMNOPQRST");
+        assert_eq!(approved.len(), 20);
+        assert!(!config.contains("sk-ant-api03"));
+    }
+
+    #[test]
+    fn claude_config_without_a_key_approves_nothing() {
+        let config = build_claude_config(&["proj".to_string()], "");
+        let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(
+            parsed["customApiKeyResponses"]["approved"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(parsed["hasCompletedOnboarding"], true);
+    }
+
+    #[test]
+    fn claude_config_survives_cloud_init() {
+        let yaml = session_cloud_init(&["/home/u/proj"], "/home/u/proj", "claude");
+        assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
+        assert!(yaml.contains("/home/sandbox/.claude.json"));
+        assert!(yaml.contains("hasTrustDialogAccepted"));
     }
 
     #[test]
