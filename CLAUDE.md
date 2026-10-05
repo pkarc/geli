@@ -61,6 +61,31 @@ Readiness is a marker `mounts.sh` echoes as its last act. `runcmd` output lands 
 
 Colour is on only when stderr is a terminal and `NO_COLOR` is unset; piped, the same phases print one line each so a CI log still shows where a boot died.
 
+### Agents
+
+`AGENTS` is the table of terminal agents the sandbox knows: claude, opencode and agy
+(Antigravity). Each declares how it installs, the binary that proves the build worked, the
+credential paths it needs, and the hosts to open when egress is restricted. The golden image
+carries all three; `agent_for_command` matches the first word of the user's command, however it
+is pathed, and *only that agent's* credentials travel into the guest. An unrecognised command
+(`geli bash`) carries none.
+
+**Credentials only, never the directory they sit in.** Antigravity keeps 1.8 KB of OAuth token in
+`~/.gemini/oauth_creds.json` — next to a 1.3 GB index and 317 MB of conversations in the same
+tree. Claude's is the same shape. A test asserts no agent's credential list reaches into history.
+
+**Node packages that ship per-platform binaries need pruning.** `opencode-ai` installs glibc,
+musl and "baseline" variants at ~180 MB each and hardlinks the right one into `bin/`; deleting
+the other three took it from 728 MB to 187 MB with the CLI still working.
+
+**Deleting files in the guest does not shrink the qcow2.** Blocks written during a build stay
+allocated. The build drive runs with `discard=unmap` and the recipe ends in `fstrim`, which took
+the image from 1.9 GB to 922 MB. Anything that writes-then-deletes during provisioning depends
+on this.
+
+**Antigravity's `agy` is a statically linked Go binary**, so musl never enters into it — unlike
+every npm-delivered agent, where it does.
+
 ### Egress policy (`--restrict-net`)
 
 Off by default; with the flag the guest reaches only `DEFAULT_ALLOWED_HOSTS` plus whatever the project's `.geli.json` lists under `allow`. A CONNECT proxy runs on a thread inside geli, resolves on the host, and only dials port 443 — a proxy that reaches any port on an allowed host is a general tunnel, not a policy.

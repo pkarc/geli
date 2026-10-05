@@ -305,7 +305,7 @@ retry() {{
 }}
 
 retry apk update
-retry apk add --no-cache bash nodejs npm git python3 py3-pip sudo
+retry apk add --no-cache bash nodejs npm git python3 py3-pip sudo curl
 
 # The user is created here, not through cloud-init: Alpine's users module cannot set an explicit
 # uid and fails the whole module when asked to. The uid has to match the host's, because files
@@ -316,7 +316,7 @@ adduser -D -u {host_uid} -s /bin/bash sandbox
 printf 'sandbox ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/sandbox
 chmod 0440 /etc/sudoers.d/sandbox
 
-retry npm install -g @anthropic-ai/claude-code
+{agent_installs}
 
 install -o sandbox -g sandbox -m 0644 /etc/geli/bash_profile /home/sandbox/.bash_profile
 
@@ -363,6 +363,8 @@ cp /boot/initramfs-virt /mnt/geli-out/{initrd_name}
   printf 'alpine=%s\n' "$(cut -d' ' -f1-2 /etc/alpine-release 2>/dev/null || echo unknown)"
   printf 'node=%s\n' "$(node --version 2>/dev/null | tr -d v)"
   printf 'claude=%s\n' "$(claude --version 2>/dev/null | cut -d' ' -f1)"
+  printf 'opencode=%s\n' "$(opencode --version 2>/dev/null | head -1)"
+  printf 'agy=%s\n' "$(agy --version 2>/dev/null | head -1)"
 }} > /mnt/geli-out/{meta_name}
 
 chown -R {host_uid}:{host_uid} /mnt/geli-out
@@ -370,7 +372,18 @@ sync
 umount /mnt/geli-out
 
 rm -rf /var/cache/apk/*
+rm -rf /root/.npm /home/sandbox/.npm /tmp/* 2>/dev/null || true
+
+# Hand the freed blocks back to the qcow2. Deleting files inside the guest does not shrink the
+# image on its own.
+sync
+fstrim -v / || true
 "#,
+        agent_installs = AGENTS
+            .iter()
+            .map(|a| a.install)
+            .collect::<Vec<_>>()
+            .join("\n"),
         mount_opts = MOUNT_OPTS,
         out_tag = GOLDEN_OUT_TAG,
         kernel_name = KERNEL_NAME,
@@ -413,9 +426,9 @@ exec /bin/login -f sandbox
 fn golden_verify_script() -> String {
     format!(
         r#"#!/bin/sh
-command -v claude >/dev/null || exit 0
 command -v git >/dev/null || exit 0
 command -v node >/dev/null || exit 0
+{agent_binaries}
 
 major=$(node -p 'process.versions.node.split(".")[0]')
 [ "$major" -ge {required} ] || exit 0
@@ -428,6 +441,11 @@ echo {marker}
 "#,
         required = REQUIRED_NODE_MAJOR,
         marker = GOLDEN_OK_MARKER,
+        agent_binaries = AGENTS
+            .iter()
+            .map(|a| format!("command -v {} >/dev/null || exit 0", a.binary))
+            .collect::<Vec<_>>()
+            .join("\n"),
     )
 }
 
@@ -621,14 +639,92 @@ fn build_claude_config(folders: &[String], api_key: &str) -> String {
     serde_json::to_string_pretty(&Value::Object(document)).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// True if the command's first word is the agent, however it is pathed.
-fn command_invokes_claude(command: &str) -> bool {
-    command
-        .split_whitespace()
-        .next()
-        .map(|word| word.rsplit('/').next().unwrap_or(word) == "claude")
-        .unwrap_or(false)
+// --- AGENTS ---
+//
+// geli runs whatever command you give it, but it knows a few terminal agents by name: enough to
+// install them into the image, carry their credentials in, and open the right hosts when egress
+// is restricted.
+
+/// A terminal coding agent the sandbox knows how to host.
+struct Agent {
+    /// The command as typed. Matched against the first word of the user's command.
+    command: &'static str,
+    /// Shown on the status line.
+    label: &'static str,
+    /// Shell that installs it in the golden image. Runs as root, with `retry` in scope.
+    install: &'static str,
+    /// Must exist for a golden build to be publishable.
+    binary: &'static str,
+    /// Paths under `$HOME`, copied verbatim into the guest when *this* agent is invoked.
+    ///
+    /// Credentials only. Antigravity keeps 1.8 KB of token next to 2.3 GB of conversation
+    /// history and a 1.3 GB index in the same directory; the same restraint applies to all of
+    /// them. See the note on `~/.claude` below.
+    credentials: &'static [&'static str],
+    /// Hosts added to the egress allowlist when this agent is invoked.
+    hosts: &'static [&'static str],
 }
+
+const AGENTS: &[Agent] = &[
+    Agent {
+        command: "claude",
+        label: "claude.ai credentials",
+        install: "retry npm install -g @anthropic-ai/claude-code",
+        binary: "claude",
+        credentials: &[".claude/.credentials.json"],
+        hosts: &[
+            "api.anthropic.com",
+            "platform.claude.com",
+            "console.anthropic.com",
+            // MCP connectors reach for this; without it they silently fail to authorise.
+            "mcp-proxy.anthropic.com",
+        ],
+    },
+    Agent {
+        command: "opencode",
+        label: "opencode credentials",
+        // npm pulls every platform variant — glibc, musl and a "baseline" of each, ~180 MB
+        // apiece — and the postinstall hardlinks the right one into bin/. Deleting the rest took
+        // the package from 728 MB to 187 MB with `opencode --version` still answering.
+        install: "retry npm install -g opencode-ai \\\n  && rm -rf /usr/local/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64 \\\n       /usr/local/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline \\\n       /usr/local/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline-musl",
+        binary: "opencode",
+        credentials: &[".local/share/opencode/auth.json"],
+        // Model-agnostic: it talks to whichever provider you configured, so only its own
+        // endpoint is assumed. Add the provider's host to `allow` in .geli.json.
+        hosts: &["opencode.ai", "api.opencode.ai"],
+    },
+    Agent {
+        command: "agy",
+        label: "Google account credentials",
+        // A static Go binary from Google's installer — musl is irrelevant to it. Installed to
+        // /usr/local/bin rather than the installer's ~/.local/bin so every user sees it.
+        install: "retry sh -c 'curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy.sh' \\
+  && HOME=/root bash /tmp/agy.sh \\
+  && install -m 0755 /root/.local/bin/agy /usr/local/bin/agy \\
+  && rm -f /tmp/agy.sh",
+        binary: "agy",
+        credentials: &[
+            ".gemini/oauth_creds.json",
+            ".gemini/google_accounts.json",
+            ".gemini/installation_id",
+        ],
+        hosts: &[
+            "antigravity.google",
+            "generativelanguage.googleapis.com",
+            "oauth2.googleapis.com",
+            "accounts.google.com",
+            "cloudcode-pa.googleapis.com",
+        ],
+    },
+];
+
+/// The agent a command invokes, if geli knows it. Matches the first word however it is pathed.
+fn agent_for_command(command: &str) -> Option<&'static Agent> {
+    let first = command.split_whitespace().next()?;
+    let name = first.rsplit('/').next().unwrap_or(first);
+    AGENTS.iter().find(|a| a.command == name)
+}
+
 
 /// Warning shown *before* booting, so a doomed run costs a few seconds rather than a full boot
 /// followed by a console that sits there silently.
@@ -641,17 +737,23 @@ fn credential_warning(command: &str, has_credentials: bool) -> Option<String> {
         return None;
     }
 
-    if command_invokes_claude(command) {
-        Some(
-            "[!] No ANTHROPIC_API_KEY is set.\n\
-             \x20   geli does not forward your host's ~/.claude credentials into the sandbox, so\n\
-             \x20   `claude` will stop at its first-run login flow and wait for input that never\n\
-             \x20   arrives. The session will look like it has hung.\n\
-             \x20   Export ANTHROPIC_API_KEY before running geli."
-                .to_string(),
-        )
-    } else {
-        Some("[!] No ANTHROPIC_API_KEY or OPENAI_API_KEY set; the sandbox will have no API credentials.".to_string())
+    match agent_for_command(command) {
+        Some(agent) => Some(format!(
+            "[!] No credentials found for `{}`.\n\
+             \x20   geli looked for {} and an API key in the environment, and found neither.\n\
+             \x20   The agent will stop at its first-run login flow inside the VM and wait for\n\
+             \x20   input that never arrives — the session will look like it has hung.",
+            agent.command,
+            agent
+                .credentials
+                .iter()
+                .map(|p| format!("~/{}", p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        None => Some(
+            "[!] No API credentials in the environment; the sandbox will have none.".to_string(),
+        ),
     }
 }
 
@@ -697,17 +799,21 @@ fn build_env_exports(vars: &[(&str, String)]) -> String {
 /// Copied, not mounted: the sandbox's job is to protect files the agent was not given, and a
 /// credential is not one of those. The copy is what makes the agent bill the user's plan instead
 /// of API credits.
-fn build_credentials_entry(credentials: Option<&str>) -> String {
-    match credentials {
-        None => String::new(),
-        Some(json) => format!(
-            "  - path: /home/sandbox/.claude/.credentials.json\n    \
-             permissions: '0600'\n    \
-             owner: sandbox:sandbox\n    \
-             content: |\n{}\n",
-            indent_block(json, 6)
-        ),
-    }
+fn build_credentials_entry(credentials: &[(String, String)]) -> String {
+    credentials
+        .iter()
+        .map(|(path, contents)| {
+            format!(
+                "  - path: /home/sandbox/{}\n    \
+                 permissions: '0600'\n    \
+                 owner: sandbox:sandbox\n    \
+                 content: |\n{}\n",
+                path,
+                indent_block(contents, 6)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // --- EGRESS POLICY ---
@@ -720,14 +826,10 @@ fn build_credentials_entry(credentials: Option<&str>) -> String {
 // buy: an agent with `github.com` allowed can still push to a gist. The allowlist narrows
 // exfiltration, it does not close it — see README.
 
-/// Reachable by default when restricted: the agent's own endpoints plus the registries a coding
-/// agent needs to do real work in a repository.
+/// Reachable by default when restricted: the registries a coding agent needs to do real work in
+/// a repository. The agent's own endpoints come from its `Agent` entry, so a session only opens
+/// what the agent it is running actually talks to.
 const DEFAULT_ALLOWED_HOSTS: &[&str] = &[
-    "api.anthropic.com",
-    "platform.claude.com",
-    "console.anthropic.com",
-    // MCP connectors reach for this; without it they silently fail to authorise.
-    "mcp-proxy.anthropic.com",
     "registry.npmjs.org",
     "pypi.org",
     "files.pythonhosted.org",
@@ -831,9 +933,10 @@ fn build_proxy_env(proxy_port: Option<u16>) -> String {
 }
 
 /// The allowlist for this session: the built-in defaults plus anything the project asked for.
-fn session_allowlist(extra: &[String]) -> Vec<String> {
+fn session_allowlist(agent: Option<&Agent>, extra: &[String]) -> Vec<String> {
     let mut all: Vec<String> = DEFAULT_ALLOWED_HOSTS.iter().map(|h| h.to_string()).collect();
-    for host in extra {
+    let agent_hosts = agent.map(|a| a.hosts).unwrap_or(&[]);
+    for host in agent_hosts.iter().map(|h| h.to_string()).chain(extra.iter().cloned()) {
         let host = host.trim();
         if !host.is_empty() && !all.iter().any(|h| h.eq_ignore_ascii_case(host)) {
             all.push(host.to_string());
@@ -850,6 +953,8 @@ struct GoldenMeta {
     alpine: String,
     node: String,
     claude: String,
+    opencode: String,
+    agy: String,
 }
 
 fn parse_golden_meta(raw: &str) -> GoldenMeta {
@@ -864,6 +969,8 @@ fn parse_golden_meta(raw: &str) -> GoldenMeta {
             "alpine" => meta.alpine = value,
             "node" => meta.node = value,
             "claude" => meta.claude = value,
+            "opencode" => meta.opencode = value,
+            "agy" => meta.agy = value,
             _ => {}
         }
     }
@@ -954,8 +1061,9 @@ fn render_status(
 fn describe_image(meta: &GoldenMeta) -> String {
     [
         ("alpine", &meta.alpine),
-        ("node", &meta.node),
         ("claude", &meta.claude),
+        ("opencode", &meta.opencode),
+        ("agy", &meta.agy),
     ]
     .iter()
     .filter(|(_, v)| !v.is_empty())
@@ -1013,7 +1121,7 @@ fn build_cloud_init(
     command: &str,
     env_exports: &str,
     claude_config: &str,
-    credentials: Option<&str>,
+    credentials: &[(String, String)],
 ) -> String {
     // The breadcrumb goes to the boot console, not stdout. It exists so a command that produces
     // no output is still distinguishable from a sandbox that never ran it — but the user's stdout
@@ -1240,7 +1348,10 @@ mod linux {
             "2".into(),
             "-nographic".into(),
             "-drive".into(),
-            format!("file={},if=virtio", disk.display()),
+            // discard=unmap lets the guest's fstrim actually return blocks to the qcow2. Without
+            // it, anything written and then deleted during a build stays in the image forever:
+            // npm writes ~540 MB of platform variants we delete, and the file stayed 2.1 GB.
+            format!("file={},if=virtio,discard=unmap,detect-zeroes=unmap", disk.display()),
             "-drive".into(),
             format!("file={},format=raw,if=virtio", iso.display()),
             "-netdev".into(),
@@ -1688,21 +1799,26 @@ fn execute_sandbox(
         "virtio-9p-pci,fsdev=pipcache,mount_tag=pipcache".to_string(),
     ]);
 
+    let agent = agent_for_command(cmd);
     let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
     let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
 
-    // Copied in so the agent authenticates as the user and bills their plan rather than API
-    // credits. Opt out with --no-credentials.
-    let credentials = if forward_credentials {
-        let path = home.join(".claude").join(".credentials.json");
-        fs::read_to_string(&path).ok()
-    } else {
-        None
+    // Only the invoked agent's credentials travel, and only the credential — not the history
+    // sitting beside it. Opt out entirely with --no-credentials.
+    let credentials: Vec<(String, String)> = match (forward_credentials, agent) {
+        (true, Some(agent)) => agent
+            .credentials
+            .iter()
+            .filter_map(|rel| {
+                fs::read_to_string(home.join(rel)).ok().map(|c| (rel.to_string(), c))
+            })
+            .collect(),
+        _ => Vec::new(),
     };
 
     let has_credentials = !anthropic_key.trim().is_empty()
         || !openai_key.trim().is_empty()
-        || credentials.is_some();
+        || !credentials.is_empty();
 
     if let Some(warning) = credential_warning(cmd, has_credentials) {
         eprintln!("\n{}\n", warning);
@@ -1711,7 +1827,7 @@ fn execute_sandbox(
     let api_key_for_config = anthropic_key.clone();
     // The proxy has to exist before the guest boots: slirp forwards a port straight to it.
     let proxy = if restrict_net {
-        let allow = session_allowlist(&read_local_allowlist(cur));
+        let allow = session_allowlist(agent, &read_local_allowlist(cur));
         let count = allow.len();
         Some((start_proxy(allow, vm_share_dir.join("net.log"))?, count))
     } else {
@@ -1740,7 +1856,7 @@ fn execute_sandbox(
         cmd,
         &env_exports,
         &claude_config,
-        credentials.as_deref(),
+        &credentials,
     );
     let iso = make_cloud_init_iso(
         &vm_share_dir,
@@ -1752,12 +1868,12 @@ fn execute_sandbox(
     // Session overlays sit on top of the golden image and inherit its size.
     create_overlay(&golden_img, &sandbox_img, None)?;
 
-    let auth = if credentials.is_some() {
-        "claude.ai credentials · bills your plan"
-    } else if !api_key_for_config.trim().is_empty() {
-        "ANTHROPIC_API_KEY · bills API credits"
-    } else {
-        "none"
+    let auth = match (credentials.is_empty(), agent) {
+        (false, Some(a)) => format!("{} · bills your plan", a.label),
+        (true, _) if !api_key_for_config.trim().is_empty() => {
+            "ANTHROPIC_API_KEY · bills API credits".to_string()
+        }
+        _ => "none".to_string(),
     };
     let net = match &proxy {
         Some((_, count)) => format!("restricted · {} domains allowed", count),
@@ -1765,7 +1881,7 @@ fn execute_sandbox(
     };
     eprint!(
         "{}",
-        render_status(ws, &status_mounts, auth, &describe_image(&meta), &net)
+        render_status(ws, &status_mounts, &auth, &describe_image(&meta), &net)
     );
 
     let console_log = vm_share_dir.join("console.log");
@@ -1883,7 +1999,7 @@ mod tests {
         let plan = build_mount_script(&dirs, Path::new(current), "");
         let env = build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]);
         let config = build_claude_config(&plan.folders, "sk-ant-test-key-0123456789");
-        build_cloud_init(&plan, cmd, &env, &config, None)
+        build_cloud_init(&plan, cmd, &env, &config, &[])
     }
 
     /// The bug that made geli never work: a YAML document that does not parse.
@@ -2046,14 +2162,17 @@ mod tests {
     /// first-run login flow, which is indistinguishable from a broken sandbox.
     #[test]
     fn warns_before_booting_an_agent_with_no_credentials() {
+        // The warning names the agent and the path it looked in, so the user can act on it.
         let warning = credential_warning("claude", false).expect("expected a warning");
-        assert!(warning.contains("ANTHROPIC_API_KEY"));
+        assert!(warning.contains("claude"));
+        assert!(warning.contains("~/.claude/.credentials.json"));
         assert!(warning.contains("first-run login"));
 
+        let agy = credential_warning("agy -p hi", false).unwrap();
+        assert!(agy.contains("~/.gemini/oauth_creds.json"));
+        assert!(!agy.contains(".claude"), "it named another agent's credential");
+
         assert!(credential_warning("claude", true).is_none());
-        assert!(credential_warning("/usr/local/bin/claude --resume", false)
-            .unwrap()
-            .contains("first-run login"));
 
         // Unrelated commands still get a note, but not the agent-specific explanation.
         let generic = credential_warning("ls -la", false).unwrap();
@@ -2061,13 +2180,65 @@ mod tests {
     }
 
     #[test]
-    fn command_invokes_claude_matches_only_the_agent() {
-        assert!(command_invokes_claude("claude"));
-        assert!(command_invokes_claude("claude --resume"));
-        assert!(command_invokes_claude("/usr/local/bin/claude"));
-        assert!(!command_invokes_claude("claudette"));
-        assert!(!command_invokes_claude("echo claude"));
-        assert!(!command_invokes_claude(""));
+    fn agent_is_recognised_however_it_is_pathed() {
+        assert_eq!(agent_for_command("claude").map(|a| a.command), Some("claude"));
+        assert_eq!(agent_for_command("claude --resume").map(|a| a.command), Some("claude"));
+        assert_eq!(agent_for_command("/usr/local/bin/agy -p hi").map(|a| a.command), Some("agy"));
+        assert_eq!(agent_for_command("opencode").map(|a| a.command), Some("opencode"));
+
+        // Near-misses must not match, or the wrong credentials would travel.
+        for not_an_agent in ["claudette", "echo claude", "", "agyx", "my-opencode"] {
+            assert!(agent_for_command(not_an_agent).is_none(), "{:?} matched", not_an_agent);
+        }
+    }
+
+    /// Each agent carries only its own credential. Running one agent must not put another
+    /// service's token in the guest.
+    #[test]
+    fn agents_declare_only_their_own_credentials() {
+        let claude = agent_for_command("claude").unwrap();
+        assert_eq!(claude.credentials, &[".claude/.credentials.json"]);
+
+        let agy = agent_for_command("agy").unwrap();
+        // 1.8 KB of token lives beside 2.3 GB of conversation history and a 1.3 GB index.
+        assert!(agy.credentials.iter().all(|p| p.starts_with(".gemini/")));
+        for history in ["antigravity-cli", "brain", "conversations", "history"] {
+            assert!(
+                !agy.credentials.iter().any(|p| p.contains(history)),
+                "{} would drag history into the guest",
+                history
+            );
+        }
+
+        // No agent may claim another's files.
+        for a in AGENTS {
+            for b in AGENTS {
+                if a.command != b.command {
+                    assert!(
+                        a.credentials.iter().all(|p| !b.credentials.contains(p)),
+                        "{} and {} share a credential path",
+                        a.command,
+                        b.command
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allowlist_opens_only_the_invoked_agents_hosts() {
+        let for_claude = session_allowlist(agent_for_command("claude"), &[]);
+        assert!(for_claude.contains(&"api.anthropic.com".to_string()));
+        assert!(!for_claude.iter().any(|h| h.contains("googleapis")));
+
+        let for_agy = session_allowlist(agent_for_command("agy"), &[]);
+        assert!(for_agy.iter().any(|h| h.contains("googleapis")));
+        assert!(!for_agy.contains(&"api.anthropic.com".to_string()));
+
+        // Registries are common ground: every agent needs to install things.
+        for list in [&for_claude, &for_agy] {
+            assert!(list.contains(&"registry.npmjs.org".to_string()));
+        }
     }
 
     /// The breadcrumb must stay out of stdout: that stream belongs to the user's command.
@@ -2103,7 +2274,7 @@ mod tests {
             build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]),
             build_terminal_setup("screen-256color", "truecolor", Some((24, 100)))
         );
-        let yaml = build_cloud_init(&plan, "claude", &env, "{}", None);
+        let yaml = build_cloud_init(&plan, "claude", &env, "{}", &[]);
 
         assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
         assert!(yaml.contains("screen-256color"));
@@ -2171,8 +2342,11 @@ mod tests {
     fn forwarded_credentials_land_in_cloud_init() {
         let dirs = [PathBuf::from("/home/u/proj")];
         let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "");
-        let creds = r#"{"claudeAiOauth":{"accessToken":"tok","refreshToken":"ref"}}"#;
-        let yaml = build_cloud_init(&plan, "claude", "", "{}", Some(creds));
+        let creds = vec![(
+            ".claude/.credentials.json".to_string(),
+            r#"{"claudeAiOauth":{"accessToken":"tok","refreshToken":"ref"}}"#.to_string(),
+        )];
+        let yaml = build_cloud_init(&plan, "claude", "", "{}", &creds);
 
         assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
         assert!(yaml.contains("/home/sandbox/.claude/.credentials.json"));
@@ -2241,7 +2415,10 @@ mod tests {
     }
 
     fn allow() -> Vec<String> {
-        session_allowlist(&["*.internal.example".to_string(), ".corp.test".to_string()])
+        session_allowlist(
+            agent_for_command("claude"),
+            &["*.internal.example".to_string(), ".corp.test".to_string()],
+        )
     }
 
     #[test]
@@ -2345,10 +2522,11 @@ mod tests {
 
     #[test]
     fn session_allowlist_adds_without_duplicating() {
-        let base = session_allowlist(&[]);
+        let claude = agent_for_command("claude");
+        let base = session_allowlist(claude, &[]);
         assert!(base.contains(&"api.anthropic.com".to_string()));
 
-        let extended = session_allowlist(&[
+        let extended = session_allowlist(claude, &[
             "API.ANTHROPIC.COM".to_string(),
             "extra.example".to_string(),
             "   ".to_string(),
@@ -2449,16 +2627,16 @@ mod tests {
         assert_eq!(meta.node, "22.23.2");
         assert_eq!(meta.claude, "2.1.289");
         assert!(meta.cmdline.starts_with("root=LABEL=/"));
-        assert_eq!(describe_image(&meta), "alpine 3.22.2 · node 22.23.2 · claude 2.1.289");
+        assert_eq!(describe_image(&meta), "alpine 3.22.2 · claude 2.1.289");
     }
 
     #[test]
     fn golden_meta_tolerates_a_missing_or_partial_file() {
         assert_eq!(parse_golden_meta(""), GoldenMeta::default());
-        let partial = parse_golden_meta("node=22.23.2\ngarbage line\n");
+        let partial = parse_golden_meta("node=22.23.2\nagy=1.2.16\ngarbage line\n");
         assert_eq!(partial.node, "22.23.2");
         // An image line with holes in it should not print empty fields.
-        assert_eq!(describe_image(&partial), "node 22.23.2");
+        assert_eq!(describe_image(&partial), "agy 1.2.16");
     }
 
     #[test]

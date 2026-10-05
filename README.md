@@ -3,7 +3,9 @@
 Run an AI coding agent inside a disposable virtual machine.
 
 ```bash
-geli claude
+geli claude        # Claude Code
+geli opencode      # OpenCode
+geli agy           # Antigravity CLI
 ```
 
 That boots a fresh Alpine VM, mounts your project into it, runs the agent interactively on the
@@ -157,6 +159,15 @@ sessions.
 
 Your terminal's size is forwarded too, at launch. Serial consoles carry no `SIGWINCH`, so resizing
 the window mid-session will not reach the guest — restart the session to pick up a new size.
+
+## Agents
+
+The image carries three terminal agents — Claude Code, OpenCode and Antigravity CLI — and geli
+runs whatever command you give it, so anything else in the image works too.
+
+Knowing the agent by name buys three things: it is installed for you, **only its credentials are
+copied into the guest**, and `--restrict-net` opens only the hosts it talks to. Running
+`geli opencode` puts no Claude token in the sandbox.
 
 ## Authentication
 
