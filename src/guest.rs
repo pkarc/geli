@@ -62,7 +62,7 @@ pub(crate) fn golden_setup_script(host_uid: u32) -> String {
             ("@HOST_UID@", &host_uid.to_string()),
             (
                 "@AGENT_INSTALLS@",
-                &AGENTS.iter().map(|a| a.install).collect::<Vec<_>>().join("\n"),
+                &agents().iter().map(|a| a.install.as_str()).collect::<Vec<_>>().join("\n"),
             ),
             ("@MOUNT_OPTS@", MOUNT_OPTS),
             ("@OUT_TAG@", GOLDEN_OUT_TAG),
@@ -109,7 +109,7 @@ pub(crate) fn golden_verify_script() -> String {
             ("@OK_MARKER@", GOLDEN_OK_MARKER),
             (
                 "@AGENT_BINARIES@",
-                &AGENTS
+                &agents()
                     .iter()
                     .map(|a| format!("command -v {} >/dev/null || exit 0", a.binary))
                     .collect::<Vec<_>>()
@@ -283,3 +283,61 @@ pub(crate) fn build_claude_config(folders: &[String], api_key: &str) -> String {
     serde_json::to_string_pretty(&Value::Object(document)).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// The serial console hands the guest a generic `TERM` and a fixed 80x24, regardless of the terminal
+/// geli was launched from. A TUI then renders in eight colours in a cramped window. Forwarding
+/// the host's terminal identity fixes both.
+///
+/// Serial lines carry no SIGWINCH, so this is a snapshot: resizing the window mid-session will
+/// not propagate.
+pub(crate) fn build_terminal_setup(term: &str, colorterm: &str, size: Option<(u16, u16)>) -> String {
+    let term = if term.trim().is_empty() {
+        "xterm-256color"
+    } else {
+        term.trim()
+    };
+
+    let mut out = format!("export TERM={}", shell_quote(term));
+
+    if !colorterm.trim().is_empty() {
+        out.push_str(&format!("\nexport COLORTERM={}", shell_quote(colorterm.trim())));
+    }
+
+    if let Some((rows, cols)) = size {
+        out.push_str(&format!("\nstty rows {} cols {} 2>/dev/null || true", rows, cols));
+    }
+
+    out
+}
+
+/// Empty values are skipped rather than exported blank: Claude Code treats a set
+/// `ANTHROPIC_API_KEY` as taking precedence over an OAuth login, so exporting an empty one would
+/// shadow forwarded credentials.
+pub(crate) fn build_env_exports(vars: &[(&str, String)]) -> String {
+    vars.iter()
+        .filter(|(_, value)| !value.trim().is_empty())
+        .map(|(key, value)| format!("export {}={}", key, shell_quote(value)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Optional extra `write_files` entry carrying the host's Claude credentials.
+///
+/// Copied, not mounted: the sandbox's job is to protect files the agent was not given, and a
+/// credential is not one of those. The copy is what makes the agent bill the user's plan instead
+/// of API credits.
+pub(crate) fn build_credentials_entry(credentials: &[(String, String)]) -> String {
+    credentials
+        .iter()
+        .map(|(path, contents)| {
+            format!(
+                "  - path: /home/sandbox/{}\n    \
+                 permissions: '0600'\n    \
+                 owner: sandbox:sandbox\n    \
+                 content: |\n{}\n",
+                path,
+                indent_block(contents, 6)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}

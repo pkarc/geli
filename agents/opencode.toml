@@ -1,0 +1,13 @@
+command = "opencode"
+binary = "opencode"
+label = "opencode credentials"
+credentials = [".local/share/opencode/auth.json"]
+hosts = [
+  "opencode.ai",
+  "api.opencode.ai",
+]
+install = '''
+retry npm install -g opencode-ai \
+  && rm -rf /usr/local/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64 \
+       /usr/local/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline \
+       /usr/local/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline-musl'''

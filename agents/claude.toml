@@ -1,0 +1,12 @@
+command = "claude"
+binary = "claude"
+label = "claude.ai credentials"
+credentials = [".claude/.credentials.json"]
+hosts = [
+  "api.anthropic.com",
+  "platform.claude.com",
+  "console.anthropic.com",
+  "mcp-proxy.anthropic.com",
+]
+install = '''
+retry npm install -g @anthropic-ai/claude-code'''

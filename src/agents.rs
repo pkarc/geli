@@ -1,93 +1,60 @@
 //! The terminal agents geli knows how to host.
+//!
+//! A recipe is a file in `agents/`, not code: adding an agent is one TOML file and no Rust. They
+//! are parsed once at startup, and a malformed one is a hard error — a half-understood recipe
+//! would install the wrong thing or copy the wrong files out of the user's home.
 
-#[allow(unused_imports)]
-use crate::{guest::*, net::*};
-// --- AGENTS ---
-//
-// geli runs whatever command you give it, but it knows a few terminal agents by name: enough to
-// install them into the image, carry their credentials in, and open the right hosts when egress
-// is restricted.
+use serde::Deserialize;
+use std::sync::OnceLock;
+
+include!(concat!(env!("OUT_DIR"), "/recipes.rs"));
 
 /// A terminal coding agent the sandbox knows how to host.
+#[derive(Debug, Deserialize)]
 pub(crate) struct Agent {
     /// The command as typed. Matched against the first word of the user's command.
-    pub(crate) command: &'static str,
-    /// Shown on the status line.
-    pub(crate) label: &'static str,
-    /// Shell that installs it in the golden image. Runs as root, with `retry` in scope.
-    pub(crate) install: &'static str,
+    pub(crate) command: String,
     /// Must exist for a golden build to be publishable.
-    pub(crate) binary: &'static str,
+    pub(crate) binary: String,
+    /// Shown on the status line.
+    pub(crate) label: String,
     /// Paths under `$HOME`, copied verbatim into the guest when *this* agent is invoked.
     ///
     /// Credentials only. Antigravity keeps 1.8 KB of token next to 2.3 GB of conversation
     /// history and a 1.3 GB index in the same directory; the same restraint applies to all of
-    /// them. See the note on `~/.claude` below.
-    pub(crate) credentials: &'static [&'static str],
+    /// them. `sensitive_credentials` exists because a recipe is now a file anyone can send.
+    pub(crate) credentials: Vec<String>,
     /// Hosts added to the egress allowlist when this agent is invoked.
-    pub(crate) hosts: &'static [&'static str],
+    pub(crate) hosts: Vec<String>,
+    /// Shell that installs it in the golden image. Runs as root, with `retry` in scope.
+    pub(crate) install: String,
 }
 
-pub(crate) const AGENTS: &[Agent] = &[
-    Agent {
-        command: "claude",
-        label: "claude.ai credentials",
-        install: "retry npm install -g @anthropic-ai/claude-code",
-        binary: "claude",
-        credentials: &[".claude/.credentials.json"],
-        hosts: &[
-            "api.anthropic.com",
-            "platform.claude.com",
-            "console.anthropic.com",
-            // MCP connectors reach for this; without it they silently fail to authorise.
-            "mcp-proxy.anthropic.com",
-        ],
-    },
-    Agent {
-        command: "opencode",
-        label: "opencode credentials",
-        // npm pulls every platform variant — glibc, musl and a "baseline" of each, ~180 MB
-        // apiece — and the postinstall hardlinks the right one into bin/. Deleting the rest took
-        // the package from 728 MB to 187 MB with `opencode --version` still answering.
-        install: "retry npm install -g opencode-ai \\\n  && rm -rf /usr/local/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64 \\\n       /usr/local/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline \\\n       /usr/local/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline-musl",
-        binary: "opencode",
-        credentials: &[".local/share/opencode/auth.json"],
-        // Model-agnostic: it talks to whichever provider you configured, so only its own
-        // endpoint is assumed. Add the provider's host to `allow` in .geli.json.
-        hosts: &["opencode.ai", "api.opencode.ai"],
-    },
-    Agent {
-        command: "agy",
-        label: "Google account credentials",
-        // A static Go binary from Google's installer — musl is irrelevant to it. Installed to
-        // /usr/local/bin rather than the installer's ~/.local/bin so every user sees it.
-        install: "retry sh -c 'curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy.sh' \\
-  && HOME=/root bash /tmp/agy.sh \\
-  && install -m 0755 /root/.local/bin/agy /usr/local/bin/agy \\
-  && rm -f /tmp/agy.sh",
-        binary: "agy",
-        credentials: &[
-            ".gemini/oauth_creds.json",
-            ".gemini/google_accounts.json",
-            ".gemini/installation_id",
-        ],
-        hosts: &[
-            "antigravity.google",
-            "generativelanguage.googleapis.com",
-            "oauth2.googleapis.com",
-            "accounts.google.com",
-            "cloudcode-pa.googleapis.com",
-        ],
-    },
+/// Home-directory paths no agent should be asking for. A recipe is a file a stranger can send,
+/// and `credentials` is "copy these out of the user's home into a VM with network access".
+const NEVER_COPY: &[&str] = &[
+    ".ssh", ".aws", ".gnupg", ".kube", ".docker", ".netrc", ".git-credentials", ".config/gh",
+    ".pgpass", ".my.cnf",
 ];
+
+pub(crate) fn agents() -> &'static [Agent] {
+    static PARSED: OnceLock<Vec<Agent>> = OnceLock::new();
+    PARSED.get_or_init(|| {
+        let mut parsed: Vec<Agent> = RECIPES
+            .iter()
+            .map(|raw| toml::from_str(raw).unwrap_or_else(|e| panic!("bad agent recipe: {}", e)))
+            .collect();
+        parsed.sort_by(|a, b| a.command.cmp(&b.command));
+        parsed
+    })
+}
 
 /// The agent a command invokes, if geli knows it. Matches the first word however it is pathed.
 pub(crate) fn agent_for_command(command: &str) -> Option<&'static Agent> {
     let first = command.split_whitespace().next()?;
     let name = first.rsplit('/').next().unwrap_or(first);
-    AGENTS.iter().find(|a| a.command == name)
+    agents().iter().find(|a| a.command == name)
 }
-
 
 /// Said once when the command is not one of the agents geli knows.
 ///
@@ -103,7 +70,7 @@ pub(crate) fn non_agent_notice(command: &str) -> Option<String> {
         "[·] `{}` is not one of geli's agents ({}). It will run, but no credentials travel\n\
          \x20   into the sandbox and --restrict-net opens no agent hosts.",
         first.rsplit('/').next().unwrap_or(first),
-        AGENTS.iter().map(|a| a.command).collect::<Vec<_>>().join(", ")
+        agents().iter().map(|a| a.command.as_str()).collect::<Vec<_>>().join(", ")
     ))
 }
 
@@ -138,62 +105,20 @@ pub(crate) fn credential_warning(command: &str, has_credentials: bool) -> Option
     }
 }
 
-/// The serial console hands the guest a generic `TERM` and a fixed 80x24, regardless of the terminal
-/// geli was launched from. A TUI then renders in eight colours in a cramped window. Forwarding
-/// the host's terminal identity fixes both.
+/// Credential paths a recipe declares that it has no business declaring.
 ///
-/// Serial lines carry no SIGWINCH, so this is a snapshot: resizing the window mid-session will
-/// not propagate.
-pub(crate) fn build_terminal_setup(term: &str, colorterm: &str, size: Option<(u16, u16)>) -> String {
-    let term = if term.trim().is_empty() {
-        "xterm-256color"
-    } else {
-        term.trim()
-    };
-
-    let mut out = format!("export TERM={}", shell_quote(term));
-
-    if !colorterm.trim().is_empty() {
-        out.push_str(&format!("\nexport COLORTERM={}", shell_quote(colorterm.trim())));
-    }
-
-    if let Some((rows, cols)) = size {
-        out.push_str(&format!("\nstty rows {} cols {} 2>/dev/null || true", rows, cols));
-    }
-
-    out
-}
-
-/// Empty values are skipped rather than exported blank: Claude Code treats a set
-/// `ANTHROPIC_API_KEY` as taking precedence over an OAuth login, so exporting an empty one would
-/// shadow forwarded credentials.
-pub(crate) fn build_env_exports(vars: &[(&str, String)]) -> String {
-    vars.iter()
-        .filter(|(_, value)| !value.trim().is_empty())
-        .map(|(key, value)| format!("export {}={}", key, shell_quote(value)))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Optional extra `write_files` entry carrying the host's Claude credentials.
-///
-/// Copied, not mounted: the sandbox's job is to protect files the agent was not given, and a
-/// credential is not one of those. The copy is what makes the agent bill the user's plan instead
-/// of API credits.
-pub(crate) fn build_credentials_entry(credentials: &[(String, String)]) -> String {
-    credentials
+/// Returned rather than rejected: geli tells the user what a recipe wants and lets them decide,
+/// because a blanket refusal would also break the legitimate odd case.
+pub(crate) fn sensitive_credentials(agent: &Agent) -> Vec<&str> {
+    agent
+        .credentials
         .iter()
-        .map(|(path, contents)| {
-            format!(
-                "  - path: /home/sandbox/{}\n    \
-                 permissions: '0600'\n    \
-                 owner: sandbox:sandbox\n    \
-                 content: |\n{}\n",
-                path,
-                indent_block(contents, 6)
-            )
+        .filter(|path| {
+            NEVER_COPY.iter().any(|bad| {
+                let p = path.as_str();
+                p == *bad || p.starts_with(&format!("{}/", bad))
+            })
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .map(String::as_str)
+        .collect()
 }
-

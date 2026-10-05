@@ -77,12 +77,22 @@ Colour is on only when stderr is a terminal and `NO_COLOR` is unset; piped, the 
 
 ### Agents
 
-`AGENTS` is the table of terminal agents the sandbox knows: claude, opencode and agy
-(Antigravity). Each declares how it installs, the binary that proves the build worked, the
-credential paths it needs, and the hosts to open when egress is restricted. The golden image
+**A recipe is a file in `agents/`, not code.** One TOML per agent declaring how it installs, the
+binary that proves the build worked, the credential paths it needs and the hosts to open when
+egress is restricted. `build.rs` discovers them, so adding an agent is one file and no Rust —
+that is the point: this is the contribution surface.
+
+Recipes are sorted by command before use, so the golden image's recipe hash does not depend on
+the filesystem's directory order. The golden image
 carries all three; `agent_for_command` matches the first word of the user's command, however it
 is pathed, and *only that agent's* credentials travel into the guest. An unrecognised command
 (`geli bash`) carries none.
+
+**`credentials` is a privileged field and recipes come from strangers.** It means "copy these
+out of the user's home into a VM with network access". `sensitive_credentials` flags paths that
+are plainly not agent credentials — `.ssh`, `.aws`, `.gnupg` and friends — and the status block
+names every file that leaves the user's home, every run. Neither is a substitute for reviewing a
+recipe, but a recipe asking for an SSH key should never be able to do it quietly.
 
 **Credentials only, never the directory they sit in.** Antigravity keeps 1.8 KB of OAuth token in
 `~/.gemini/oauth_creds.json` — next to a 1.3 GB index and 317 MB of conversations in the same

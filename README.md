@@ -169,6 +169,31 @@ Knowing the agent by name buys three things: it is installed for you, **only its
 copied into the guest**, and `--restrict-net` opens only the hosts it talks to. Running
 `geli opencode` puts no Claude token in the sandbox.
 
+### Teaching geli a new agent
+
+One file in `agents/`, no Rust:
+
+```toml
+# agents/aider.toml
+command     = "aider"
+binary      = "aider"
+label       = "aider credentials"
+credentials = [".aider.conf.yml"]
+hosts       = ["api.openai.com"]
+install     = """
+retry pip install --break-system-packages aider-chat"""
+```
+
+`install` runs as root while the image is built, with a `retry` helper in scope for anything that
+touches the network. `binary` is checked before the image is published, so a recipe that silently
+fails to install cannot ship.
+
+`credentials` deserves care, both to write and to review: those files are copied out of the
+user's home into a VM that can reach the network. Name the credential, never the directory it
+sits in — agents tend to keep conversation history next to their tokens. geli refuses to be quiet
+about it: every copied path is printed at the start of each session, and paths like `.ssh` or
+`.aws` raise a warning.
+
 ## Authentication
 
 The sandbox is a fresh machine with no Claude state, so credentials have to come from the host.

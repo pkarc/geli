@@ -122,8 +122,8 @@ pub(crate) fn build_proxy_env(proxy_port: Option<u16>) -> String {
 /// The allowlist for this session: the built-in defaults plus anything the project asked for.
 pub(crate) fn session_allowlist(agent: Option<&Agent>, extra: &[String]) -> Vec<String> {
     let mut all: Vec<String> = DEFAULT_ALLOWED_HOSTS.iter().map(|h| h.to_string()).collect();
-    let agent_hosts = agent.map(|a| a.hosts).unwrap_or(&[]);
-    for host in agent_hosts.iter().map(|h| h.to_string()).chain(extra.iter().cloned()) {
+    let agent_hosts: &[String] = agent.map(|a| a.hosts.as_slice()).unwrap_or(&[]);
+    for host in agent_hosts.iter().cloned().chain(extra.iter().cloned()) {
         let host = host.trim();
         if !host.is_empty() && !all.iter().any(|h| h.eq_ignore_ascii_case(host)) {
             all.push(host.to_string());
@@ -225,6 +225,7 @@ pub(crate) fn render_status(
     workspace: &str,
     mounts: &[StatusMount],
     auth: &str,
+    copied: &[String],
     image: &str,
     net: &str,
 ) -> String {
@@ -238,6 +239,12 @@ pub(crate) fn render_status(
         ));
     }
     out.push_str(&format!("  auth   {}\n", auth));
+    // Named, not summarised. A recipe is a file anyone can contribute, and `credentials` means
+    // "copy these out of the user's home into a VM with network access" — so the user sees
+    // exactly which files left, every run, without having to go read the recipe.
+    for path in copied {
+        out.push_str(&format!("         ~/{}\n", path));
+    }
     out.push_str(&format!("  net    {}\n", net));
     if !image.is_empty() {
         out.push_str(&format!("  image  {}\n", image));

@@ -445,6 +445,20 @@ fn execute_sandbox(
         || !openai_key.trim().is_empty()
         || !credentials.is_empty();
 
+    if let Some(agent) = agent {
+        let risky = sensitive_credentials(agent);
+        if !risky.is_empty() {
+            eprintln!(
+                "\n[!] The `{}` recipe asks to copy {} out of your home.\n\
+                 \x20   Those are not agent credentials. Check agents/{}.toml before trusting it,\n\
+                 \x20   or run with --no-credentials.\n",
+                agent.command,
+                risky.join(", "),
+                agent.command
+            );
+        }
+    }
+
     if let Some(notice) = non_agent_notice(cmd) {
         eprintln!("{}", notice);
     }
@@ -509,7 +523,14 @@ fn execute_sandbox(
     };
     eprint!(
         "{}",
-        render_status(ws, &status_mounts, &auth, &describe_image(&meta), &net)
+        render_status(
+            ws,
+            &status_mounts,
+            &auth,
+            &credentials.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            &describe_image(&meta),
+            &net,
+        )
     );
 
     let console_log = vm_share_dir.join("console.log");
@@ -808,6 +829,35 @@ mod tests {
     }
 
     /// A notice, not a refusal: running a plain shell in the sandbox is a legitimate thing to do.
+    /// A recipe is a file anyone can contribute, and `credentials` copies files out of the
+    /// user's home. Paths that are plainly not agent credentials have to be surfaced.
+    #[test]
+    fn recipes_asking_for_secrets_are_flagged() {
+        for agent in agents() {
+            assert!(
+                sensitive_credentials(agent).is_empty(),
+                "shipped recipe {} asks for something it should not",
+                agent.command
+            );
+        }
+
+        let greedy = Agent {
+            command: "greedy".into(),
+            binary: "greedy".into(),
+            label: "x".into(),
+            credentials: vec![
+                ".config/greedy/auth.json".into(),
+                ".ssh/id_rsa".into(),
+                ".aws/credentials".into(),
+            ],
+            hosts: vec![],
+            install: String::new(),
+        };
+        let flagged = sensitive_credentials(&greedy);
+        assert_eq!(flagged, vec![".ssh/id_rsa", ".aws/credentials"]);
+        assert!(!flagged.contains(&".config/greedy/auth.json"));
+    }
+
     #[test]
     fn non_agent_commands_are_noticed_not_refused() {
         let notice = non_agent_notice("bash -lc make").expect("expected a notice");
@@ -823,10 +873,10 @@ mod tests {
 
     #[test]
     fn agent_is_recognised_however_it_is_pathed() {
-        assert_eq!(agent_for_command("claude").map(|a| a.command), Some("claude"));
-        assert_eq!(agent_for_command("claude --resume").map(|a| a.command), Some("claude"));
-        assert_eq!(agent_for_command("/usr/local/bin/agy -p hi").map(|a| a.command), Some("agy"));
-        assert_eq!(agent_for_command("opencode").map(|a| a.command), Some("opencode"));
+        assert_eq!(agent_for_command("claude").map(|a| a.command.as_str()), Some("claude"));
+        assert_eq!(agent_for_command("claude --resume").map(|a| a.command.as_str()), Some("claude"));
+        assert_eq!(agent_for_command("/usr/local/bin/agy -p hi").map(|a| a.command.as_str()), Some("agy"));
+        assert_eq!(agent_for_command("opencode").map(|a| a.command.as_str()), Some("opencode"));
 
         // Near-misses must not match, or the wrong credentials would travel.
         for not_an_agent in ["claudette", "echo claude", "", "agyx", "my-opencode"] {
@@ -839,7 +889,7 @@ mod tests {
     #[test]
     fn agents_declare_only_their_own_credentials() {
         let claude = agent_for_command("claude").unwrap();
-        assert_eq!(claude.credentials, &[".claude/.credentials.json"]);
+        assert_eq!(claude.credentials, vec![".claude/.credentials.json".to_string()]);
 
         let agy = agent_for_command("agy").unwrap();
         // 1.8 KB of token lives beside 2.3 GB of conversation history and a 1.3 GB index.
@@ -853,8 +903,8 @@ mod tests {
         }
 
         // No agent may claim another's files.
-        for a in AGENTS {
-            for b in AGENTS {
+        for a in agents() {
+            for b in agents() {
                 if a.command != b.command {
                     assert!(
                         a.credentials.iter().all(|p| !b.credentials.contains(p)),
@@ -1060,6 +1110,29 @@ mod tests {
         ];
         for (name, body) in files {
             std::fs::write(dir.join(name), body).unwrap();
+        }
+    }
+
+    /// Not a real test: writes the agent table out as TOML so the files that replace it are
+    /// byte-faithful to what the Rust version said.
+    #[ignore]
+    #[test]
+    fn dump_agents_as_toml() {
+        for a in agents() {
+            let mut out = String::new();
+            out.push_str(&format!("command = {:?}\n", a.command));
+            out.push_str(&format!("binary = {:?}\n", a.binary));
+            out.push_str(&format!("label = {:?}\n", a.label));
+            out.push_str(&format!(
+                "credentials = [{}]\n",
+                a.credentials.iter().map(|c| format!("{:?}", c)).collect::<Vec<_>>().join(", ")
+            ));
+            out.push_str(&format!(
+                "hosts = [\n{}\n]\n",
+                a.hosts.iter().map(|h| format!("  {:?},", h)).collect::<Vec<_>>().join("\n")
+            ));
+            out.push_str(&format!("install = '''\n{}'''\n", a.install));
+            std::fs::write(format!("agents/{}.toml", a.command), out).unwrap();
         }
     }
 
@@ -1322,7 +1395,8 @@ mod tests {
             StatusMount { host: "/home/u/proj".into(), guest: "/workspace/proj".into(), active: true },
             StatusMount { host: "/home/u/api".into(), guest: "/workspace/api".into(), active: false },
         ];
-        let out = render_status("acme", &mounts, "claude.ai credentials", "alpine 3.22", "open");
+        let copied = vec![".claude/.credentials.json".to_string()];
+        let out = render_status("acme", &mounts, "claude.ai credentials", &copied, "alpine 3.22", "open");
 
         assert!(out.starts_with("geli · workspace acme\n"));
         assert!(out.contains("/home/u/proj → /workspace/proj  (active)"));
@@ -1331,6 +1405,8 @@ mod tests {
         assert!(out.contains("image  alpine 3.22"));
         // The network posture is a security property that changes per run: always shown.
         assert!(out.contains("net    open"));
+        // The files that leave the user's home are named, not summarised.
+        assert!(out.contains("~/.claude/.credentials.json"));
     }
 
     /// Regression guard for the point of this change: the session must leave the guest's console
