@@ -13,18 +13,27 @@ Usage: `geli <command> [args...]` runs `<command>` inside the sandbox; `geli --l
 ```bash
 cargo build                    # debug build
 cargo build --release          # release build
-cargo test                     # unit tests (cloud-init generation)
+cargo test                     # unit tests, all on pure functions
 cargo test golden_cloud_init   # single test
 cargo run -- --list            # run without installing
-cargo run -- --build-image     # (re)build the golden image, ~5 min
+cargo run -- --build-image     # (re)build the golden image; 5-20 min, mostly downloads
 ./setup.sh                     # host deps + base image + binary + golden image
 ```
+
+Recipes live in `agents/*.toml` and are discovered by `build.rs`, so touching one triggers a
+rebuild without any Rust changing.
+
+`cargo test dump_generated_documents -- --ignored` writes every generated guest document to
+`/tmp/geli-baseline`. Dump before a refactor, dump after, and diff: that is how the module split
+and the move to file-based recipes were shown to change nothing.
 
 `GELI_KEEP=1 geli <cmd>` preserves the session qcow2 and `/tmp/sandbox-share-<pid>/` instead of
 deleting them on exit — the only way to inspect `user-data` or the guest's
 `/var/log/cloud-init-output.log` after a failed boot.
 
-There is no CI in this repo yet.
+There is no CI in this repo yet, which matters more now that recipes are the contribution
+surface: the per-agent sentinel in `golden_verify_script` is the only gate on a new recipe, and
+it runs wherever someone happens to build.
 
 Running the sandbox requires, on the host: `qemu-system-x86_64`, `qemu-img`, `genisoimage`, KVM access, and the base image at `~/qemu-sandbox/nocloud_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2`. `setup.sh` provisions all of these for Ubuntu/Debian hosts. `GELI_BASE_IMAGE` points `--build-image` at a different cloud image. `main.rs` re-checks qemu/genisoimage at runtime and exits with install instructions if missing.
 
@@ -51,7 +60,7 @@ Recipes are files, not Rust strings, with `@NAME@` placeholders. They were liter
 `#[ignore]`d `dump_generated_documents` test writes every generated guest document to `/tmp` —
 dump before and after and diff, which is how the split above was proven to change nothing.
 
-Two layers underneath:
+Two concerns underneath, independent of the module split:
 
 **Workspace registry (platform-independent).** A "workspace" is a named group of directories that should see each other inside one VM. Two pieces of state:
 
@@ -62,7 +71,7 @@ So invoking `geli` from directory A in workspace `foo` mounts *every* directory 
 
 **Guest configuration (platform-independent, pure, tested).** `build_mount_script`, `build_cloud_init`, `build_golden_cloud_init`, `build_env_exports` and `indent_block` turn a workspace into a cloud-init document with no I/O. Keeping these pure is what makes the guest config testable without booting a VM — add tests here rather than debugging through the serial console.
 
-**There are two cloud-init documents, and the split is the whole performance story.** `build_golden_cloud_init` is baked once by `--build-image` and holds everything static: packages, the agent, the autologin drop-in, and `GOLDEN_PROFILE` (the login profile). `build_cloud_init` runs per session and holds only what depends on the workspace: mounts, env, and the command. Anything slow or workspace-independent belongs in the golden recipe — putting it in the session document is what made boots take 4.5 minutes instead of 15 seconds.
+**There are two cloud-init documents, and the split is the whole performance story.** `build_golden_cloud_init` is baked once by `--build-image` and holds everything static: the toolchain, every agent's install, the autologin inittab line and `GOLDEN_PROFILE` (the login profile). `build_cloud_init` runs per session and holds only what depends on the workspace: mounts, env, credentials and the command. Anything slow or workspace-independent belongs in the golden recipe — putting it in the session document is what made boots take 4.5 minutes instead of nine seconds.
 
 **Sandbox driver (`execute_sandbox`), `#[cfg]`-gated per OS.** Only the Linux implementation exists; macOS and Windows are stubs that print "not yet implemented".
 

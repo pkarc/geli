@@ -9,8 +9,8 @@ geli agy           # Antigravity CLI
 ```
 
 That boots a fresh Alpine VM, mounts your project into it, runs the agent interactively on the
-serial console, and destroys the machine when you exit. The agent gets a real root shell and a
-real filesystem — just not yours.
+serial console, and destroys the machine when you exit. The agent gets a real filesystem and a
+real root shell — just not yours.
 
 ## Why a VM
 
@@ -28,18 +28,18 @@ Early. It works, with caveats worth knowing before you rely on it:
 - **Linux only.** macOS and Windows have stubs that print "not implemented".
 - **KVM is required**, not optional — `-enable-kvm` is hardcoded, so this will not run on a host
   without hardware virtualization exposed.
-- **Network is open.** The guest has unrestricted outbound access. This is a deliberate choice
-  for now, not an oversight — see [Security notes](#security-notes).
-- **The agent version is frozen into the image.** Rebuild with `geli --build-image` to update it.
-- **Your Claude account token is copied into the sandbox** by default so the agent can work —
-  see [Authentication](#authentication) for the trade and how to opt out.
+- **Network is open by default.** `--restrict-net` narrows it to an allowlist; without it the
+  guest reaches anything. See [Restricting what the sandbox can reach](#restricting-what-the-sandbox-can-reach).
+- **Agent versions are frozen into the image.** Rebuild with `geli --build-image` to update them.
+- **The invoked agent's credential is copied into the sandbox** by default so it can work — see
+  [Authentication](#authentication) for the trade and how to opt out.
 
 ## Requirements
 
 - A Linux host with KVM (`/dev/kvm` accessible)
 - `qemu-system-x86_64`, `qemu-img`, `genisoimage`
 - Rust toolchain, to build
-- ~3 GB of disk for the base and golden images, plus a sparse 20 GB session overlay
+- ~1.2 GB of disk for the base and golden images, plus a sparse 20 GB session overlay
 
 ## Install
 
@@ -53,8 +53,9 @@ cd geli
 `~/qemu-sandbox/`, builds the release binary, copies it to `/usr/local/bin/`, and provisions the
 golden image. It uses `sudo` for the package install and the final copy.
 
-That last step boots a VM once to install node, npm, python, git and the agent, and takes a few
-minutes. It is what makes every subsequent session start in seconds.
+That last step boots a VM once to install node, python, git and the three agents. It downloads
+about a gigabyte of packages, so budget five to twenty minutes depending on your connection — it
+is also the only slow part, and it is what makes every subsequent session start in seconds.
 
 ## Usage
 
@@ -63,11 +64,11 @@ geli <command> [args...]    # run a command inside the sandbox
 geli --restrict-net <cmd>   # let the sandbox reach only an allowlist of hosts
 geli --list                 # show the workspace registry
 geli --build-image          # rebuild the golden image (also how you update the agent)
-geli --no-credentials <cmd>  # do not copy your Claude credentials into the sandbox
+geli --no-credentials <cmd> # do not copy any credentials into the sandbox
 ```
 
-A session starts in **~15 seconds**, because it installs nothing — see
-[The golden image](#the-golden-image).
+A session starts in **about nine seconds**, because it installs nothing and boots the image's
+kernel directly — see [The golden image](#the-golden-image).
 
 The first run in a directory asks how to namespace it and writes a `.geli.json`:
 
@@ -108,19 +109,22 @@ no longer exist are skipped automatically.
 
 ## The golden image
 
-Installing node, npm, python and the agent on every boot cost ~4.5 minutes per run. Instead that
-happens once, into a reusable image:
+Installing the toolchain and the agents on every boot cost about four and a half minutes per
+run. Instead it happens once, into a reusable image:
 
 | File in `~/qemu-sandbox/` | Role |
 |---|---|
 | `nocloud_alpine-3.22.2-...qcow2` | Pristine Alpine cloud image. Never written to. |
-| `geli-golden.qcow2` | Overlay on the base with the toolchain, the agent and autologin baked in. |
+| `geli-golden.qcow2` | Overlay on the base with the toolchain, the agents and autologin baked in. |
 | `geli-golden.recipe` | Hash of the recipe it was built from. |
 | `geli-vmlinuz`, `geli-initramfs` | Kernel and initramfs handed out by the build. Sessions boot these directly, skipping firmware and bootloader. |
 | `geli-golden.meta` | The kernel command line and the versions inside the image. |
 
-Sessions are overlays on the golden image, so a session boot is just a kernel boot plus mounting
-your directories: **~15 seconds instead of ~4.5 minutes.**
+Sessions are overlays on the golden image, and QEMU boots `geli-vmlinuz` directly rather than
+going through firmware and a bootloader. A session is therefore a kernel boot plus mounting your
+directories: **about nine seconds**, against the four and a half minutes it started at.
+
+Base and golden together are around 1.2 GB for all three agents.
 
 If the recipe in the binary no longer matches `geli-golden.recipe`, geli warns and keeps going —
 a stale image is out of date, not broken. If the image is missing it stops and tells you to run
@@ -295,24 +299,54 @@ worth stating plainly:
 
 ```bash
 cargo build
-cargo test                    # cloud-init generation is unit tested
-cargo test cloud_init_parses  # single test
+cargo test                    # every test runs on a pure function; none boots a VM
+cargo test cloud_init_parses  # a single test
 cargo clippy --all-targets
 ```
 
-The guest configuration is generated by pure functions (`build_cloud_init`, `build_mount_script`,
-`indent_block`) specifically so it can be tested without booting a VM. If you change what the
-guest does, add a test there rather than debugging through the serial console — a malformed
-cloud-init document fails *silently*: the VM boots normally and your command simply never runs.
+```
+src/agents.rs   the agents geli knows, parsed from agents/*.toml
+src/guest.rs    what the guest is told to be: cloud-init, recipes, mounts, boot
+src/net.rs      egress policy: the allowlist and the proxy that enforces it
+src/qemu.rs     images on disk, direct kernel boot, watching the guest come up
+src/ui.rs       the status block and the loading line
+agents/*.toml   one recipe per agent
+src/guest/*.sh  the recipes themselves, as real shell and YAML
+```
 
-See [CLAUDE.md](CLAUDE.md) for architecture detail and [docs/plans/](docs/plans/) for the roadmap.
+The guest's configuration is generated by pure functions so it can be tested without booting a
+VM, and that is not a stylistic preference: a malformed cloud-init document fails **silently** —
+the VM boots normally and your command simply never runs. If you change what the guest does, add
+a test rather than debugging through the serial console.
+
+Before and after a refactor, `cargo test dump_generated_documents -- --ignored` writes every
+generated guest document to `/tmp/geli-baseline`; diffing the two is how the module split and the
+move to file-based recipes were shown to change nothing.
+
+[CLAUDE.md](CLAUDE.md) has the architecture and the hard-won details. [docs/plans/](docs/plans/)
+holds the plans and measurements behind the bigger decisions — why Alpine, why not Debian, what
+Antigravity's credential actually weighs.
 
 ## Roadmap
 
-1. ~~Make the sandbox boot and run the command~~ — done
-2. ~~Golden image, to cut boot from minutes to seconds~~ — done (~4.5 min → ~15 s)
-3. ~~Alpine as the guest base~~ — done (1.9 GB → 656 MB, same session time)
-4. ~~Quiet output and direct kernel boot~~ — done (615 lines → 8; ~14 s → ~7.5 s)
-5. ~~Network egress policy~~ — done (`--restrict-net`); DNS remains an open channel.
-6. Optional KVM, for hosts without hardware virtualization.
-7. Trim the 4 GB RAM ceiling — the guest uses 476 MB.
+Done:
+
+1. ~~Make the sandbox boot and run the command~~
+2. ~~A golden image, so a session installs nothing~~ — 4.5 min → 15 s
+3. ~~Alpine as the guest base~~ — a third of Ubuntu's disk at the same speed
+4. ~~Quiet output and direct kernel boot~~ — 615 lines of console → 1 on stdout; 14 s → 9 s
+5. ~~Network egress policy~~ — `--restrict-net`
+6. ~~More than one agent~~ — OpenCode and Antigravity alongside Claude Code
+7. ~~Recipes as data~~ — one TOML file per agent, no Rust
+
+Next:
+
+8. **A qcow2 layer per agent.** The image carries all three agents today, which is fine at three
+   and will not be at ten. A base image without agents, plus one cached layer per agent chosen at
+   build time or built on first use, means you only pay for the agents you actually run.
+9. **CI.** There is none. With recipes being the contribution surface, the per-agent sentinel is
+   the only gate and it currently runs on one laptop.
+10. **Close the DNS channel.** `--restrict-net` leaves slirp's resolver reachable, so names are
+    still a slow way out. Needs a packet filter in the image.
+11. Optional KVM, for hosts without hardware virtualization.
+12. Trim the 4 GB RAM ceiling — the guest uses 476 MB.
