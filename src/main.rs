@@ -287,109 +287,20 @@ fn host_uid() -> u32 {
 /// `bash` is not optional: Alpine's default shell is busybox ash, and the agent's Bash tool
 /// needs real bash. Everything else is the same toolchain the Ubuntu recipe installed.
 fn golden_setup_script(host_uid: u32) -> String {
-    format!(
-        r#"#!/bin/sh
-set -eux
-
-# Roughly a fifth of outbound connections on a given network can time out or drop mid-TLS, and
-# `set -e` turns any one of them into a failed build. Every network step gets retries.
-retry() {{
-  n=0
-  until [ "$n" -ge 5 ]; do
-    "$@" && return 0
-    n=$((n + 1))
-    echo "geli: network step failed, retry $n/5: $*"
-    sleep 3
-  done
-  return 1
-}}
-
-retry apk update
-retry apk add --no-cache bash nodejs npm git python3 py3-pip sudo curl
-
-# The user is created here, not through cloud-init: Alpine's users module cannot set an explicit
-# uid and fails the whole module when asked to. The uid has to match the host's, because files
-# arrive over 9p owned by the host user — otherwise the agent can read the project but not write.
-deluser alpine 2>/dev/null || true
-rm -rf /home/alpine
-adduser -D -u {host_uid} -s /bin/bash sandbox
-printf 'sandbox ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/sandbox
-chmod 0440 /etc/sudoers.d/sandbox
-
-{agent_installs}
-
-install -o sandbox -g sandbox -m 0644 /etc/geli/bash_profile /home/sandbox/.bash_profile
-
-# Autologin on the serial console. Alpine has no systemd, so this is an inittab line plus a
-# login helper rather than a getty drop-in. No getty at all: busybox init already opens ttyS0
-# as the controlling tty with sane modes, and `getty -n` unconditionally writes a CRLF, which
-# was the stray blank line at the top of every session's stdout.
-sed -i 's|^ttyS0::respawn:.*|ttyS0::respawn:/usr/local/bin/geli-autologin|' /etc/inittab
-
-# A disposable VM has no use for a clock daemon or an ssh server, and chronyd alone cost ~4s of
-# boot slewing the clock the host already provides.
-rc-update del chronyd default || true
-rc-update del sshd default || true
-rc-update del rdate default || true
-
-# QEMU's user networking always hands out the same addresses, so DHCP is pure latency:
-# dhcpcd negotiating a lease was most of this image's boot time.
-printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet static\n    address 10.0.2.15\n    netmask 255.255.255.0\n    gateway 10.0.2.2\n' > /etc/network/interfaces
-printf 'nameserver 10.0.2.3\n' > /etc/resolv.conf
-printf 'network:\n  config: disabled\n' > /etc/cloud/cloud.cfg.d/99-geli-network.cfg
-
-# Sessions boot the kernel directly, so the boot menu never runs — but a hand-booted image
-# still shouldn't sit for 10 seconds waiting for a keypress nobody will make.
-sed -i 's/^timeout=.*/timeout=1/' /etc/update-extlinux.conf || true
-update-extlinux || true
-sed -i 's/^TIMEOUT .*/TIMEOUT 1/; s/^PROMPT .*/PROMPT 0/' /boot/extlinux.conf || true
-
-# The login banner and MOTD are the last guest output the user would see on a clean session.
-# Removed rather than emptied: busybox login still prints a newline for an empty motd.
-rm -f /etc/motd
-: > /etc/issue
-
-# Hand the kernel, the initramfs and the cmdline out to the host: sessions boot them directly
-# with -kernel/-initrd, which skips SeaBIOS, iPXE and the bootloader entirely. This is the only
-# point where we run as root, and those files are 0600 root-only.
-mkdir -p /mnt/geli-out
-mount -t 9p -o {mount_opts} {out_tag} /mnt/geli-out
-cp /boot/vmlinuz-virt /mnt/geli-out/{kernel_name}
-cp /boot/initramfs-virt /mnt/geli-out/{initrd_name}
-
-# Captured, never hardcoded: `root=` depends on how the image labels its filesystem.
-{{
-  printf 'cmdline=%s\n' "$(cat /proc/cmdline)"
-  printf 'alpine=%s\n' "$(cut -d' ' -f1-2 /etc/alpine-release 2>/dev/null || echo unknown)"
-  printf 'node=%s\n' "$(node --version 2>/dev/null | tr -d v)"
-  printf 'claude=%s\n' "$(claude --version 2>/dev/null | cut -d' ' -f1)"
-  printf 'opencode=%s\n' "$(opencode --version 2>/dev/null | head -1)"
-  printf 'agy=%s\n' "$(agy --version 2>/dev/null | head -1)"
-}} > /mnt/geli-out/{meta_name}
-
-chown -R {host_uid}:{host_uid} /mnt/geli-out
-sync
-umount /mnt/geli-out
-
-rm -rf /var/cache/apk/*
-rm -rf /root/.npm /home/sandbox/.npm /tmp/* 2>/dev/null || true
-
-# Hand the freed blocks back to the qcow2. Deleting files inside the guest does not shrink the
-# image on its own.
-sync
-fstrim -v / || true
-"#,
-        agent_installs = AGENTS
-            .iter()
-            .map(|a| a.install)
-            .collect::<Vec<_>>()
-            .join("\n"),
-        mount_opts = MOUNT_OPTS,
-        out_tag = GOLDEN_OUT_TAG,
-        kernel_name = KERNEL_NAME,
-        initrd_name = INITRD_NAME,
-        meta_name = GOLDEN_META_NAME,
-        host_uid = host_uid,
+    recipe(
+        include_str!("guest/setup.sh"),
+        &[
+            ("@HOST_UID@", &host_uid.to_string()),
+            (
+                "@AGENT_INSTALLS@",
+                &AGENTS.iter().map(|a| a.install).collect::<Vec<_>>().join("\n"),
+            ),
+            ("@MOUNT_OPTS@", MOUNT_OPTS),
+            ("@OUT_TAG@", GOLDEN_OUT_TAG),
+            ("@KERNEL@", KERNEL_NAME),
+            ("@INITRD@", INITRD_NAME),
+            ("@META@", GOLDEN_META_NAME),
+        ],
     )
 }
 
@@ -417,35 +328,25 @@ const BOOT_PHASES: &[(&str, &str)] = &[
 /// sandbox is ready — `runcmd` output lands in that log, so no extra channel is needed.
 const READY_MARKER: &str = "geli:ready";
 
-const GOLDEN_AUTOLOGIN: &str = r#"#!/bin/sh
-exec /bin/login -f sandbox
-"#;
+const GOLDEN_AUTOLOGIN: &str = include_str!("guest/autologin.sh");
 
 /// Printed only when every tool is present *and* Node is new enough. cloud-init does not abort
 /// runcmd on failure, so the host greps for this rather than trusting the build "finished".
 fn golden_verify_script() -> String {
-    format!(
-        r#"#!/bin/sh
-command -v git >/dev/null || exit 0
-command -v node >/dev/null || exit 0
-{agent_binaries}
-
-major=$(node -p 'process.versions.node.split(".")[0]')
-[ "$major" -ge {required} ] || exit 0
-
-# Without these the host cannot boot the kernel directly, so the image is not publishable.
-[ -s /boot/vmlinuz-virt ] || exit 0
-[ -s /boot/initramfs-virt ] || exit 0
-
-echo {marker}
-"#,
-        required = REQUIRED_NODE_MAJOR,
-        marker = GOLDEN_OK_MARKER,
-        agent_binaries = AGENTS
-            .iter()
-            .map(|a| format!("command -v {} >/dev/null || exit 0", a.binary))
-            .collect::<Vec<_>>()
-            .join("\n"),
+    recipe(
+        include_str!("guest/verify.sh"),
+        &[
+            ("@NODE_MAJOR@", &REQUIRED_NODE_MAJOR.to_string()),
+            ("@OK_MARKER@", GOLDEN_OK_MARKER),
+            (
+                "@AGENT_BINARIES@",
+                &AGENTS
+                    .iter()
+                    .map(|a| format!("command -v {} >/dev/null || exit 0", a.binary))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        ],
     )
 }
 
@@ -459,33 +360,7 @@ echo {marker}
 /// user's command, and hit `sudo poweroff`, killing the VM out from under it. The guard below
 /// makes only the boot's first login shell own the session; nested ones just load the
 /// environment, so the agent's commands still get TERM and the API keys.
-const GOLDEN_PROFILE: &str = r#"[ -f ~/.bashrc ] && . ~/.bashrc
-
-if [ -z "$GELI_SESSION_ACTIVE" ] && [ ! -e /tmp/.geli-session-active ]; then
-    export GELI_SESSION_ACTIVE=1
-    : > /tmp/.geli-session-active 2>/dev/null
-
-    # Autologin is baked into the image, so the getty can hand us a shell before this session's
-    # cloud-init has written /etc/geli/session. Wait for it rather than racing it.
-    cloud-init status --wait >/dev/null 2>&1
-
-    [ -f /etc/geli/env ] && . /etc/geli/env
-
-    if [ -f /etc/geli/session ]; then
-        . /etc/geli/session
-        # The project lives on 9p, so flush before cutting power. `poweroff -f` skips the wall
-        # broadcast and the orderly-shutdown log, neither of which belongs on the user's screen.
-        sync
-        sudo poweroff -f
-    else
-        echo "[!] geli: no session script found; cloud-init may have failed."
-        echo "[!] See /var/log/cloud-init-output.log. Dropping to a shell."
-    fi
-else
-    # Nested login shell, e.g. an agent's Bash tool. Load the environment, own nothing.
-    [ -f /etc/geli/env ] && . /etc/geli/env
-fi
-"#;
+const GOLDEN_PROFILE: &str = include_str!("guest/profile.sh");
 
 struct MountPlan {
     /// Body of the shell script that performs every 9p mount inside the guest.
@@ -725,6 +600,24 @@ fn agent_for_command(command: &str) -> Option<&'static Agent> {
     AGENTS.iter().find(|a| a.command == name)
 }
 
+
+/// Said once when the command is not one of the agents geli knows.
+///
+/// Not a refusal: opening a shell in the sandbox to try something is legitimate and useful. But
+/// the consequences are worth stating, because they are invisible otherwise — no credentials
+/// travel, and `--restrict-net` has no agent hosts to open.
+fn non_agent_notice(command: &str) -> Option<String> {
+    if command.trim().is_empty() || agent_for_command(command).is_some() {
+        return None;
+    }
+    let first = command.split_whitespace().next().unwrap_or(command);
+    Some(format!(
+        "[·] `{}` is not one of geli's agents ({}). It will run, but no credentials travel\n\
+         \x20   into the sandbox and --restrict-net opens no agent hosts.",
+        first.rsplit('/').next().unwrap_or(first),
+        AGENTS.iter().map(|a| a.command).collect::<Vec<_>>().join(", ")
+    ))
+}
 
 /// Warning shown *before* booting, so a doomed run costs a few seconds rather than a full boot
 /// followed by a console that sits there silently.
@@ -1072,6 +965,23 @@ fn describe_image(meta: &GoldenMeta) -> String {
     .join(" · ")
 }
 
+/// Guest recipes live in `src/guest/` as real shell and YAML, not as Rust string literals.
+///
+/// They were literals until the file passed 2,700 lines, and every `{` in a shell script had to
+/// be doubled to survive `format!`. Placeholders are `@NAME@` and substituted here, which keeps
+/// the files readable — and runnable — on their own.
+fn recipe(template: &str, values: &[(&str, &str)]) -> String {
+    let mut out = template.to_string();
+    for (key, value) in values {
+        out = out.replace(key, value);
+    }
+    debug_assert!(
+        !out.contains('@') || !out.contains("@\n") || values.is_empty(),
+        "a recipe placeholder went unsubstituted"
+    );
+    out
+}
+
 /// cloud-config for `--build-image`. Everything slow and workspace-independent lives here.
 ///
 /// Alpine, not Ubuntu: measured at a third of the disk footprint (632 MB against 1.9 GB) with a
@@ -1079,39 +989,14 @@ fn describe_image(meta: &GoldenMeta) -> String {
 /// the Ubuntu recipe are apk instead of apt, an inittab line instead of a systemd drop-in, and
 /// no Node tarball, since Alpine already ships Node 22.
 fn build_golden_cloud_init(host_uid: u32) -> String {
-    format!(
-        r#"#cloud-config
-write_files:
-  - path: /usr/local/bin/geli-autologin
-    permissions: '0755'
-    content: |
-{autologin}
-
-  - path: /etc/geli/bash_profile
-    permissions: '0644'
-    content: |
-{profile}
-
-  - path: /etc/geli/setup.sh
-    permissions: '0755'
-    content: |
-{setup}
-
-  - path: /etc/geli/verify.sh
-    permissions: '0755'
-    content: |
-{verify}
-
-runcmd:
-  - sh /etc/geli/setup.sh
-  - sh /etc/geli/verify.sh
-  - cloud-init clean --logs --seed
-  - poweroff -f
-"#,
-        autologin = indent_block(GOLDEN_AUTOLOGIN, 6),
-        profile = indent_block(GOLDEN_PROFILE, 6),
-        setup = indent_block(&golden_setup_script(host_uid), 6),
-        verify = indent_block(&golden_verify_script(), 6),
+    recipe(
+        include_str!("guest/golden.yaml"),
+        &[
+            ("@AUTOLOGIN@", &indent_block(GOLDEN_AUTOLOGIN, 6)),
+            ("@PROFILE@", &indent_block(GOLDEN_PROFILE, 6)),
+            ("@SETUP@", &indent_block(&golden_setup_script(host_uid), 6)),
+            ("@VERIFY@", &indent_block(&golden_verify_script(), 6)),
+        ],
     )
 }
 
@@ -1136,43 +1021,15 @@ fn build_cloud_init(
         command
     );
 
-    format!(
-        r#"#cloud-config
-write_files:
-  - path: /etc/geli/env
-    permissions: '0600'
-    owner: sandbox:sandbox
-    content: |
-{env}
-
-  - path: /etc/geli/mounts.sh
-    permissions: '0755'
-    content: |
-{mounts}
-
-  - path: /etc/geli/session
-    permissions: '0644'
-    owner: sandbox:sandbox
-    content: |
-{session}
-
-  - path: /home/sandbox/.claude.json
-    permissions: '0600'
-    owner: sandbox:sandbox
-    content: |
-{claude_config}
-
-{credentials}
-runcmd:
-  - bash /etc/geli/mounts.sh
-  - chown -R sandbox:sandbox /home/sandbox/.claude /home/sandbox/.claude.json || true
-  - chown -R sandbox:sandbox /home/sandbox/.cache /workspace || true
-"#,
-        env = indent_block(env_exports, 6),
-        mounts = indent_block(&plan.script, 6),
-        session = indent_block(&session, 6),
-        claude_config = indent_block(claude_config, 6),
-        credentials = build_credentials_entry(credentials),
+    recipe(
+        include_str!("guest/session.yaml"),
+        &[
+            ("@ENV@", &indent_block(env_exports, 6)),
+            ("@MOUNTS@", &indent_block(&plan.script, 6)),
+            ("@SESSION@", &indent_block(&session, 6)),
+            ("@CLAUDE_CONFIG@", &indent_block(claude_config, 6)),
+            ("@CREDENTIALS@", &build_credentials_entry(credentials)),
+        ],
     )
 }
 
@@ -1820,6 +1677,9 @@ fn execute_sandbox(
         || !openai_key.trim().is_empty()
         || !credentials.is_empty();
 
+    if let Some(notice) = non_agent_notice(cmd) {
+        eprintln!("{}", notice);
+    }
     if let Some(warning) = credential_warning(cmd, has_credentials) {
         eprintln!("\n{}\n", warning);
     }
@@ -2179,6 +2039,20 @@ mod tests {
         assert!(!generic.contains("first-run login"));
     }
 
+    /// A notice, not a refusal: running a plain shell in the sandbox is a legitimate thing to do.
+    #[test]
+    fn non_agent_commands_are_noticed_not_refused() {
+        let notice = non_agent_notice("bash -lc make").expect("expected a notice");
+        assert!(notice.contains("bash"));
+        assert!(notice.contains("claude"), "it should list the agents geli does know");
+        assert!(notice.contains("will run"), "it must not read as a refusal");
+
+        // Known agents and an empty command say nothing.
+        for quiet in ["claude", "/usr/local/bin/agy --version", "opencode", ""] {
+            assert!(non_agent_notice(quiet).is_none(), "{:?} should be silent", quiet);
+        }
+    }
+
     #[test]
     fn agent_is_recognised_however_it_is_pathed() {
         assert_eq!(agent_for_command("claude").map(|a| a.command), Some("claude"));
@@ -2384,6 +2258,41 @@ mod tests {
     fn forwarded_credentials_count_as_credentials() {
         // No API key, but credentials were copied in: nothing to warn about.
         assert!(credential_warning("claude", true).is_none());
+    }
+
+    /// Not a real test: writes every generated guest document to /tmp so a refactor can be
+    /// proven byte-identical. Run with `cargo test dump_generated -- --ignored`.
+    #[ignore]
+    #[test]
+    fn dump_generated_documents() {
+        let dir = std::path::PathBuf::from("/tmp/geli-baseline");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let dirs = [PathBuf::from("/home/u/proj"), PathBuf::from("/home/u/api")];
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), &build_lockdown(true));
+        let env = format!(
+            "{}\n{}\n{}",
+            build_env_exports(&[("ANTHROPIC_API_KEY", "sk-fixed".to_string())]),
+            build_proxy_env(Some(45678)),
+            build_terminal_setup("xterm-256color", "truecolor", Some((46, 190)))
+        );
+        let config = build_claude_config(&plan.folders, "sk-ant-fixed-0123456789");
+        let creds = vec![(".claude/.credentials.json".to_string(), "{\"t\":1}".to_string())];
+
+        let files: Vec<(&str, String)> = vec![
+            ("golden.cloud-init.yaml", build_golden_cloud_init(1000)),
+            ("session.cloud-init.yaml", build_cloud_init(&plan, "claude", &env, &config, &creds)),
+            ("setup.sh", golden_setup_script(1000)),
+            ("verify.sh", golden_verify_script()),
+            ("profile.sh", GOLDEN_PROFILE.to_string()),
+            ("autologin.sh", GOLDEN_AUTOLOGIN.to_string()),
+            ("mounts.sh", plan.script.clone()),
+            ("claude.json", config.clone()),
+            ("lockdown.sh", build_lockdown(true)),
+        ];
+        for (name, body) in files {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
     }
 
     // --- egress policy ---

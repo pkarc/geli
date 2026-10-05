@@ -1,0 +1,30 @@
+#cloud-config
+write_files:
+  - path: /etc/geli/env
+    permissions: '0600'
+    owner: sandbox:sandbox
+    content: |
+@ENV@
+
+  - path: /etc/geli/mounts.sh
+    permissions: '0755'
+    content: |
+@MOUNTS@
+
+  - path: /etc/geli/session
+    permissions: '0644'
+    owner: sandbox:sandbox
+    content: |
+@SESSION@
+
+  - path: /home/sandbox/.claude.json
+    permissions: '0600'
+    owner: sandbox:sandbox
+    content: |
+@CLAUDE_CONFIG@
+
+@CREDENTIALS@
+runcmd:
+  - bash /etc/geli/mounts.sh
+  - chown -R sandbox:sandbox /home/sandbox/.claude /home/sandbox/.claude.json || true
+  - chown -R sandbox:sandbox /home/sandbox/.cache /workspace || true

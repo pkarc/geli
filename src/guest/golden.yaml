@@ -1,0 +1,27 @@
+#cloud-config
+write_files:
+  - path: /usr/local/bin/geli-autologin
+    permissions: '0755'
+    content: |
+@AUTOLOGIN@
+
+  - path: /etc/geli/bash_profile
+    permissions: '0644'
+    content: |
+@PROFILE@
+
+  - path: /etc/geli/setup.sh
+    permissions: '0755'
+    content: |
+@SETUP@
+
+  - path: /etc/geli/verify.sh
+    permissions: '0755'
+    content: |
+@VERIFY@
+
+runcmd:
+  - sh /etc/geli/setup.sh
+  - sh /etc/geli/verify.sh
+  - cloud-init clean --logs --seed
+  - poweroff -f
