@@ -1,19 +1,29 @@
-//! The Linux sandbox driver: images, direct kernel boot, the egress proxy and the boot watch.
+//! The Linux sandbox driver: images on disk, direct kernel boot, and watching the guest come up.
 
 #[allow(unused_imports)]
 use crate::dirs_home_dir;
-use crate::{guest::*, net::*};
+use crate::{guest::*, ui::*};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-
-use std::io::Read;
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Child, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+// --- what lives in ~/qemu-sandbox ---
+
+pub(crate) const BASE_IMAGE_NAME: &str = "nocloud_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2";
+pub(crate) const GOLDEN_IMAGE_NAME: &str = "geli-golden.qcow2";
+pub(crate) const GOLDEN_RECIPE_NAME: &str = "geli-golden.recipe";
+pub(crate) const GOLDEN_BUILD_LOG: &str = "geli-golden-build.log";
+pub(crate) const GOLDEN_META_NAME: &str = "geli-golden.meta";
+pub(crate) const KERNEL_NAME: &str = "geli-vmlinuz";
+pub(crate) const INITRD_NAME: &str = "geli-initramfs";
+/// Virtual size of the golden image. The Ubuntu cloud image is only 3.5 GiB, which
+/// `apt install nodejs npm` alone overflows. qcow2 is sparse, so this costs nothing until used,
+/// and cloud-init's growpart expands the root partition to match on first boot. Session
+/// overlays inherit this size from their backing file.
+pub(crate) const SANDBOX_DISK_SIZE: &str = "20G";
 
 /// Where QEMU's console goes. Sessions inherit the terminal so the agent is interactive;
 /// image builds are unattended and go to a log we can inspect afterwards.
@@ -245,164 +255,6 @@ pub fn run_qemu(
     command.spawn()
 }
 
-/// What the proxy decided, for the end-of-session summary.
-#[derive(Default)]
-pub struct ProxyStats {
-    pub allowed: usize,
-    pub blocked: usize,
-    /// Deduplicated so a retry loop against one host does not fill the summary.
-    pub blocked_hosts: std::collections::BTreeSet<String>,
-}
-
-pub struct Proxy {
-    pub port: u16,
-    pub stats: Arc<Mutex<ProxyStats>>,
-}
-
-/// Start the egress proxy on an ephemeral localhost port.
-///
-/// The accept loop runs on a detached thread: it dies with the process, so there is nothing
-/// to shut down or clean up. The guest reaches it only through slirp's single forwarded port.
-pub fn start_proxy(allow: Vec<String>, log_path: PathBuf) -> io::Result<Proxy> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let port = listener.local_addr()?.port();
-    let stats = Arc::new(Mutex::new(ProxyStats::default()));
-
-    let log = Arc::new(Mutex::new(
-        fs::OpenOptions::new().create(true).append(true).open(&log_path)?,
-    ));
-    let allow = Arc::new(allow);
-    let thread_stats = stats.clone();
-
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
-            let (allow, log, stats) = (allow.clone(), log.clone(), thread_stats.clone());
-            std::thread::spawn(move || serve(stream, &allow, &log, &stats));
-        }
-    });
-
-    Ok(Proxy { port, stats })
-}
-
-/// Error responses must say `Connection: close`.
-///
-/// Without it a client keeps the proxy connection in its pool, believing it reusable, then
-/// sends its next CONNECT down a socket this side has already dropped — and waits out its
-/// own timeout. Observed as git taking 300s on the request *after* a rejected one.
-pub(crate) fn refuse(client: &mut TcpStream, status: &str) {
-    let _ = client.write_all(
-        format!("HTTP/1.1 {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status)
-            .as_bytes(),
-    );
-    let _ = client.flush();
-    let _ = client.shutdown(std::net::Shutdown::Both);
-}
-
-pub(crate) fn note(log: &Mutex<File>, line: &str) {
-    if let Ok(mut f) = log.lock() {
-        let _ = writeln!(f, "{}", line);
-    }
-}
-
-pub(crate) fn serve(mut client: TcpStream, allow: &[String], log: &Mutex<File>, stats: &Mutex<ProxyStats>) {
-    // A client that opens a connection and then stalls would otherwise hold a thread for the
-    // life of the session. The timeout covers reading the request head only; once the tunnel
-    // is established it is cleared, because an idle agent session is legitimately quiet.
-    let _ = client.set_read_timeout(Some(Duration::from_secs(20)));
-
-    let mut head = Vec::new();
-    let mut buf = [0u8; 1024];
-    loop {
-        match client.read(&mut buf) {
-            Ok(0) => return,
-            Ok(n) => head.extend_from_slice(&buf[..n]),
-            Err(_) => return,
-        }
-        if head.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        // A client that never finishes its request head is not getting unbounded memory.
-        if head.len() > 16 * 1024 {
-            return;
-        }
-    }
-
-    let request = parse_proxy_request(&String::from_utf8_lossy(&head));
-    let (host, port) = match request {
-        ProxyRequest::Connect { host, port } => (host, port),
-        ProxyRequest::Unsupported(line) => {
-            note(log, &format!("rejected non-CONNECT: {}", line));
-            refuse(&mut client, "405 Method Not Allowed");
-            return;
-        }
-    };
-
-    if port != ALLOWED_PORT {
-        note(log, &format!("blocked {}:{} (only {} is proxied)", host, port, ALLOWED_PORT));
-        deny(&mut client, stats, &host);
-        return;
-    }
-    if !host_allowed(&host, allow) {
-        note(log, &format!("blocked {}:{}", host, port));
-        deny(&mut client, stats, &host);
-        return;
-    }
-
-    let upstream = match TcpStream::connect_timeout(
-        &match (host.as_str(), port).to_socket_addrs().ok().and_then(|mut a| a.next()) {
-            Some(addr) => addr,
-            None => {
-                note(log, &format!("allowed {}:{} but DNS failed", host, port));
-                refuse(&mut client, "502 Bad Gateway");
-                return;
-            }
-        },
-        Duration::from_secs(15),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            note(log, &format!("allowed {}:{} but connect failed: {}", host, port, e));
-            refuse(&mut client, "502 Bad Gateway");
-            return;
-        }
-    };
-
-    note(log, &format!("allowed {}:{}", host, port));
-    if let Ok(mut s) = stats.lock() {
-        s.allowed += 1;
-    }
-    if client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").is_err() {
-        return;
-    }
-    // Clear the head-reading timeout: a live session can sit idle between requests.
-    let _ = client.set_read_timeout(None);
-    tunnel(client, upstream);
-}
-
-pub(crate) fn deny(client: &mut TcpStream, stats: &Mutex<ProxyStats>, host: &str) {
-    if let Ok(mut s) = stats.lock() {
-        s.blocked += 1;
-        s.blocked_hosts.insert(host.to_string());
-    }
-    refuse(client, "403 Forbidden");
-}
-
-pub(crate) fn tunnel(client: TcpStream, upstream: TcpStream) {
-    let Ok(mut client_read) = client.try_clone() else { return };
-    let Ok(mut upstream_write) = upstream.try_clone() else { return };
-    let mut client_write = client;
-    let mut upstream_read = upstream;
-
-    let up = std::thread::spawn(move || {
-        let _ = io::copy(&mut client_read, &mut upstream_write);
-        let _ = upstream_write.shutdown(std::net::Shutdown::Write);
-    });
-    let _ = io::copy(&mut upstream_read, &mut client_write);
-    let _ = client_write.shutdown(std::net::Shutdown::Write);
-    let _ = up.join();
-}
-
 /// Show which phase the guest is in and return once it reports ready.
 ///
 /// Returns false on timeout. That matters: a guest whose cloud-init broke will never write
@@ -448,3 +300,14 @@ pub fn track_boot(log: &Path, animate: bool, color: bool, timeout: Duration) -> 
     false
 }
 
+/// The uid the guest's `sandbox` user must take: files arrive over 9p owned by the host user,
+/// so a mismatch leaves the agent unable to write to the project it was given.
+pub(crate) fn host_uid() -> u32 {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1000)
+}

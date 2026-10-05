@@ -32,12 +32,19 @@ Running the sandbox requires, on the host: `qemu-system-x86_64`, `qemu-img`, `ge
 
 ```
 src/main.rs     CLI, the workspace registry, orchestration, tests
-src/agents.rs   the agents geli knows how to host
-src/guest.rs    what the guest is told to be: cloud-init, mounts, boot phases
-src/net.rs      egress policy: allowlist, CONNECT parsing, proxy env
-src/qemu.rs     the Linux driver: images, direct boot, proxy server, boot watch
+src/agents.rs   the agents geli knows, parsed from agents/*.toml
+src/guest.rs    what the guest is told to be: cloud-init, recipes, mounts, boot
+src/net.rs      egress policy: the allowlist and the proxy that enforces it
+src/qemu.rs     the Linux driver: images on disk, direct boot, the boot watch
+src/ui.rs       the status block and the loading line
+agents/*.toml   one recipe per agent
 src/guest/*.sh  the recipes themselves, as real shell and YAML
 ```
+
+Module boundaries are by subject, not convenience. The first split was cut by line ranges and
+put both cloud-init generators in `net.rs` and the whole proxy server in `qemu.rs`; both were
+wrong and both were moved. If something feels misfiled it probably is — move it rather than
+leaving a note.
 
 Recipes are files, not Rust strings, with `@NAME@` placeholders. They were literals until every
 `{` in a shell script had to be doubled to survive `format!`. If you change one, the

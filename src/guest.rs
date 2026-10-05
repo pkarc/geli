@@ -1,10 +1,8 @@
 //! What the guest is told to be: recipes, cloud-init, mounts, and the boot it reports back.
 
 #[allow(unused_imports)]
-use crate::{agents::*, net::*};
-use std::process::Command;
+use crate::{agents::*, net::*, qemu::*, ui::*};
 use std::path::{Path, PathBuf};
-
 
 // --- GUEST CONFIGURATION ---
 //
@@ -20,17 +18,6 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const MOUNT_OPTS: &str = "trans=virtio,version=9p2000.L,msize=1048576";
 
-/// Virtual size of the golden image. The Ubuntu cloud image is only 3.5 GiB, which
-/// `apt install nodejs npm` alone overflows. qcow2 is sparse, so this costs nothing until used,
-/// and cloud-init's growpart expands the root partition to match on first boot. Session
-/// overlays inherit this size from their backing file.
-pub(crate) const SANDBOX_DISK_SIZE: &str = "20G";
-
-pub(crate) const BASE_IMAGE_NAME: &str = "nocloud_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2";
-pub(crate) const GOLDEN_IMAGE_NAME: &str = "geli-golden.qcow2";
-pub(crate) const GOLDEN_RECIPE_NAME: &str = "geli-golden.recipe";
-pub(crate) const GOLDEN_BUILD_LOG: &str = "geli-golden-build.log";
-
 /// Printed by the build VM only if every expected tool is actually present. cloud-init does not
 /// abort runcmd on failure, so a sentinel that is merely "reached" would prove nothing.
 pub(crate) const GOLDEN_OK_MARKER: &str = "GELI_GOLDEN_OK";
@@ -38,18 +25,6 @@ pub(crate) const GOLDEN_OK_MARKER: &str = "GELI_GOLDEN_OK";
 /// Major Node version the agent requires. Alpine's own `nodejs` package satisfies it, so unlike
 /// on Ubuntu there is no tarball to fetch — apt's Node 18 was the reason that existed.
 pub(crate) const REQUIRED_NODE_MAJOR: u32 = 22;
-
-/// The uid the guest's `sandbox` user must take: files arrive over 9p owned by the host user,
-/// so a mismatch leaves the agent unable to write to the project it was given.
-pub(crate) fn host_uid() -> u32 {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(1000)
-}
 
 /// Provisioning run once by `--build-image`.
 ///
@@ -75,9 +50,6 @@ pub(crate) fn golden_setup_script(host_uid: u32) -> String {
 
 /// 9p tag the build VM uses to hand the kernel, initramfs and metadata back to the host.
 pub(crate) const GOLDEN_OUT_TAG: &str = "geliout";
-pub(crate) const KERNEL_NAME: &str = "geli-vmlinuz";
-pub(crate) const INITRD_NAME: &str = "geli-initramfs";
-pub(crate) const GOLDEN_META_NAME: &str = "geli-golden.meta";
 
 /// Console the kernel and OpenRC write to. The user's terminal is ttyS0; everything the guest
 /// says while booting goes here instead, into a log file on the host.
@@ -340,4 +312,153 @@ pub(crate) fn build_credentials_entry(credentials: &[(String, String)]) -> Strin
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// What `--build-image` recorded about the image it produced.
+#[derive(Default, Debug, PartialEq)]
+pub(crate) struct GoldenMeta {
+    /// The kernel command line the image boots itself with, captured rather than invented.
+    pub(crate) cmdline: String,
+    pub(crate) alpine: String,
+    pub(crate) node: String,
+    pub(crate) claude: String,
+    pub(crate) opencode: String,
+    pub(crate) agy: String,
+}
+
+pub(crate) fn parse_golden_meta(raw: &str) -> GoldenMeta {
+    let mut meta = GoldenMeta::default();
+    for line in raw.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().to_string();
+        match key.trim() {
+            "cmdline" => meta.cmdline = value,
+            "alpine" => meta.alpine = value,
+            "node" => meta.node = value,
+            "claude" => meta.claude = value,
+            "opencode" => meta.opencode = value,
+            "agy" => meta.agy = value,
+            _ => {}
+        }
+    }
+    meta
+}
+
+pub(crate) fn describe_image(meta: &GoldenMeta) -> String {
+    [
+        ("alpine", &meta.alpine),
+        ("claude", &meta.claude),
+        ("opencode", &meta.opencode),
+        ("agy", &meta.agy),
+    ]
+    .iter()
+    .filter(|(_, v)| !v.is_empty())
+    .map(|(k, v)| format!("{} {}", k, v))
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
+/// Furthest phase the boot log shows evidence of.
+pub(crate) fn boot_phase(log: &str) -> &'static str {
+    BOOT_PHASES
+        .iter()
+        .rev()
+        .find(|(_, marker)| log.contains(marker))
+        .map(|(name, _)| *name)
+        .unwrap_or("starting")
+}
+
+/// Rewrite the image's own command line for a direct boot: the guest's console moves off the
+/// user's terminal, and the kernel stops narrating.
+///
+/// `root=` and `modules=` are carried over untouched — they describe how this particular image
+/// finds its filesystem, and hardcoding them is the kind of guess that breaks silently. The
+/// bootloader's own `BOOT_IMAGE=` and `initrd=` are dropped, since there is no bootloader now.
+pub(crate) fn boot_cmdline(original: &str) -> String {
+    let mut tokens: Vec<String> = original
+        .split_whitespace()
+        .filter(|t| {
+            !t.starts_with("console=")
+                && !t.starts_with("BOOT_IMAGE=")
+                && !t.starts_with("initrd=")
+                && !t.starts_with("loglevel=")
+                && *t != "quiet"
+        })
+        .map(str::to_string)
+        .collect();
+
+    tokens.push(format!("console={}", BOOT_CONSOLE));
+    tokens.push("quiet".to_string());
+    tokens.push("loglevel=0".to_string());
+    tokens.join(" ")
+}
+
+/// Guest recipes live in `src/guest/` as real shell and YAML, not as Rust string literals.
+///
+/// They were literals until the file passed 2,700 lines, and every `{` in a shell script had to
+/// be doubled to survive `format!`. Placeholders are `@NAME@` and substituted here, which keeps
+/// the files readable — and runnable — on their own.
+pub(crate) fn recipe(template: &str, values: &[(&str, &str)]) -> String {
+    let mut out = template.to_string();
+    for (key, value) in values {
+        out = out.replace(key, value);
+    }
+    debug_assert!(
+        !out.contains('@') || !out.contains("@\n") || values.is_empty(),
+        "a recipe placeholder went unsubstituted"
+    );
+    out
+}
+
+/// cloud-config for `--build-image`. Everything slow and workspace-independent lives here.
+///
+/// Alpine, not Ubuntu: measured at a third of the disk footprint (632 MB against 1.9 GB) with a
+/// newer kernel and far fewer packages — which is the point of a sandbox. The differences from
+/// the Ubuntu recipe are apk instead of apt, an inittab line instead of a systemd drop-in, and
+/// no Node tarball, since Alpine already ships Node 22.
+pub(crate) fn build_golden_cloud_init(host_uid: u32) -> String {
+    recipe(
+        include_str!("guest/golden.yaml"),
+        &[
+            ("@AUTOLOGIN@", &indent_block(GOLDEN_AUTOLOGIN, 6)),
+            ("@PROFILE@", &indent_block(GOLDEN_PROFILE, 6)),
+            ("@SETUP@", &indent_block(&golden_setup_script(host_uid), 6)),
+            ("@VERIFY@", &indent_block(&golden_verify_script(), 6)),
+        ],
+    )
+}
+
+/// cloud-config for one sandbox session. Installs nothing: the golden image already has it.
+pub(crate) fn build_cloud_init(
+    plan: &MountPlan,
+    command: &str,
+    env_exports: &str,
+    claude_config: &str,
+    credentials: &[(String, String)],
+) -> String {
+    // The breadcrumb goes to the boot console, not stdout. It exists so a command that produces
+    // no output is still distinguishable from a sandbox that never ran it — but the user's stdout
+    // belongs to the command alone, and geli's own status block now covers the visible case.
+    let session = format!(
+        "cd /workspace/{} || true\n\
+         echo '[geli] running: {}' > /dev/{} 2>/dev/null || true\n\
+         {}\n",
+        plan.active_folder,
+        plan.active_folder,
+        BOOT_CONSOLE.split(',').next().unwrap_or("ttyS1"),
+        command
+    );
+
+    recipe(
+        include_str!("guest/session.yaml"),
+        &[
+            ("@ENV@", &indent_block(env_exports, 6)),
+            ("@MOUNTS@", &indent_block(&plan.script, 6)),
+            ("@SESSION@", &indent_block(&session, 6)),
+            ("@CLAUDE_CONFIG@", &indent_block(claude_config, 6)),
+            ("@CREDENTIALS@", &build_credentials_entry(credentials)),
+        ],
+    )
 }

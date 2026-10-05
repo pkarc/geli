@@ -239,12 +239,14 @@ fn display_active_workspaces() -> io::Result<()> {
 mod agents;
 mod guest;
 mod net;
+mod ui;
 #[cfg(target_os = "linux")]
 mod qemu;
 
 use agents::*;
 use guest::*;
 use net::*;
+use ui::*;
 #[cfg(target_os = "linux")]
 use qemu::*;
 
@@ -1146,7 +1148,7 @@ mod tests {
         use std::io::{Read, Write};
 
         let log = std::env::temp_dir().join(format!("geli-proxy-{}.log", std::process::id()));
-        let proxy = qemu::start_proxy(vec!["allowed.example".to_string()], log.clone())
+        let proxy = net::start_proxy(vec!["allowed.example".to_string()], log.clone())
             .expect("proxy failed to start");
 
         for attempt in 1..=3 {

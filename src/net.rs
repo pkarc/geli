@@ -1,7 +1,15 @@
-//! Egress policy: the allowlist, the CONNECT proxy, and what the guest is told about it.
+//! Egress policy: the allowlist, the CONNECT proxy that enforces it, and what the guest is
+//! told so its traffic goes through it.
+
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[allow(unused_imports)]
-use crate::{agents::*, guest::*};
+use crate::{agents::*, guest::*, qemu::*, ui::*};
 
 // --- EGRESS POLICY ---
 //
@@ -132,205 +140,160 @@ pub(crate) fn session_allowlist(agent: Option<&Agent>, extra: &[String]) -> Vec<
     all
 }
 
-/// What `--build-image` recorded about the image it produced.
-#[derive(Default, Debug, PartialEq)]
-pub(crate) struct GoldenMeta {
-    /// The kernel command line the image boots itself with, captured rather than invented.
-    pub(crate) cmdline: String,
-    pub(crate) alpine: String,
-    pub(crate) node: String,
-    pub(crate) claude: String,
-    pub(crate) opencode: String,
-    pub(crate) agy: String,
+/// What the proxy decided, for the end-of-session summary.
+#[derive(Default)]
+pub struct ProxyStats {
+    pub allowed: usize,
+    pub blocked: usize,
+    /// Deduplicated so a retry loop against one host does not fill the summary.
+    pub blocked_hosts: std::collections::BTreeSet<String>,
 }
 
-pub(crate) fn parse_golden_meta(raw: &str) -> GoldenMeta {
-    let mut meta = GoldenMeta::default();
-    for line in raw.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().to_string();
-        match key.trim() {
-            "cmdline" => meta.cmdline = value,
-            "alpine" => meta.alpine = value,
-            "node" => meta.node = value,
-            "claude" => meta.claude = value,
-            "opencode" => meta.opencode = value,
-            "agy" => meta.agy = value,
-            _ => {}
+pub struct Proxy {
+    pub port: u16,
+    pub stats: Arc<Mutex<ProxyStats>>,
+}
+
+/// Start the egress proxy on an ephemeral localhost port.
+///
+/// The accept loop runs on a detached thread: it dies with the process, so there is nothing
+/// to shut down or clean up. The guest reaches it only through slirp's single forwarded port.
+pub fn start_proxy(allow: Vec<String>, log_path: PathBuf) -> io::Result<Proxy> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    let stats = Arc::new(Mutex::new(ProxyStats::default()));
+
+    let log = Arc::new(Mutex::new(
+        fs::OpenOptions::new().create(true).append(true).open(&log_path)?,
+    ));
+    let allow = Arc::new(allow);
+    let thread_stats = stats.clone();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let (allow, log, stats) = (allow.clone(), log.clone(), thread_stats.clone());
+            std::thread::spawn(move || serve(stream, &allow, &log, &stats));
+        }
+    });
+
+    Ok(Proxy { port, stats })
+}
+
+/// Error responses must say `Connection: close`.
+///
+/// Without it a client keeps the proxy connection in its pool, believing it reusable, then
+/// sends its next CONNECT down a socket this side has already dropped — and waits out its
+/// own timeout. Observed as git taking 300s on the request *after* a rejected one.
+pub(crate) fn refuse(client: &mut TcpStream, status: &str) {
+    let _ = client.write_all(
+        format!("HTTP/1.1 {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status)
+            .as_bytes(),
+    );
+    let _ = client.flush();
+    let _ = client.shutdown(std::net::Shutdown::Both);
+}
+
+pub(crate) fn note(log: &Mutex<File>, line: &str) {
+    if let Ok(mut f) = log.lock() {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
+pub(crate) fn serve(mut client: TcpStream, allow: &[String], log: &Mutex<File>, stats: &Mutex<ProxyStats>) {
+    // A client that opens a connection and then stalls would otherwise hold a thread for the
+    // life of the session. The timeout covers reading the request head only; once the tunnel
+    // is established it is cleared, because an idle agent session is legitimately quiet.
+    let _ = client.set_read_timeout(Some(Duration::from_secs(20)));
+
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        match client.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+            Err(_) => return,
+        }
+        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        // A client that never finishes its request head is not getting unbounded memory.
+        if head.len() > 16 * 1024 {
+            return;
         }
     }
-    meta
-}
 
-/// Furthest phase the boot log shows evidence of.
-pub(crate) fn boot_phase(log: &str) -> &'static str {
-    BOOT_PHASES
-        .iter()
-        .rev()
-        .find(|(_, marker)| log.contains(marker))
-        .map(|(name, _)| *name)
-        .unwrap_or("starting")
-}
+    let request = parse_proxy_request(&String::from_utf8_lossy(&head));
+    let (host, port) = match request {
+        ProxyRequest::Connect { host, port } => (host, port),
+        ProxyRequest::Unsupported(line) => {
+            note(log, &format!("rejected non-CONNECT: {}", line));
+            refuse(&mut client, "405 Method Not Allowed");
+            return;
+        }
+    };
 
-/// One frame of the loading line. Pure so the colour handling is testable: escape codes in a
-/// piped log are noise, and `NO_COLOR` exists.
-pub(crate) fn render_spinner_line(frame: char, phase: &str, elapsed: f32, color: bool) -> String {
-    if color {
-        format!(
-            "  \x1b[36m{frame}\x1b[0m booting · \x1b[1m{phase}\x1b[0m \x1b[2m· {elapsed:.1}s\x1b[0m"
-        )
-    } else {
-        format!("  {frame} booting · {phase} · {elapsed:.1}s")
+    if port != ALLOWED_PORT {
+        note(log, &format!("blocked {}:{} (only {} is proxied)", host, port, ALLOWED_PORT));
+        deny(&mut client, stats, &host);
+        return;
     }
-}
-
-/// Rewrite the image's own command line for a direct boot: the guest's console moves off the
-/// user's terminal, and the kernel stops narrating.
-///
-/// `root=` and `modules=` are carried over untouched — they describe how this particular image
-/// finds its filesystem, and hardcoding them is the kind of guess that breaks silently. The
-/// bootloader's own `BOOT_IMAGE=` and `initrd=` are dropped, since there is no bootloader now.
-pub(crate) fn boot_cmdline(original: &str) -> String {
-    let mut tokens: Vec<String> = original
-        .split_whitespace()
-        .filter(|t| {
-            !t.starts_with("console=")
-                && !t.starts_with("BOOT_IMAGE=")
-                && !t.starts_with("initrd=")
-                && !t.starts_with("loglevel=")
-                && *t != "quiet"
-        })
-        .map(str::to_string)
-        .collect();
-
-    tokens.push(format!("console={}", BOOT_CONSOLE));
-    tokens.push("quiet".to_string());
-    tokens.push("loglevel=0".to_string());
-    tokens.join(" ")
-}
-
-/// One mounted directory, as the status block shows it.
-pub(crate) struct StatusMount {
-    pub(crate) host: String,
-    pub(crate) guest: String,
-    pub(crate) active: bool,
-}
-
-/// The facts worth printing before handing the terminal over: what is mounted, which credential
-/// the agent will use, and what is inside the image. Everything else about a session is identical
-/// every time, and identical output is noise even when geli writes it.
-pub(crate) fn render_status(
-    workspace: &str,
-    mounts: &[StatusMount],
-    auth: &str,
-    copied: &[String],
-    image: &str,
-    net: &str,
-) -> String {
-    let mut out = format!("geli · workspace {}\n", workspace);
-    for m in mounts {
-        out.push_str(&format!(
-            "  mount  {} → {}{}\n",
-            m.host,
-            m.guest,
-            if m.active { "  (active)" } else { "" }
-        ));
+    if !host_allowed(&host, allow) {
+        note(log, &format!("blocked {}:{}", host, port));
+        deny(&mut client, stats, &host);
+        return;
     }
-    out.push_str(&format!("  auth   {}\n", auth));
-    // Named, not summarised. A recipe is a file anyone can contribute, and `credentials` means
-    // "copy these out of the user's home into a VM with network access" — so the user sees
-    // exactly which files left, every run, without having to go read the recipe.
-    for path in copied {
-        out.push_str(&format!("         ~/{}\n", path));
+
+    let upstream = match TcpStream::connect_timeout(
+        &match (host.as_str(), port).to_socket_addrs().ok().and_then(|mut a| a.next()) {
+            Some(addr) => addr,
+            None => {
+                note(log, &format!("allowed {}:{} but DNS failed", host, port));
+                refuse(&mut client, "502 Bad Gateway");
+                return;
+            }
+        },
+        Duration::from_secs(15),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            note(log, &format!("allowed {}:{} but connect failed: {}", host, port, e));
+            refuse(&mut client, "502 Bad Gateway");
+            return;
+        }
+    };
+
+    note(log, &format!("allowed {}:{}", host, port));
+    if let Ok(mut s) = stats.lock() {
+        s.allowed += 1;
     }
-    out.push_str(&format!("  net    {}\n", net));
-    if !image.is_empty() {
-        out.push_str(&format!("  image  {}\n", image));
+    if client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").is_err() {
+        return;
     }
-    out
+    // Clear the head-reading timeout: a live session can sit idle between requests.
+    let _ = client.set_read_timeout(None);
+    tunnel(client, upstream);
 }
 
-pub(crate) fn describe_image(meta: &GoldenMeta) -> String {
-    [
-        ("alpine", &meta.alpine),
-        ("claude", &meta.claude),
-        ("opencode", &meta.opencode),
-        ("agy", &meta.agy),
-    ]
-    .iter()
-    .filter(|(_, v)| !v.is_empty())
-    .map(|(k, v)| format!("{} {}", k, v))
-    .collect::<Vec<_>>()
-    .join(" · ")
-}
-
-/// Guest recipes live in `src/guest/` as real shell and YAML, not as Rust string literals.
-///
-/// They were literals until the file passed 2,700 lines, and every `{` in a shell script had to
-/// be doubled to survive `format!`. Placeholders are `@NAME@` and substituted here, which keeps
-/// the files readable — and runnable — on their own.
-pub(crate) fn recipe(template: &str, values: &[(&str, &str)]) -> String {
-    let mut out = template.to_string();
-    for (key, value) in values {
-        out = out.replace(key, value);
+pub(crate) fn deny(client: &mut TcpStream, stats: &Mutex<ProxyStats>, host: &str) {
+    if let Ok(mut s) = stats.lock() {
+        s.blocked += 1;
+        s.blocked_hosts.insert(host.to_string());
     }
-    debug_assert!(
-        !out.contains('@') || !out.contains("@\n") || values.is_empty(),
-        "a recipe placeholder went unsubstituted"
-    );
-    out
+    refuse(client, "403 Forbidden");
 }
 
-/// cloud-config for `--build-image`. Everything slow and workspace-independent lives here.
-///
-/// Alpine, not Ubuntu: measured at a third of the disk footprint (632 MB against 1.9 GB) with a
-/// newer kernel and far fewer packages — which is the point of a sandbox. The differences from
-/// the Ubuntu recipe are apk instead of apt, an inittab line instead of a systemd drop-in, and
-/// no Node tarball, since Alpine already ships Node 22.
-pub(crate) fn build_golden_cloud_init(host_uid: u32) -> String {
-    recipe(
-        include_str!("guest/golden.yaml"),
-        &[
-            ("@AUTOLOGIN@", &indent_block(GOLDEN_AUTOLOGIN, 6)),
-            ("@PROFILE@", &indent_block(GOLDEN_PROFILE, 6)),
-            ("@SETUP@", &indent_block(&golden_setup_script(host_uid), 6)),
-            ("@VERIFY@", &indent_block(&golden_verify_script(), 6)),
-        ],
-    )
+pub(crate) fn tunnel(client: TcpStream, upstream: TcpStream) {
+    let Ok(mut client_read) = client.try_clone() else { return };
+    let Ok(mut upstream_write) = upstream.try_clone() else { return };
+    let mut client_write = client;
+    let mut upstream_read = upstream;
+
+    let up = std::thread::spawn(move || {
+        let _ = io::copy(&mut client_read, &mut upstream_write);
+        let _ = upstream_write.shutdown(std::net::Shutdown::Write);
+    });
+    let _ = io::copy(&mut upstream_read, &mut client_write);
+    let _ = client_write.shutdown(std::net::Shutdown::Write);
+    let _ = up.join();
 }
-
-/// cloud-config for one sandbox session. Installs nothing: the golden image already has it.
-pub(crate) fn build_cloud_init(
-    plan: &MountPlan,
-    command: &str,
-    env_exports: &str,
-    claude_config: &str,
-    credentials: &[(String, String)],
-) -> String {
-    // The breadcrumb goes to the boot console, not stdout. It exists so a command that produces
-    // no output is still distinguishable from a sandbox that never ran it — but the user's stdout
-    // belongs to the command alone, and geli's own status block now covers the visible case.
-    let session = format!(
-        "cd /workspace/{} || true\n\
-         echo '[geli] running: {}' > /dev/{} 2>/dev/null || true\n\
-         {}\n",
-        plan.active_folder,
-        plan.active_folder,
-        BOOT_CONSOLE.split(',').next().unwrap_or("ttyS1"),
-        command
-    );
-
-    recipe(
-        include_str!("guest/session.yaml"),
-        &[
-            ("@ENV@", &indent_block(env_exports, 6)),
-            ("@MOUNTS@", &indent_block(&plan.script, 6)),
-            ("@SESSION@", &indent_block(&session, 6)),
-            ("@CLAUDE_CONFIG@", &indent_block(claude_config, 6)),
-            ("@CREDENTIALS@", &build_credentials_entry(credentials)),
-        ],
-    )
-}
-
