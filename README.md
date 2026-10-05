@@ -58,6 +58,7 @@ minutes. It is what makes every subsequent session start in seconds.
 
 ```bash
 geli <command> [args...]    # run a command inside the sandbox
+geli --restrict-net <cmd>   # let the sandbox reach only an allowlist of hosts
 geli --list                 # show the workspace registry
 geli --build-image          # rebuild the golden image (also how you update the agent)
 geli --no-credentials <cmd>  # do not copy your Claude credentials into the sandbox
@@ -205,6 +206,41 @@ One caveat: the copy is one-way. If the token is refreshed inside the sandbox, t
 with the VM. Should a refresh ever invalidate the host's copy, re-run `claude` on the host to log
 back in.
 
+## Restricting what the sandbox can reach
+
+By default the guest reaches the whole internet. `--restrict-net` narrows it to an allowlist:
+Anthropic's endpoints plus the registries an agent needs to work — npm, PyPI, GitHub, crates.io.
+A project can add its own in `.geli.json`:
+
+```json
+{ "workspace": "acme", "allow": ["registry.internal.example"] }
+```
+
+A proxy inside geli resolves and filters on the host; the guest's default route is deleted so the
+proxy is the only way out. Blocked attempts are logged and summarised when the session ends:
+
+```
+geli · net: 14 allowed, 9 blocked (http-intake.logs.us5.datadoghq.com, mcp-proxy.anthropic.com)
+```
+
+That summary is worth having on its own — it tells you what your agent reaches for.
+
+**Restricted mode also takes away the agent's root** inside the guest, leaving it only
+`sudo poweroff`. It has to: the agent is root by default and could simply restore the route. The
+cost is that `apk add` no longer works mid-session — the image already carries node, python, git
+and the agent, so project dependencies installed as the user are unaffected.
+
+### What it does not give you
+
+- **An allowed destination is still a way out.** With `github.com` reachable, an agent can push to
+  a gist. The allowlist stops an *arbitrary* server from being reached; it does not make the data
+  unable to leave.
+- **DNS queries still resolve.** slirp's resolver sits on the same subnet as the proxy, so names
+  remain a slow, noisy channel out. Closing it needs a packet filter in the image.
+- **Anything that ignores proxy variables loses the network entirely**: `git` over SSH, `ping`,
+  raw sockets, and busybox `wget` (which sends plaintext absolute-form requests a CONNECT proxy
+  correctly refuses). `npm`, `pip` and `git` over HTTPS all work.
+
 ## Security notes
 
 The VM boundary protects your host filesystem. It does not protect everything, and the gaps are
@@ -241,7 +277,6 @@ See [CLAUDE.md](CLAUDE.md) for architecture detail and [docs/plans/](docs/plans/
 2. ~~Golden image, to cut boot from minutes to seconds~~ — done (~4.5 min → ~15 s)
 3. ~~Alpine as the guest base~~ — done (1.9 GB → 656 MB, same session time)
 4. ~~Quiet output and direct kernel boot~~ — done (615 lines → 8; ~14 s → ~7.5 s)
-5. Network egress policy. The guest currently reaches anything; the file boundary holds but
-   confidentiality of what the agent *was* given does not.
+5. ~~Network egress policy~~ — done (`--restrict-net`); DNS remains an open channel.
 6. Optional KVM, for hosts without hardware virtualization.
 7. Trim the 4 GB RAM ceiling — the guest uses 476 MB.

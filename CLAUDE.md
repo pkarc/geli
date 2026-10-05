@@ -61,6 +61,16 @@ Readiness is a marker `mounts.sh` echoes as its last act. `runcmd` output lands 
 
 Colour is on only when stderr is a terminal and `NO_COLOR` is unset; piped, the same phases print one line each so a CI log still shows where a boot died.
 
+### Egress policy (`--restrict-net`)
+
+Off by default; with the flag the guest reaches only `DEFAULT_ALLOWED_HOSTS` plus whatever the project's `.geli.json` lists under `allow`. A CONNECT proxy runs on a thread inside geli, resolves on the host, and only dials port 443 — a proxy that reaches any port on an allowed host is a general tunnel, not a policy.
+
+**Do not reach for `restrict=on` + `guestfwd`.** Measured on QEMU 8.2.2: a guestfwd forwards exactly one connection and then times out forever, with or without `restrict`, so a session died after its first request. The guest reaches the proxy at slirp's host alias `10.0.2.2:<port>` instead, and egress is cut by deleting the guest's default route — which leaves the internet unreachable by name *and* by IP while the on-link proxy still answers.
+
+**Cutting the route is only half of it.** The agent is root in the guest by default and can add the route straight back, so restricted mode also narrows its sudoers to `/sbin/poweroff` alone. Both happen in `mounts.sh`, as root, before the agent runs — and before the readiness marker, or the agent could start first. A restriction the sandbox can undo is worse than none, because the status line claims it is on.
+
+What this does **not** give: an allowed destination is still a way out — `github.com` permits a gist. And slirp's DNS at `10.0.2.3` stays on-link, so name queries remain a low-bandwidth channel; closing that needs nftables in the image.
+
 ### Things to know when editing
 
 - **The cloud-init YAML has a deliberately fixed shape.** Everything variable (mounts, env, the user's command) is injected as a literal block scalar via `indent_block`, so the document's structure never depends on the number of workspace directories. An earlier version built `runcmd` entries by string-replacing newlines; the indentation didn't match and the YAML never parsed, which fails *silently* — the VM boots fine and the command simply never runs. If you add anything variable here, put it in a `content: |` block, not in a list item, and extend `cloud_init_parses`.

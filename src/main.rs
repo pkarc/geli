@@ -22,6 +22,10 @@ struct Cli {
     #[arg(long)]
     no_credentials: bool,
 
+    /// Allow the sandbox to reach only an allowlist of hosts, instead of the whole internet
+    #[arg(long)]
+    restrict_net: bool,
+
     /// Command and arguments passed to execute inside the sandbox
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     agent_args: Vec<String>,
@@ -30,6 +34,10 @@ struct Cli {
 #[derive(Serialize, Deserialize, Debug)]
 struct LocalConfig {
     workspace: String,
+    /// Extra hosts this project may reach when `--restrict-net` is on. Defaulted so the
+    /// `.geli.json` files that already exist keep loading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allow: Vec<String>,
 }
 
 fn main() -> io::Result<()> {
@@ -63,6 +71,7 @@ fn main() -> io::Result<()> {
         mapped_dirs,
         &command_to_run,
         !args.no_credentials,
+        args.restrict_net,
     )?;
     Ok(())
 }
@@ -79,6 +88,14 @@ fn get_config_dir() -> PathBuf {
     path.push("geli");
     path.push("workspaces");
     path
+}
+
+fn read_local_allowlist(current_dir: &Path) -> Vec<String> {
+    fs::read_to_string(current_dir.join(LOCAL_CONFIG_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<LocalConfig>(&raw).ok())
+        .map(|c| c.allow)
+        .unwrap_or_default()
 }
 
 fn get_or_create_workspace(current_dir: &Path) -> io::Result<String> {
@@ -151,6 +168,7 @@ fn get_or_create_workspace(current_dir: &Path) -> io::Result<String> {
 
     let config_payload = LocalConfig {
         workspace: ws_name.clone(),
+        allow: Vec::new(),
     };
     let local_file = File::create(local_config_path)?;
     serde_json::to_writer_pretty(local_file, &config_payload).map_err(io::Error::other)?;
@@ -513,7 +531,7 @@ fn recipe_hash(recipe: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn build_mount_script(dirs: &[PathBuf], current_canonical: &Path) -> MountPlan {
+fn build_mount_script(dirs: &[PathBuf], current_canonical: &Path, lockdown: &str) -> MountPlan {
     let mut script = String::from("#!/bin/bash\nset -x\n\nmkdir -p /workspace\n");
     let mut active_folder = String::new();
     let mut folders = Vec::new();
@@ -539,6 +557,9 @@ fn build_mount_script(dirs: &[PathBuf], current_canonical: &Path) -> MountPlan {
     script.push_str(&format!(
         "mount -t 9p -o {MOUNT_OPTS} pipcache /home/sandbox/.cache/pip\n"
     ));
+
+    // Egress is cut here, after the mounts and before the agent ever runs.
+    script.push_str(lockdown);
 
     // /dev is recreated on every boot, so the session's write access to the boot console has to
     // be granted here rather than baked into the image.
@@ -689,6 +710,138 @@ fn build_credentials_entry(credentials: Option<&str>) -> String {
     }
 }
 
+// --- EGRESS POLICY ---
+//
+// With `--restrict-net` the guest gets `restrict=on`, which blocks outbound traffic *and* DNS,
+// and a single forwarded port to a proxy running inside geli. The proxy resolves names on the
+// host and only connects to destinations on the allowlist.
+//
+// What this buys: an arbitrary server is no longer reachable from the sandbox. What it does not
+// buy: an agent with `github.com` allowed can still push to a gist. The allowlist narrows
+// exfiltration, it does not close it — see README.
+
+/// Reachable by default when restricted: the agent's own endpoints plus the registries a coding
+/// agent needs to do real work in a repository.
+const DEFAULT_ALLOWED_HOSTS: &[&str] = &[
+    "api.anthropic.com",
+    "platform.claude.com",
+    "console.anthropic.com",
+    // MCP connectors reach for this; without it they silently fail to authorise.
+    "mcp-proxy.anthropic.com",
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "github.com",
+    "codeload.github.com",
+    "crates.io",
+    "static.crates.io",
+];
+
+/// The only port the proxy will connect to. A proxy that reaches any port on an allowed host is
+/// a general-purpose tunnel, not a policy.
+const ALLOWED_PORT: u16 = 443;
+
+/// slirp's alias for the host. A guest connection to `10.0.2.2:N` arrives at the host's
+/// `127.0.0.1:N`, which is where the proxy listens.
+///
+/// This is deliberately *not* `restrict=on` plus `guestfwd`. Measured on QEMU 8.2.2: a guestfwd
+/// forwards exactly one connection and then times out forever, with or without `restrict`, so a
+/// session died after its first request. Egress is cut by removing the guest's default route
+/// instead, which leaves only the on-link 10.0.2.0/24 — the proxy — reachable.
+const GUEST_PROXY_HOST: &str = "10.0.2.2";
+
+/// Matches a host against the allowlist. A rule starting with `.` or `*.` also matches
+/// subdomains, which private registries tend to need.
+fn host_allowed(host: &str, allow: &[String]) -> bool {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    allow.iter().any(|rule| {
+        let rule = rule.trim().to_ascii_lowercase();
+        let suffix = rule.strip_prefix("*.").or_else(|| rule.strip_prefix('.'));
+        match suffix {
+            Some(base) => host == base || host.ends_with(&format!(".{}", base)),
+            None => host == rule,
+        }
+    })
+}
+
+/// What the proxy was asked to do.
+#[derive(Debug, PartialEq)]
+enum ProxyRequest {
+    Connect { host: String, port: u16 },
+    /// Anything else, kept verbatim so a rejection can be explained rather than just dropped.
+    Unsupported(String),
+}
+
+fn parse_proxy_request(head: &str) -> ProxyRequest {
+    let line = head.lines().next().unwrap_or("").trim();
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+
+    if !method.eq_ignore_ascii_case("CONNECT") || target.is_empty() {
+        return ProxyRequest::Unsupported(line.chars().take(80).collect());
+    }
+
+    let (host, port) = match target.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().unwrap_or(0)),
+        // A CONNECT without a port is malformed; default to 443 rather than guessing wider.
+        None => (target, ALLOWED_PORT),
+    };
+
+    ProxyRequest::Connect {
+        host: host.trim_matches(|c| c == '[' || c == ']').to_string(),
+        port,
+    }
+}
+
+/// Shell run as root, before the agent starts, that makes the proxy the only way out.
+///
+/// Two halves, and both are needed. Dropping the default route leaves the internet unreachable
+/// by name *and* by IP while the on-link proxy still answers. Narrowing sudo is what makes that
+/// stick: the agent is root in the guest by default, and root can simply add the route back.
+fn build_lockdown(restricted: bool) -> String {
+    if !restricted {
+        return String::new();
+    }
+    "\n# --- restricted egress ---\n\
+     ip route del default || true\n\
+     printf 'sandbox ALL=(ALL) NOPASSWD: /sbin/poweroff\\n' > /etc/sudoers.d/sandbox\n\
+     chmod 0440 /etc/sudoers.d/sandbox\n"
+        .to_string()
+}
+
+/// Proxy variables for the guest. Lowercase forms too: several tools read only those.
+fn build_proxy_env(proxy_port: Option<u16>) -> String {
+    let Some(port) = proxy_port else {
+        return String::new();
+    };
+    let url = format!("http://{}:{}", GUEST_PROXY_HOST, port);
+    [
+        format!("export HTTP_PROXY={}", shell_quote(&url)),
+        format!("export HTTPS_PROXY={}", shell_quote(&url)),
+        format!("export http_proxy={}", shell_quote(&url)),
+        format!("export https_proxy={}", shell_quote(&url)),
+        "export NO_PROXY='localhost,127.0.0.1'".to_string(),
+        "export no_proxy='localhost,127.0.0.1'".to_string(),
+    ]
+    .join("\n")
+}
+
+/// The allowlist for this session: the built-in defaults plus anything the project asked for.
+fn session_allowlist(extra: &[String]) -> Vec<String> {
+    let mut all: Vec<String> = DEFAULT_ALLOWED_HOSTS.iter().map(|h| h.to_string()).collect();
+    for host in extra {
+        let host = host.trim();
+        if !host.is_empty() && !all.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+            all.push(host.to_string());
+        }
+    }
+    all
+}
+
 /// What `--build-image` recorded about the image it produced.
 #[derive(Default, Debug, PartialEq)]
 struct GoldenMeta {
@@ -774,7 +927,13 @@ struct StatusMount {
 /// The facts worth printing before handing the terminal over: what is mounted, which credential
 /// the agent will use, and what is inside the image. Everything else about a session is identical
 /// every time, and identical output is noise even when geli writes it.
-fn render_status(workspace: &str, mounts: &[StatusMount], auth: &str, image: &str) -> String {
+fn render_status(
+    workspace: &str,
+    mounts: &[StatusMount],
+    auth: &str,
+    image: &str,
+    net: &str,
+) -> String {
     let mut out = format!("geli · workspace {}\n", workspace);
     for m in mounts {
         out.push_str(&format!(
@@ -785,6 +944,7 @@ fn render_status(workspace: &str, mounts: &[StatusMount], auth: &str, image: &st
         ));
     }
     out.push_str(&format!("  auth   {}\n", auth));
+    out.push_str(&format!("  net    {}\n", net));
     if !image.is_empty() {
         out.push_str(&format!("  image  {}\n", image));
     }
@@ -913,8 +1073,11 @@ runcmd:
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream, ToSocketAddrs};
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Child, Stdio};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     /// Where QEMU's console goes. Sessions inherit the terminal so the agent is interactive;
@@ -1144,6 +1307,164 @@ mod linux {
         command.spawn()
     }
 
+    /// What the proxy decided, for the end-of-session summary.
+    #[derive(Default)]
+    pub struct ProxyStats {
+        pub allowed: usize,
+        pub blocked: usize,
+        /// Deduplicated so a retry loop against one host does not fill the summary.
+        pub blocked_hosts: std::collections::BTreeSet<String>,
+    }
+
+    pub struct Proxy {
+        pub port: u16,
+        pub stats: Arc<Mutex<ProxyStats>>,
+    }
+
+    /// Start the egress proxy on an ephemeral localhost port.
+    ///
+    /// The accept loop runs on a detached thread: it dies with the process, so there is nothing
+    /// to shut down or clean up. The guest reaches it only through slirp's single forwarded port.
+    pub fn start_proxy(allow: Vec<String>, log_path: PathBuf) -> io::Result<Proxy> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let stats = Arc::new(Mutex::new(ProxyStats::default()));
+
+        let log = Arc::new(Mutex::new(
+            fs::OpenOptions::new().create(true).append(true).open(&log_path)?,
+        ));
+        let allow = Arc::new(allow);
+        let thread_stats = stats.clone();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let (allow, log, stats) = (allow.clone(), log.clone(), thread_stats.clone());
+                std::thread::spawn(move || serve(stream, &allow, &log, &stats));
+            }
+        });
+
+        Ok(Proxy { port, stats })
+    }
+
+    /// Error responses must say `Connection: close`.
+    ///
+    /// Without it a client keeps the proxy connection in its pool, believing it reusable, then
+    /// sends its next CONNECT down a socket this side has already dropped — and waits out its
+    /// own timeout. Observed as git taking 300s on the request *after* a rejected one.
+    fn refuse(client: &mut TcpStream, status: &str) {
+        let _ = client.write_all(
+            format!("HTTP/1.1 {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status)
+                .as_bytes(),
+        );
+        let _ = client.flush();
+        let _ = client.shutdown(std::net::Shutdown::Both);
+    }
+
+    fn note(log: &Mutex<File>, line: &str) {
+        if let Ok(mut f) = log.lock() {
+            let _ = writeln!(f, "{}", line);
+        }
+    }
+
+    fn serve(mut client: TcpStream, allow: &[String], log: &Mutex<File>, stats: &Mutex<ProxyStats>) {
+        // A client that opens a connection and then stalls would otherwise hold a thread for the
+        // life of the session. The timeout covers reading the request head only; once the tunnel
+        // is established it is cleared, because an idle agent session is legitimately quiet.
+        let _ = client.set_read_timeout(Some(Duration::from_secs(20)));
+
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match client.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => head.extend_from_slice(&buf[..n]),
+                Err(_) => return,
+            }
+            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            // A client that never finishes its request head is not getting unbounded memory.
+            if head.len() > 16 * 1024 {
+                return;
+            }
+        }
+
+        let request = parse_proxy_request(&String::from_utf8_lossy(&head));
+        let (host, port) = match request {
+            ProxyRequest::Connect { host, port } => (host, port),
+            ProxyRequest::Unsupported(line) => {
+                note(log, &format!("rejected non-CONNECT: {}", line));
+                refuse(&mut client, "405 Method Not Allowed");
+                return;
+            }
+        };
+
+        if port != ALLOWED_PORT {
+            note(log, &format!("blocked {}:{} (only {} is proxied)", host, port, ALLOWED_PORT));
+            deny(&mut client, stats, &host);
+            return;
+        }
+        if !host_allowed(&host, allow) {
+            note(log, &format!("blocked {}:{}", host, port));
+            deny(&mut client, stats, &host);
+            return;
+        }
+
+        let upstream = match TcpStream::connect_timeout(
+            &match (host.as_str(), port).to_socket_addrs().ok().and_then(|mut a| a.next()) {
+                Some(addr) => addr,
+                None => {
+                    note(log, &format!("allowed {}:{} but DNS failed", host, port));
+                    refuse(&mut client, "502 Bad Gateway");
+                    return;
+                }
+            },
+            Duration::from_secs(15),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                note(log, &format!("allowed {}:{} but connect failed: {}", host, port, e));
+                refuse(&mut client, "502 Bad Gateway");
+                return;
+            }
+        };
+
+        note(log, &format!("allowed {}:{}", host, port));
+        if let Ok(mut s) = stats.lock() {
+            s.allowed += 1;
+        }
+        if client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").is_err() {
+            return;
+        }
+        // Clear the head-reading timeout: a live session can sit idle between requests.
+        let _ = client.set_read_timeout(None);
+        tunnel(client, upstream);
+    }
+
+    fn deny(client: &mut TcpStream, stats: &Mutex<ProxyStats>, host: &str) {
+        if let Ok(mut s) = stats.lock() {
+            s.blocked += 1;
+            s.blocked_hosts.insert(host.to_string());
+        }
+        refuse(client, "403 Forbidden");
+    }
+
+    fn tunnel(client: TcpStream, upstream: TcpStream) {
+        let Ok(mut client_read) = client.try_clone() else { return };
+        let Ok(mut upstream_write) = upstream.try_clone() else { return };
+        let mut client_write = client;
+        let mut upstream_read = upstream;
+
+        let up = std::thread::spawn(move || {
+            let _ = io::copy(&mut client_read, &mut upstream_write);
+            let _ = upstream_write.shutdown(std::net::Shutdown::Write);
+        });
+        let _ = io::copy(&mut upstream_read, &mut client_write);
+        let _ = client_write.shutdown(std::net::Shutdown::Write);
+        let _ = up.join();
+    }
+
     /// Show which phase the guest is in and return once it reports ready.
     ///
     /// Returns false on timeout. That matters: a guest whose cloud-init broke will never write
@@ -1281,6 +1602,7 @@ fn execute_sandbox(
     dirs: Vec<PathBuf>,
     cmd: &str,
     forward_credentials: bool,
+    restrict_net: bool,
 ) -> io::Result<()> {
     use linux::*;
 
@@ -1331,7 +1653,7 @@ fn execute_sandbox(
     let sandbox_img = PathBuf::from(format!("/tmp/sandbox-session-{}.qcow2", pid));
 
     let cur_canon = cur.canonicalize()?;
-    let plan = build_mount_script(&dirs, &cur_canon);
+    let plan = build_mount_script(&dirs, &cur_canon, &build_lockdown(restrict_net));
 
     let mut qemu_args: Vec<String> = Vec::new();
     let mut status_mounts: Vec<StatusMount> = Vec::new();
@@ -1387,10 +1709,24 @@ fn execute_sandbox(
     }
 
     let api_key_for_config = anthropic_key.clone();
+    // The proxy has to exist before the guest boots: slirp forwards a port straight to it.
+    let proxy = if restrict_net {
+        let allow = session_allowlist(&read_local_allowlist(cur));
+        let count = allow.len();
+        Some((start_proxy(allow, vm_share_dir.join("net.log"))?, count))
+    } else {
+        None
+    };
+
     let mut env_exports = build_env_exports(&[
         ("ANTHROPIC_API_KEY", anthropic_key),
         ("OPENAI_API_KEY", openai_key),
     ]);
+    let proxy_env = build_proxy_env(proxy.as_ref().map(|(p, _)| p.port));
+    if !proxy_env.is_empty() {
+        env_exports.push('\n');
+        env_exports.push_str(&proxy_env);
+    }
     env_exports.push('\n');
     env_exports.push_str(&build_terminal_setup(
         &std::env::var("TERM").unwrap_or_default(),
@@ -1423,9 +1759,13 @@ fn execute_sandbox(
     } else {
         "none"
     };
+    let net = match &proxy {
+        Some((_, count)) => format!("restricted · {} domains allowed", count),
+        None => "open · unrestricted".to_string(),
+    };
     eprint!(
         "{}",
-        render_status(ws, &status_mounts, auth, &describe_image(&meta))
+        render_status(ws, &status_mounts, auth, &describe_image(&meta), &net)
     );
 
     let console_log = vm_share_dir.join("console.log");
@@ -1468,6 +1808,24 @@ fn execute_sandbox(
         eprintln!("[!] QEMU exited with {}. Console log: {}", qemu_status, console_log.display());
     }
 
+    if let Some((proxy, _)) = &proxy {
+        if let Ok(stats) = proxy.stats.lock() {
+            if stats.blocked > 0 {
+                let mut hosts: Vec<&str> = stats.blocked_hosts.iter().map(String::as_str).collect();
+                hosts.truncate(4);
+                eprintln!(
+                    "geli · net: {} allowed, {} blocked ({}{})",
+                    stats.allowed,
+                    stats.blocked,
+                    hosts.join(", "),
+                    if stats.blocked_hosts.len() > hosts.len() { ", …" } else { "" }
+                );
+            } else {
+                eprintln!("geli · net: {} allowed, none blocked", stats.allowed);
+            }
+        }
+    }
+
     let elapsed = started.elapsed().as_secs_f32();
     if keep_session {
         eprintln!(
@@ -1497,6 +1855,7 @@ fn execute_sandbox(
     _dirs: Vec<PathBuf>,
     _cmd: &str,
     _forward_credentials: bool,
+    _restrict_net: bool,
 ) -> io::Result<()> {
     eprintln!("macOS backend is not yet implemented.");
     Ok(())
@@ -1508,6 +1867,7 @@ fn execute_sandbox(
     _dirs: Vec<PathBuf>,
     _cmd: &str,
     _forward_credentials: bool,
+    _restrict_net: bool,
 ) -> io::Result<()> {
     eprintln!("Windows backend is not yet implemented.");
     Ok(())
@@ -1520,7 +1880,7 @@ mod tests {
 
     fn session_cloud_init(dirs: &[&str], current: &str, cmd: &str) -> String {
         let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
-        let plan = build_mount_script(&dirs, Path::new(current));
+        let plan = build_mount_script(&dirs, Path::new(current), "");
         let env = build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]);
         let config = build_claude_config(&plan.folders, "sk-ant-test-key-0123456789");
         build_cloud_init(&plan, cmd, &env, &config, None)
@@ -1662,14 +2022,14 @@ mod tests {
     fn build_mount_script_marks_current_directory_as_active() {
         let tmp = std::env::temp_dir().canonicalize().unwrap();
         let dirs = vec![tmp.clone()];
-        let plan = build_mount_script(&dirs, &tmp);
+        let plan = build_mount_script(&dirs, &tmp, "");
         assert_eq!(plan.active_folder, folder_name(&tmp));
     }
 
     #[test]
     fn build_mount_script_falls_back_when_no_directory_matches() {
         // Nothing canonicalizes to this path, so the fallback in build_mount_script applies.
-        let plan = build_mount_script(&[], Path::new("/home/u/myproject"));
+        let plan = build_mount_script(&[], Path::new("/home/u/myproject"), "");
         assert_eq!(plan.active_folder, "myproject");
         assert!(!plan.script.contains("cd /workspace/\n"));
     }
@@ -1737,7 +2097,7 @@ mod tests {
     #[test]
     fn terminal_setup_survives_cloud_init() {
         let dirs = [PathBuf::from("/home/u/proj")];
-        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"));
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "");
         let env = format!(
             "{}\n{}",
             build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]),
@@ -1810,7 +2170,7 @@ mod tests {
     #[test]
     fn forwarded_credentials_land_in_cloud_init() {
         let dirs = [PathBuf::from("/home/u/proj")];
-        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"));
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "");
         let creds = r#"{"claudeAiOauth":{"accessToken":"tok","refreshToken":"ref"}}"#;
         let yaml = build_cloud_init(&plan, "claude", "", "{}", Some(creds));
 
@@ -1852,8 +2212,171 @@ mod tests {
         assert!(credential_warning("claude", true).is_none());
     }
 
-    /// The guest's console must never land on the user's terminal, and `root=` must survive:
-    /// hardcoding it is how a boot breaks silently on a differently-labelled image.
+    // --- egress policy ---
+
+    /// The proxy must survive being used more than once. A blocked host is enough to exercise
+    /// accept → parse → refuse without touching the real network.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proxy_serves_more_than_one_connection() {
+        use std::io::{Read, Write};
+
+        let log = std::env::temp_dir().join(format!("geli-proxy-{}.log", std::process::id()));
+        let proxy = linux::start_proxy(vec!["allowed.example".to_string()], log.clone())
+            .expect("proxy failed to start");
+
+        for attempt in 1..=3 {
+            let mut c = std::net::TcpStream::connect(("127.0.0.1", proxy.port))
+                .unwrap_or_else(|e| panic!("connection {} refused: {}", attempt, e));
+            c.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            c.write_all(b"CONNECT blocked.example:443 HTTP/1.1\r\n\r\n").unwrap();
+
+            let mut buf = [0u8; 64];
+            let n = c.read(&mut buf).unwrap_or(0);
+            let reply = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(reply.contains("403"), "connection {} got {:?}", attempt, reply);
+        }
+
+        let _ = std::fs::remove_file(&log);
+    }
+
+    fn allow() -> Vec<String> {
+        session_allowlist(&["*.internal.example".to_string(), ".corp.test".to_string()])
+    }
+
+    #[test]
+    fn allowlist_matches_exactly_and_by_suffix() {
+        let a = allow();
+        assert!(host_allowed("api.anthropic.com", &a));
+        assert!(host_allowed("API.Anthropic.COM", &a), "hosts are case-insensitive");
+        assert!(host_allowed("api.anthropic.com.", &a), "a trailing dot is the same host");
+
+        // Suffix rules cover the base and its subdomains, and nothing else.
+        assert!(host_allowed("registry.internal.example", &a));
+        assert!(host_allowed("internal.example", &a));
+        assert!(host_allowed("deep.nested.corp.test", &a));
+    }
+
+    /// The failure that matters: something not on the list must not slip through. A suffix rule
+    /// must not match a host that merely *ends with the same text*.
+    #[test]
+    fn allowlist_rejects_everything_else() {
+        let a = allow();
+        for host in [
+            "example.com",
+            "evil.com",
+            "",
+            "anthropic.com",                 // the rule is api.anthropic.com, not the apex
+            "api.anthropic.com.evil.com",    // suffix-appending attack
+            "notinternal.example",           // `.internal.example` must need the dot
+            "fake-corp.test",
+        ] {
+            assert!(!host_allowed(host, &a), "{:?} should not be allowed", host);
+        }
+    }
+
+    #[test]
+    fn proxy_only_accepts_connect() {
+        assert_eq!(
+            parse_proxy_request("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: x\r\n\r\n"),
+            ProxyRequest::Connect { host: "api.anthropic.com".into(), port: 443 }
+        );
+        // busybox wget proxies plain HTTP as an absolute-form GET; it must be refused, visibly.
+        match parse_proxy_request("GET http://example.com/ HTTP/1.1\r\n\r\n") {
+            ProxyRequest::Unsupported(line) => assert!(line.contains("GET")),
+            other => panic!("absolute-form GET was accepted: {:?}", other),
+        }
+        assert!(matches!(parse_proxy_request(""), ProxyRequest::Unsupported(_)));
+        assert!(matches!(parse_proxy_request("CONNECT\r\n"), ProxyRequest::Unsupported(_)));
+    }
+
+    /// A port other than 443 turns the proxy into a general tunnel, so the parse must surface it
+    /// for the caller to reject.
+    #[test]
+    fn proxy_surfaces_the_requested_port() {
+        assert_eq!(
+            parse_proxy_request("CONNECT github.com:22 HTTP/1.1\r\n\r\n"),
+            ProxyRequest::Connect { host: "github.com".into(), port: 22 }
+        );
+        assert_ne!(22, ALLOWED_PORT);
+    }
+
+    #[test]
+    fn proxy_env_points_at_the_host_gateway() {
+        assert_eq!(build_proxy_env(None), "");
+        let env = build_proxy_env(Some(45678));
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY"] {
+            assert!(env.contains(key), "{} missing: some tools read only one form", key);
+        }
+        // Measured: a guestfwd forwards one connection and then dies, so the proxy is reached
+        // through slirp's host alias instead.
+        assert!(env.contains("10.0.2.2:45678"));
+        assert!(!env.contains("10.0.2.100"));
+    }
+
+    /// Both halves of the lockdown are load-bearing. Dropping the route cuts egress; narrowing
+    /// sudo is what stops the agent — root in the guest by default — from adding it back.
+    #[test]
+    fn lockdown_cuts_the_route_and_takes_away_root() {
+        assert_eq!(build_lockdown(false), "", "an open session must not be touched");
+
+        let locked = build_lockdown(true);
+        assert!(locked.contains("ip route del default"));
+        assert!(locked.contains("NOPASSWD: /sbin/poweroff"));
+        assert!(
+            !locked.contains("NOPASSWD: ALL"),
+            "leaving blanket sudo would let the agent undo the route"
+        );
+    }
+
+    /// The lockdown has to be in place before the agent runs, and the readiness marker is what
+    /// tells the host the guest is ready — so the lockdown must come first.
+    #[test]
+    fn lockdown_runs_before_the_session_is_declared_ready() {
+        let plan = build_mount_script(
+            &[PathBuf::from("/home/u/proj")],
+            Path::new("/home/u/proj"),
+            &build_lockdown(true),
+        );
+        let route = plan.script.find("ip route del default").expect("no lockdown");
+        let ready = plan.script.find(READY_MARKER).expect("no ready marker");
+        assert!(route < ready, "the agent could run before egress was cut");
+    }
+
+    #[test]
+    fn session_allowlist_adds_without_duplicating() {
+        let base = session_allowlist(&[]);
+        assert!(base.contains(&"api.anthropic.com".to_string()));
+
+        let extended = session_allowlist(&[
+            "API.ANTHROPIC.COM".to_string(),
+            "extra.example".to_string(),
+            "   ".to_string(),
+        ]);
+        assert_eq!(extended.len(), base.len() + 1, "case-folded duplicate or blank crept in");
+        assert!(extended.contains(&"extra.example".to_string()));
+    }
+
+    /// Adding `allow` must not break the .geli.json files that already exist on disk.
+    #[test]
+    fn local_config_without_allow_still_parses() {
+        let old: LocalConfig = serde_json::from_str(r#"{"workspace":"github"}"#).unwrap();
+        assert_eq!(old.workspace, "github");
+        assert!(old.allow.is_empty());
+
+        let new: LocalConfig =
+            serde_json::from_str(r#"{"workspace":"w","allow":["a.test"]}"#).unwrap();
+        assert_eq!(new.allow, vec!["a.test".to_string()]);
+
+        // An empty allowlist must not be written back into users' files.
+        let written = serde_json::to_string(&LocalConfig {
+            workspace: "w".into(),
+            allow: Vec::new(),
+        })
+        .unwrap();
+        assert!(!written.contains("allow"));
+    }
+
     /// Phases must come from the guest's own output. A loader that advances on a timer is
     /// confidently wrong exactly when the boot is stuck, which is the only time anyone reads it.
     #[test]
@@ -1890,6 +2413,8 @@ mod tests {
         assert!(colored.contains("7.0s"));
     }
 
+    /// The guest's console must never land on the user's terminal, and `root=` must survive:
+    /// hardcoding it is how a boot breaks silently on a differently-labelled image.
     #[test]
     fn boot_cmdline_moves_the_console_and_keeps_root() {
         let original = "BOOT_IMAGE=vmlinuz-virt root=LABEL=/ modules=sd-mod,usb-storage,ext4 \
@@ -1942,20 +2467,22 @@ mod tests {
             StatusMount { host: "/home/u/proj".into(), guest: "/workspace/proj".into(), active: true },
             StatusMount { host: "/home/u/api".into(), guest: "/workspace/api".into(), active: false },
         ];
-        let out = render_status("acme", &mounts, "claude.ai credentials", "alpine 3.22");
+        let out = render_status("acme", &mounts, "claude.ai credentials", "alpine 3.22", "open");
 
         assert!(out.starts_with("geli · workspace acme\n"));
         assert!(out.contains("/home/u/proj → /workspace/proj  (active)"));
         assert!(out.contains("/home/u/api → /workspace/api\n"));
         assert!(out.contains("auth   claude.ai credentials"));
         assert!(out.contains("image  alpine 3.22"));
+        // The network posture is a security property that changes per run: always shown.
+        assert!(out.contains("net    open"));
     }
 
     /// Regression guard for the point of this change: the session must leave the guest's console
     /// somewhere other than the terminal, and signal readiness through it.
     #[test]
     fn mount_script_ends_with_the_ready_marker() {
-        let plan = build_mount_script(&[PathBuf::from("/home/u/proj")], Path::new("/home/u/proj"));
+        let plan = build_mount_script(&[PathBuf::from("/home/u/proj")], Path::new("/home/u/proj"), "");
         assert_eq!(
             plan.script.trim_end().lines().last().unwrap().trim(),
             format!("echo {}", READY_MARKER)
