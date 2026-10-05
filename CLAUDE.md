@@ -30,7 +30,21 @@ Running the sandbox requires, on the host: `qemu-system-x86_64`, `qemu-img`, `ge
 
 ## Architecture
 
-Everything lives in `src/main.rs`, split into two layers:
+```
+src/main.rs     CLI, the workspace registry, orchestration, tests
+src/agents.rs   the agents geli knows how to host
+src/guest.rs    what the guest is told to be: cloud-init, mounts, boot phases
+src/net.rs      egress policy: allowlist, CONNECT parsing, proxy env
+src/qemu.rs     the Linux driver: images, direct boot, proxy server, boot watch
+src/guest/*.sh  the recipes themselves, as real shell and YAML
+```
+
+Recipes are files, not Rust strings, with `@NAME@` placeholders. They were literals until every
+`{` in a shell script had to be doubled to survive `format!`. If you change one, the
+`#[ignore]`d `dump_generated_documents` test writes every generated guest document to `/tmp` —
+dump before and after and diff, which is how the split above was proven to change nothing.
+
+Two layers underneath:
 
 **Workspace registry (platform-independent).** A "workspace" is a named group of directories that should see each other inside one VM. Two pieces of state:
 
