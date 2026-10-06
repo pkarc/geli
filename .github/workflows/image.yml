@@ -37,10 +37,15 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest  # x86_64: nested virtualization is not available on the arm64 runners
+    # Pinned, not `ubuntu-latest`, for two reasons: nested virtualization is x86_64-only, and this
+    # job's behaviour depends on the host QEMU version — the guestfwd finding in CLAUDE.md was
+    # specific to QEMU 8.2.2. `ubuntu-latest` moves to Ubuntu 26 in October 2026, and a silent
+    # change of hypervisor underneath an image build is not something to discover from a red run.
+    # Bump this deliberately, and read the build log when you do.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0  # so a PR can be diffed against its base to find changed recipes
 
@@ -60,7 +65,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -79,7 +84,7 @@ jobs:
           echo "url=$(grep -oP '^IMG_URL="\K[^"]+' setup.sh)" >> "$GITHUB_OUTPUT"
 
       - name: Cache the cloud image
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/qemu-sandbox/${{ steps.cloud.outputs.name }}
           key: cloud-image-${{ steps.cloud.outputs.name }}
@@ -93,7 +98,7 @@ jobs:
       # Keyed on the recipe's ingredients. A restore that is nonetheless stale is safe rather than
       # wrong: `--build-image` compares the recorded recipe hash and rebuilds when it differs.
       - name: Cache the base image
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/qemu-sandbox/geli-base.qcow2
@@ -174,7 +179,7 @@ jobs:
         if: always()
         run: cp ~/qemu-sandbox/geli-build.log . || true
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-log
           path: geli-build.log
