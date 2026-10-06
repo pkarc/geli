@@ -382,8 +382,11 @@ The session smoke test asserts that `geli <agent> --version` puts **exactly one 
 That is the stdout-belongs-to-the-command contract, and it is the assertion that would have caught
 the stray blank line busybox `getty -n` used to print at the top of every session.
 
-`cargo fmt --check` is not a gate: parts of this code are laid out by hand in ways rustfmt would
-undo. If you want it, reformat in a commit of its own.
+**Please don't run `cargo fmt` here.** The layout of this code is deliberate — some things are
+split across lines so they read in one glance, and rustfmt cannot tell a meaningful break from an
+accidental one. There is no `rustfmt.toml`, so a bare `cargo fmt` reformats about 620 lines, none
+of which changes behaviour and all of which buries whatever you actually came to change. Match the
+formatting of the code around you instead.
 
 If you send a recipe, note that `image` runs its `install` as root in a VM on a runner. The
 workflow uses `pull_request`, never `pull_request_target`, so a fork's job has a read-only token
