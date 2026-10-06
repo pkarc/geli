@@ -1,0 +1,181 @@
+name: image
+
+# The expensive gate: does the image actually build, and does a session actually run?
+#
+# `check` proves a recipe parses and declares sane things. Only this proves it installs. cloud-init
+# does not abort on failure, so the only real answer comes from booting the thing and looking for
+# the binary — which is what `--build-image` already does, and what this makes someone other than
+# the author do too.
+#
+# Layers are what make this affordable. A PR touching one recipe builds one layer, not an image
+# holding every agent, so a broken recipe is one red job instead of a build nobody can complete.
+on:
+  pull_request:
+    paths:
+      - 'agents/**'
+      - 'src/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.github/workflows/image.yml'
+  # Upstream breaks recipes without touching this repo: Antigravity's installer started serving
+  # its script gzipped and `agy` went from working to downloading a binary, with no commit here.
+  # Nothing but a scheduled build finds that.
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      agents:
+        description: 'Agents to build (comma separated, or "all")'
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest  # x86_64: nested virtualization is not available on the arm64 runners
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # so a PR can be diffed against its base to find changed recipes
+
+      # /dev/kvm exists on the hosted x86_64 runners but the runner user is not in the kvm group.
+      # Without this QEMU falls back to emulation, where a layer build takes far longer than the
+      # job timeout.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -c /dev/kvm
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - run: cargo build --locked --release
+
+      # Both read out of setup.sh, so the workflow cannot drift from the installer.
+      - name: Resolve the cloud image
+        id: cloud
+        run: |
+          echo "name=$(grep -oP '^IMG_NAME="\K[^"]+' setup.sh)" >> "$GITHUB_OUTPUT"
+          echo "url=$(grep -oP '^IMG_URL="\K[^"]+' setup.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the cloud image
+        uses: actions/cache@v4
+        with:
+          path: ~/qemu-sandbox/${{ steps.cloud.outputs.name }}
+          key: cloud-image-${{ steps.cloud.outputs.name }}
+
+      - name: Download the cloud image if it was not cached
+        run: |
+          mkdir -p ~/qemu-sandbox
+          target="$HOME/qemu-sandbox/${{ steps.cloud.outputs.name }}"
+          test -f "$target" || curl -fsSL -o "$target" "${{ steps.cloud.outputs.url }}"
+
+      # Keyed on the recipe's ingredients. A restore that is nonetheless stale is safe rather than
+      # wrong: `--build-image` compares the recorded recipe hash and rebuilds when it differs.
+      - name: Cache the base image
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/qemu-sandbox/geli-base.qcow2
+            ~/qemu-sandbox/geli-base.recipe
+            ~/qemu-sandbox/geli-base.meta
+            ~/qemu-sandbox/geli-vmlinuz
+            ~/qemu-sandbox/geli-initramfs
+          key: >
+            base-image-${{ hashFiles(
+              'src/guest/setup.sh', 'src/guest/verify.sh', 'src/guest/base.yaml',
+              'src/guest/profile.sh', 'src/guest/autologin.sh', 'src/guest/retry.sh') }}
+
+      # A PR that changes recipes builds exactly those: that is the point of the split, and it
+      # keeps an unrelated agent's upstream outage from failing someone else's pull request.
+      # A PR that changes the code instead builds one layer, enough to prove layer.sh still works.
+      - name: Decide which agents to build
+        id: pick
+        run: |
+          all=$(ls agents/*.toml | xargs -n1 basename | sed 's/\.toml$//' | paste -sd,)
+          case "${{ github.event_name }}" in
+            schedule)          agents=$all ;;
+            workflow_dispatch) agents='${{ inputs.agents }}'
+                               if [ "$agents" = all ]; then agents=$all; fi ;;
+            *)
+              changed=$(git diff --name-only \
+                          '${{ github.event.pull_request.base.sha }}' HEAD -- agents/ \
+                        | sed -n 's|^agents/\(.*\)\.toml$|\1|p' | paste -sd,)
+              agents=${changed:-claude} ;;
+          esac
+          echo "agents=$agents" >> "$GITHUB_OUTPUT"
+          echo "Building layers for: $agents"
+
+      - name: Build the base image and the layers
+        run: ./target/release/geli --build-image --agents '${{ steps.pick.outputs.agents }}'
+
+      # Bind this checkout to a workspace up front: without it geli prompts for one and a
+      # non-interactive run would hang. .geli.json is gitignored, so this dirties nothing.
+      - name: Register a workspace
+        run: echo '{"workspace":"ci"}' > .geli.json
+
+      # Two things at once, and the second is the one with teeth.
+      #
+      # That the agent runs at all: a layer whose install half-worked gets caught by the build's
+      # own sentinel, but a layer whose binary cannot start does not.
+      #
+      # And that stdout belongs to the command alone. geli's own output goes to stderr so
+      # `geli claude > out.txt` captures the command and nothing else; asserting the captured
+      # stdout is exactly one line of version would have caught the stray blank line that busybox
+      # `getty -n` used to print at the top of every session.
+      - name: Smoke-test a session per agent
+        run: |
+          set -eu
+          for agent in $(echo '${{ steps.pick.outputs.agents }}' | tr ',' ' '); do
+            echo "::group::geli $agent --version"
+            out=$(./target/release/geli "$agent" --version)
+            echo "stdout: [$out]"
+            echo "$out" | grep -qE '^[0-9]+\.' || {
+              echo "::error::$agent printed no version on stdout"; exit 1; }
+            [ "$(printf '%s' "$out" | wc -l)" -eq 0 ] || {
+              echo "::error::$agent's stdout was more than one line; something leaked into it"
+              exit 1; }
+            echo "::endgroup::"
+          done
+
+      # The base image is what a command geli does not know boots on, and it must not carry an
+      # agent — that is the whole saving. `which` rather than a compound command: arguments reach
+      # the guest shell unquoted, so `&&` and `||` would be reparsed there.
+      - name: A non-agent command boots the agent-less base image
+        run: |
+          set -eu
+          test -n "$(./target/release/geli which node)"
+          test -z "$(./target/release/geli which claude)" \
+            || { echo "::error::an agent leaked into the base image"; exit 1; }
+
+      # The console log is the only account of why a build failed, and upload-artifact does not
+      # expand `~`, so it has to be copied into the workspace first.
+      - name: Keep the build log
+        if: always()
+        run: cp ~/qemu-sandbox/geli-build.log . || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: geli-build.log
+          if-no-files-found: ignore

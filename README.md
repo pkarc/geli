@@ -366,6 +366,29 @@ Before and after a refactor, `cargo test dump_generated_documents -- --ignored` 
 generated guest document to `/tmp/geli-baseline`; diffing the two is how the module split and the
 move to file-based recipes were shown to change nothing.
 
+### CI
+
+| Workflow | When | What |
+|---|---|---|
+| `check` | every push and PR | build, test, clippy `-D warnings`. No VM. |
+| `image` | PRs touching recipes or code, plus weekly | builds the base image and the affected layers, then runs a session per agent |
+
+`check` proves a recipe parses and declares sane things. Only `image` proves it installs: cloud-init
+does not abort on failure, so the honest answer comes from booting the VM and looking for the
+binary. A PR that changes one recipe builds one layer, which is what makes this cheap enough to run
+at all — and the weekly run is there because upstream breaks recipes with no commit here.
+
+The session smoke test asserts that `geli <agent> --version` puts **exactly one line on stdout**.
+That is the stdout-belongs-to-the-command contract, and it is the assertion that would have caught
+the stray blank line busybox `getty -n` used to print at the top of every session.
+
+`cargo fmt --check` is not a gate: parts of this code are laid out by hand in ways rustfmt would
+undo. If you want it, reformat in a commit of its own.
+
+If you send a recipe, note that `image` runs its `install` as root in a VM on a runner. The
+workflow uses `pull_request`, never `pull_request_target`, so a fork's job has a read-only token
+and no secrets.
+
 [CLAUDE.md](CLAUDE.md) has the architecture and the hard-won details. [docs/plans/](docs/plans/)
 holds the plans and measurements behind the bigger decisions — why Alpine, why not Debian, what
 Antigravity's credential actually weighs.
@@ -382,12 +405,10 @@ Done:
 6. ~~More than one agent~~ — OpenCode and Antigravity alongside Claude Code
 7. ~~Recipes as data~~ — one TOML file per agent, no Rust
 8. ~~A qcow2 layer per agent~~ — the base image carries no agent; each one is a cached layer
+9. ~~CI~~ — `check` on every push; `image` builds the affected layers and runs a real session
 
 Next:
 
-9. **CI.** There is none. With recipes being the contribution surface, the per-agent sentinel is
-   the only gate and it currently runs on one laptop. Layers make this cheaper to fix than it was:
-   a recipe's blast radius is now one image nobody else boots.
 10. **Let one session carry several agents.** The layer chain already supports it —
     `geli-layer-claude+opencode.qcow2` is a layer on `geli-layer-claude.qcow2`, keyed by the
     sorted set — but nothing asks for more than the invoked agent yet. The open question is
