@@ -1844,6 +1844,43 @@ mod tests {
         assert!(sync < off, "sync must run before power is cut");
     }
 
+    /// `-cpu host` is a KVM-only model, so the accelerator and the CPU model have to move
+    /// together: emitting `host` without `-enable-kvm` is not a slow sandbox but one QEMU refuses
+    /// to start. Measured on this host: ~10s accelerated against 99s emulated, so the fallback is
+    /// worth having and worth warning about.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_model_follows_the_accelerator() {
+        let accelerated = accel_args(true);
+        assert!(accelerated.contains(&"-enable-kvm".to_string()));
+        assert_eq!(accelerated.windows(2).find(|w| w[0] == "-cpu").map(|w| &w[1]), Some(&"host".to_string()));
+
+        let emulated = accel_args(false);
+        assert!(
+            !emulated.contains(&"-enable-kvm".to_string()),
+            "asking for KVM on a host without it fails at launch"
+        );
+        assert_eq!(emulated.windows(2).find(|w| w[0] == "-cpu").map(|w| &w[1]), Some(&"max".to_string()));
+        assert!(
+            !emulated.contains(&"host".to_string()),
+            "`-cpu host` under emulation is refused by QEMU, so this must never pair with TCG"
+        );
+    }
+
+    /// A ceiling, not a reservation — but a Linux guest fills whatever it is given with page
+    /// cache that QEMU's RSS never gives back, which is why it came down from 4 GiB at all.
+    /// Measured peak RSS with an agent reading a file: 728 MB at 4 GiB, 635 at 2, 588 at 1.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_memory_leaves_room_over_the_measured_peak() {
+        let mem = guest_memory();
+        // Only meaningful if the environment has not overridden it for this run.
+        if std::env::var_os("GELI_MEMORY").is_none() {
+            assert_eq!(mem, "2G", "1G worked but left a trivial task at 57% of the ceiling");
+        }
+        assert!(mem.ends_with('G') || mem.ends_with('M'), "QEMU needs a unit: {}", mem);
+    }
+
     #[test]
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("abc"), "'abc'");
