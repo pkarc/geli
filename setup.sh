@@ -35,12 +35,17 @@ cargo build --release
 echo "[*] Installing geli to /usr/local/bin/..."
 sudo cp target/release/geli /usr/local/bin/
 
-# 5. Provision the golden image once, so individual sandbox sessions install nothing
-echo "[*] Building the golden sandbox image (one-time, a few minutes)..."
+# 5. Provision the base image once, so individual sandbox sessions install nothing.
+#    No agent goes in here: each one is a qcow2 layer built the first time you run it, so the
+#    image you boot only ever carries the agents you actually use.
+echo "[*] Building the base sandbox image (one-time, a few minutes)..."
 geli --build-image
 
 echo "============================================="
 echo "[✓] Geli installation complete!"
 echo "    You can now run: geli <command>"
+echo ""
+echo "    The first run of an agent builds its layer, once. To get it over with now:"
+echo "      geli --build-image --agents claude"
 echo "============================================="
 

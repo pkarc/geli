@@ -13,9 +13,13 @@ struct Cli {
     #[arg(long)]
     list: bool,
 
-    /// Build (or rebuild) the golden image every sandbox session boots from
+    /// Build (or rebuild) the base image every sandbox session boots from
     #[arg(long)]
     build_image: bool,
+
+    /// With --build-image: also build these agents' layers now, instead of on first use
+    #[arg(long, value_delimiter = ',', value_name = "claude,opencode")]
+    agents: Vec<String>,
 
     /// Do not copy the host's Claude credentials into the sandbox
     #[arg(long)]
@@ -48,7 +52,7 @@ fn main() -> io::Result<()> {
     }
 
     if args.build_image {
-        return build_golden_image();
+        return build_images(&args.agents);
     }
 
     if args.agent_args.is_empty() {
@@ -251,73 +255,96 @@ use ui::*;
 use qemu::*;
 
 
+/// Provision one image by booting a VM that runs a cloud-init recipe and powers itself off.
+///
+/// Shared by the base image and every agent layer, which differ only in their recipe and in what
+/// they hand back. Returns the directory the guest wrote its outputs to; `Ok(None)` means the
+/// guest did not print the sentinel, so whatever it produced must not be published.
+///
+/// Builds into `<name>.building` and the caller renames on success: a failed build must never
+/// leave a half-provisioned image standing where a working one was.
 #[cfg(target_os = "linux")]
-fn build_golden_image() -> io::Result<()> {
-
-    check_host_tools();
-
-    let dir = images_dir();
-    // GELI_BASE_IMAGE points the build at a different cloud image — for comparing distros, or
-    // for anyone who would rather not start from Ubuntu Server. The recipe assumes apt and
-    // cloud-init, so Debian-family images work; others would need the recipe changed.
-    let base_img = match std::env::var_os("GELI_BASE_IMAGE") {
-        Some(path) => PathBuf::from(path),
-        None => dir.join(BASE_IMAGE_NAME),
-    };
-    if !base_img.exists() {
-        eprintln!("Error: Base image not found at {}", base_img.display());
-        eprintln!("Run ./setup.sh, or place the base cloud image in {}", dir.display());
-        std::process::exit(1);
-    }
-
-    let host_uid = host_uid();
-    let recipe = build_golden_cloud_init(host_uid);
-    let pid = std::process::id();
-    let stage = staging_dir(&format!("geli-build-{}", pid))?;
-    let iso = make_cloud_init_iso(&stage, &recipe, &format!("geli-build-{}", pid), "geli-golden")?;
-
-    // Build into a temporary file and rename on success, so a failed build never leaves a
-    // half-provisioned image in place of a working one.
-    let target = dir.join(GOLDEN_IMAGE_NAME);
-    let pending = dir.join(format!("{}.building", GOLDEN_IMAGE_NAME));
-    let log_path = dir.join(GOLDEN_BUILD_LOG);
+fn run_build_vm(
+    pending: &Path,
+    recipe: &str,
+    instance: &str,
+    log_path: &Path,
+) -> io::Result<Option<PathBuf>> {
+    let stage = staging_dir(&format!("geli-stage-{}-{}", std::process::id(), instance))?;
+    let iso = make_cloud_init_iso(&stage, recipe, instance, "geli-build")?;
 
     // The build VM hands the kernel, initramfs and metadata back through this share.
-    let out_dir = staging_dir(&format!("geli-out-{}", pid))?;
+    let out_dir = staging_dir(&format!("geli-out-{}-{}", std::process::id(), instance))?;
     let out_share = vec![
         "-fsdev".to_string(),
         format!(
             "local,path={},id={},security_model=none",
             out_dir.display(),
-            GOLDEN_OUT_TAG
+            BUILD_OUT_TAG
         ),
         "-device".to_string(),
-        format!("virtio-9p-pci,fsdev={},mount_tag={}", GOLDEN_OUT_TAG, GOLDEN_OUT_TAG),
+        format!("virtio-9p-pci,fsdev={},mount_tag={}", BUILD_OUT_TAG, BUILD_OUT_TAG),
     ];
 
-    create_overlay(&base_img, &pending, Some(SANDBOX_DISK_SIZE))?;
+    run_qemu(pending, &iso, out_share, QemuIo::LogTo(log_path.to_path_buf()), None)?.wait()?;
+    let _ = fs::remove_dir_all(&stage);
 
-    println!("[*] Building golden image. This takes a few minutes, once.");
-    println!("[*] Installing: bash, Node {REQUIRED_NODE_MAJOR}, python3, pip, git, @anthropic-ai/claude-code");
-    println!("[*] Follow along with:  tail -f {}", log_path.display());
+    // cloud-init does not abort runcmd on failure, so "the build finished" proves nothing. The
+    // recipe echoes the sentinel only behind a check that every tool is really there.
+    let console = fs::read_to_string(log_path).unwrap_or_default();
+    if console.contains(BUILD_OK_MARKER) {
+        Ok(Some(out_dir))
+    } else {
+        let _ = fs::remove_dir_all(&out_dir);
+        Ok(None)
+    }
+}
 
-    run_qemu(&pending, &iso, out_share, QemuIo::LogTo(log_path.clone()), None)?.wait()?;
+#[cfg(target_os = "linux")]
+fn build_failed(pending: &Path, log_path: &Path, what: &str) -> ! {
+    let _ = fs::remove_file(pending);
+    eprintln!("\n[!] Building {} failed: the guest did not report it ready.", what);
+    eprintln!("    Console log kept at {}", log_path.display());
+    std::process::exit(1);
+}
 
-    let console = fs::read_to_string(&log_path).unwrap_or_default();
-    if !console.contains(GOLDEN_OK_MARKER) {
-        let _ = fs::remove_file(&pending);
-        eprintln!("\n[!] Golden image build failed: the guest did not report all tools present.");
-        eprintln!("    Console log kept at {}", log_path.display());
+/// Provision the base image: the toolchain, the sandbox user, autologin — and no agent.
+#[cfg(target_os = "linux")]
+fn build_base_image(dir: &Path) -> io::Result<()> {
+    // GELI_BASE_IMAGE points the build at a different cloud image — for comparing distros. The
+    // recipe assumes apk and cloud-init, so Alpine-family images work; others need it changed.
+    let cloud_img = match std::env::var_os("GELI_BASE_IMAGE") {
+        Some(path) => PathBuf::from(path),
+        None => dir.join(CLOUD_IMAGE_NAME),
+    };
+    if !cloud_img.exists() {
+        eprintln!("Error: Cloud image not found at {}", cloud_img.display());
+        eprintln!("Run ./setup.sh, or place the base cloud image in {}", dir.display());
         std::process::exit(1);
     }
 
+    let recipe = build_base_cloud_init(host_uid());
+    let target = dir.join(BASE_IMAGE_NAME);
+    let pending = dir.join(format!("{}.building", BASE_IMAGE_NAME));
+    let log_path = dir.join(BUILD_LOG_NAME);
+
+    create_overlay(&cloud_img, &pending, Some(SANDBOX_DISK_SIZE))?;
+
+    println!("[*] Building the base image: bash, Node {REQUIRED_NODE_MAJOR}, python3, pip, git.");
+    println!("[*] No agent goes in here — each one is its own layer on top.");
+    println!("[*] Follow along with:  tail -f {}", log_path.display());
+
+    let Some(out_dir) = run_build_vm(&pending, &recipe, "geli-base", &log_path)? else {
+        build_failed(&pending, &log_path, "the base image");
+    };
+
     // Direct boot is useless without these, so a build that did not produce them is a failure
     // even if the guest reported every tool present.
-    for name in [KERNEL_NAME, INITRD_NAME, GOLDEN_META_NAME] {
+    for name in [KERNEL_NAME, INITRD_NAME, BASE_META_NAME] {
         let produced = out_dir.join(name);
         if !produced.exists() {
             let _ = fs::remove_file(&pending);
-            eprintln!("\n[!] Golden image build failed: the guest did not hand back {}.", name);
+            eprintln!("\n[!] Base image build failed: the guest did not hand back {}.", name);
             eprintln!("    Console log kept at {}", log_path.display());
             std::process::exit(1);
         }
@@ -325,12 +352,182 @@ fn build_golden_image() -> io::Result<()> {
     }
 
     fs::rename(&pending, &target)?;
-    fs::write(dir.join(GOLDEN_RECIPE_NAME), recipe_hash(&recipe))?;
-    let _ = fs::remove_dir_all(&stage);
+    fs::write(dir.join(BASE_RECIPE_NAME), recipe_hash(&recipe))?;
     let _ = fs::remove_dir_all(&out_dir);
 
-    println!("\n[✓] Golden image ready at {}", target.display());
+    // An agent layer built against the old base is not merely stale, it is wrong: it sits on a
+    // backing file that no longer exists. Drop them rather than leave broken chains behind.
+    let dropped = discard_layers(dir)?;
+    if dropped > 0 {
+        println!("[*] Discarded {} agent layer(s) built on the previous base image.", dropped);
+    }
+
+    println!("\n[✓] Base image ready at {}", target.display());
+    Ok(())
+}
+
+/// Remove every agent layer. Called when the base image is rebuilt, since a layer's backing file
+/// is gone at that point.
+#[cfg(target_os = "linux")]
+fn discard_layers(dir: &Path) -> io::Result<usize> {
+    let mut dropped = 0;
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if name.starts_with("geli-layer-") {
+            if name.ends_with(".qcow2") {
+                dropped += 1;
+            }
+            let _ = fs::remove_file(&path);
+        }
+    }
+    Ok(dropped)
+}
+
+/// The recipe hash a layer must record to be considered current: its parent's hash plus its own
+/// recipe. So editing one agent's TOML invalidates that layer and everything stacked on it, and
+/// nothing else.
+#[cfg(target_os = "linux")]
+fn layer_hash(parent_hash: &str, recipe: &str) -> String {
+    recipe_hash(&format!("{}\n{}", parent_hash, recipe))
+}
+
+/// Build the qcow2 layer for `agent` on top of `parent`, if it is missing or stale.
+///
+/// Returns the layer's path and its recipe hash, so the next agent in the chain can stack on it.
+#[cfg(target_os = "linux")]
+fn ensure_layer(
+    dir: &Path,
+    agent: &Agent,
+    key: &str,
+    parent: &Path,
+    parent_hash: &str,
+) -> io::Result<(PathBuf, String)> {
+    let recipe = build_layer_cloud_init(agent, host_uid(), key);
+    let hash = layer_hash(parent_hash, &recipe);
+
+    let target = dir.join(layer_image_name(key));
+    let recipe_path = dir.join(layer_recipe_name(key));
+    let recorded = fs::read_to_string(&recipe_path).unwrap_or_default();
+
+    if target.exists() && recorded.trim() == hash {
+        return Ok((target, hash));
+    }
+
+    let pending = dir.join(format!("{}.building", layer_image_name(key)));
+    let log_path = dir.join(BUILD_LOG_NAME);
+    let _ = fs::remove_file(&pending);
+    create_overlay(parent, &pending, None)?;
+
+    eprintln!(
+        "[*] Building the {} layer, once. Follow along with:  tail -f {}",
+        agent.command,
+        log_path.display()
+    );
+
+    let instance = format!("geli-layer-{}", key);
+    let Some(out_dir) = run_build_vm(&pending, &recipe, &instance, &log_path)? else {
+        build_failed(&pending, &log_path, &format!("the {} layer", agent.command));
+    };
+
+    let meta_name = layer_meta_name(key);
+    let produced = out_dir.join(&meta_name);
+    if produced.exists() {
+        fs::copy(&produced, dir.join(&meta_name))?;
+    }
+    let _ = fs::remove_dir_all(&out_dir);
+
+    fs::rename(&pending, &target)?;
+    fs::write(&recipe_path, &hash)?;
+    eprintln!("[✓] {} layer ready.", agent.command);
+    Ok((target, hash))
+}
+
+/// The image a session should overlay, building whatever is missing.
+///
+/// The chain is base ← one layer per agent, in sorted order, each keyed by the agents at and
+/// below it. A session wanting only `claude` reuses the `claude` layer that a `claude+opencode`
+/// chain also sits on, instead of a second copy of the same install.
+///
+/// Also returns the merged metadata: the base's, plus one entry per layer, which is what the
+/// status block prints as the contents of the image.
+#[cfg(target_os = "linux")]
+fn resolve_chain(dir: &Path, chain: &[&Agent]) -> io::Result<(PathBuf, ImageMeta)> {
+    let base = dir.join(BASE_IMAGE_NAME);
+    let mut meta = parse_image_meta(&fs::read_to_string(dir.join(BASE_META_NAME)).unwrap_or_default());
+    let mut image = base;
+    let mut hash = fs::read_to_string(dir.join(BASE_RECIPE_NAME)).unwrap_or_default().trim().to_string();
+
+    let commands: Vec<String> = chain.iter().map(|a| a.command.clone()).collect();
+    for (i, agent) in chain.iter().enumerate() {
+        let key = layer_key(&commands[..=i]);
+        let (layer, layer_hash) = ensure_layer(dir, agent, &key, &image, &hash)?;
+        merge_image_meta(&mut meta, &fs::read_to_string(dir.join(layer_meta_name(&key))).unwrap_or_default());
+        image = layer;
+        hash = layer_hash;
+    }
+
+    Ok((image, meta))
+}
+
+/// Whether the base image on disk is the one this binary's recipe describes.
+///
+/// Checked so `--build-image` is idempotent: `--build-image --agents claude` must be able to add
+/// a layer without rebuilding the image that layer is going to sit on — which would also discard
+/// every other layer along the way.
+#[cfg(target_os = "linux")]
+fn base_is_current(dir: &Path) -> bool {
+    let recorded = fs::read_to_string(dir.join(BASE_RECIPE_NAME)).unwrap_or_default();
+    dir.join(BASE_IMAGE_NAME).exists()
+        && recorded.trim() == recipe_hash(&build_base_cloud_init(host_uid()))
+}
+
+#[cfg(target_os = "linux")]
+fn build_images(selected: &[String]) -> io::Result<()> {
+    check_host_tools();
+    let dir = images_dir();
+
+    // Anyone upgrading has a ~900 MB single image sitting there that nothing reads any more.
+    // Said, not deleted: it is the user's file, and it is the only way back to the old binary.
+    let legacy = dir.join(LEGACY_IMAGE_NAME);
+    if legacy.exists() {
+        // Blocks, not length: a qcow2 is sparse, and `len()` reports the virtual size, which
+        // overstates what deleting the file would actually give back by about twofold.
+        use std::os::unix::fs::MetadataExt;
+        let size = fs::metadata(&legacy).map(|m| m.blocks() * 512 / 1_048_576).unwrap_or(0);
+        println!("[*] {} ({} MB) is from before images were layered and is", LEGACY_IMAGE_NAME, size);
+        println!("    no longer used. Delete it when you are sure you do not want to go back.");
+    }
+
+    if base_is_current(&dir) {
+        println!("[*] Base image is already current.");
+        println!("    Delete {} to force a rebuild.", dir.join(BASE_IMAGE_NAME).display());
+    } else {
+        build_base_image(&dir)?;
+    }
+
+    // Each named agent gets its own layer directly on the base, not one chain through all of
+    // them: a session invokes one agent, and sibling layers are what it can actually reuse.
+    for name in selected {
+        let Some(agent) = agent_for_command(name) else {
+            eprintln!(
+                "[!] `{}` is not an agent geli knows ({}). Skipped.",
+                name,
+                agents().iter().map(|a| a.command.as_str()).collect::<Vec<_>>().join(", ")
+            );
+            continue;
+        };
+        resolve_chain(&dir, &[agent])?;
+    }
+
     println!("    Sandbox sessions boot its kernel directly, installing nothing.");
+    if selected.is_empty() {
+        println!("    An agent's layer is built the first time you run it, or now with:");
+        println!(
+            "      geli --build-image --agents <{}>",
+            agents().iter().map(|a| a.command.as_str()).collect::<Vec<_>>().join("|")
+        );
+    }
     Ok(())
 }
 
@@ -353,14 +550,22 @@ fn execute_sandbox(
     check_host_tools();
 
     let images = images_dir();
-    let golden_img = images.join(GOLDEN_IMAGE_NAME);
-    if !golden_img.exists() {
-        eprintln!("\n[!] Error: Golden image not found at {}", golden_img.display());
+    let base_img = images.join(BASE_IMAGE_NAME);
+    if !base_img.exists() {
+        eprintln!("\n[!] Error: Base image not found at {}", base_img.display());
+        if images.join(LEGACY_IMAGE_NAME).exists() {
+            eprintln!(
+                "{} is from before images were layered and cannot be used.",
+                LEGACY_IMAGE_NAME
+            );
+            eprintln!("Delete it and rebuild — the new base image carries no agents, so it is");
+            eprintln!("smaller, and each agent becomes its own layer.");
+        }
         eprintln!("Build it once with:\n  geli --build-image\n");
         std::process::exit(1);
     }
 
-    let meta_path = images.join(GOLDEN_META_NAME);
+    let meta_path = images.join(BASE_META_NAME);
     let kernel = images.join(KERNEL_NAME);
     let initrd = images.join(INITRD_NAME);
     for required in [&meta_path, &kernel, &initrd] {
@@ -371,15 +576,22 @@ fn execute_sandbox(
             std::process::exit(1);
         }
     }
-    let meta = parse_golden_meta(&fs::read_to_string(&meta_path).unwrap_or_default());
 
     // Stale images still boot — they are merely out of date, not broken.
-    let expected = recipe_hash(&build_golden_cloud_init(host_uid()));
-    let recorded = fs::read_to_string(images.join(GOLDEN_RECIPE_NAME)).unwrap_or_default();
+    let expected = recipe_hash(&build_base_cloud_init(host_uid()));
+    let recorded = fs::read_to_string(images.join(BASE_RECIPE_NAME)).unwrap_or_default();
     if recorded.trim() != expected {
-        eprintln!("[!] Golden image was built from a different recipe than this binary expects.");
+        eprintln!("[!] The base image was built from a different recipe than this binary expects.");
         eprintln!("    Rebuild when convenient:  geli --build-image");
     }
+
+    let agent = agent_for_command(cmd);
+
+    // The base image carries no agent, so the invoked one's layer has to exist before the
+    // session can overlay anything. Missing means first use: build it now, once, and say so —
+    // this is the only time geli takes minutes instead of seconds.
+    let chain: Vec<&Agent> = agent.into_iter().collect();
+    let (session_backing, meta) = resolve_chain(&images, &chain)?;
 
     let host_cache_dir = home.join(".cache").join("geli-sandbox");
     let npm_cache = host_cache_dir.join("npm");
@@ -426,7 +638,7 @@ fn execute_sandbox(
         "virtio-9p-pci,fsdev=pipcache,mount_tag=pipcache".to_string(),
     ]);
 
-    let agent = agent_for_command(cmd);
+    // `agent` and the image chain were resolved above, before anything was overlaid.
     let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
     let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
 
@@ -509,8 +721,9 @@ fn execute_sandbox(
         &format!("sandbox-{}", ws),
     )?;
 
-    // Session overlays sit on top of the golden image and inherit its size.
-    create_overlay(&golden_img, &sandbox_img, None)?;
+    // The session overlay sits on top of the agent layer (or the base image, for a command that
+    // is not an agent) and inherits its virtual size.
+    create_overlay(&session_backing, &sandbox_img, None)?;
 
     let auth = match (credentials.is_empty(), agent) {
         (false, Some(a)) => format!("{} · bills your plan", a.label),
@@ -610,7 +823,7 @@ fn execute_sandbox(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn build_golden_image() -> io::Result<()> {
+fn build_images(_agents: &[String]) -> io::Result<()> {
     eprintln!("Image building is only implemented on Linux.");
     Ok(())
 }
@@ -676,8 +889,8 @@ mod tests {
     }
 
     #[test]
-    fn golden_cloud_init_parses() {
-        let yaml = build_golden_cloud_init(1000);
+    fn base_cloud_init_parses() {
+        let yaml = build_base_cloud_init(1000);
         let parsed = YamlLoader::load_from_str(&yaml);
         assert!(parsed.is_ok(), "{:?}\n---\n{}", parsed.err(), yaml);
     }
@@ -692,14 +905,15 @@ mod tests {
     }
 
     #[test]
-    fn golden_cloud_init_bakes_tooling_and_login() {
-        let yaml = build_golden_cloud_init(1000);
-        for expected in ["git", "@anthropic-ai/claude-code", "geli-autologin"] {
-            assert!(yaml.contains(expected), "golden recipe missing {:?}", expected);
+    fn base_cloud_init_bakes_tooling_and_login() {
+        let yaml = build_base_cloud_init(1000);
+        for expected in ["git", "geli-autologin"] {
+            assert!(yaml.contains(expected), "base recipe missing {:?}", expected);
         }
-        // The marker must be guarded by a real check, not echoed unconditionally.
-        assert!(yaml.contains("command -v claude"));
-        assert!(yaml.contains(GOLDEN_OK_MARKER));
+        // The marker must be guarded by a real check, not echoed unconditionally. The agents
+        // moved out to their own layers, so what the base proves is the toolchain.
+        assert!(yaml.contains("command -v node"));
+        assert!(yaml.contains(BUILD_OK_MARKER));
 
         // Alpine ships Node 22, so no tarball — but the version is still checked, because
         // npm installs onto a too-old runtime with only a warning.
@@ -708,7 +922,6 @@ mod tests {
         // fail the whole build under `set -e`.
         assert!(yaml.contains("retry apk update"));
         assert!(yaml.contains("retry apk add"));
-        assert!(yaml.contains("retry npm install"));
         assert!(!yaml.contains("apt-get"), "apt leaked into the Alpine recipe");
         assert!(yaml.contains(&format!("-ge {}", REQUIRED_NODE_MAJOR)));
         // bash is not optional: Alpine defaults to busybox ash and the agent's Bash tool needs bash.
@@ -735,10 +948,10 @@ mod tests {
     /// would re-run it and poweroff mid-session.
     #[test]
     fn login_profile_waits_for_cloud_init_and_avoids_bashrc() {
-        assert!(GOLDEN_PROFILE.contains("cloud-init status --wait"));
-        assert!(GOLDEN_PROFILE.contains("/etc/geli/session"));
+        assert!(LOGIN_PROFILE.contains("cloud-init status --wait"));
+        assert!(LOGIN_PROFILE.contains("/etc/geli/session"));
         // Sourcing ~/.bashrc is fine; appending the command to it is not.
-        assert!(!GOLDEN_PROFILE.contains(">> ~/.bashrc"));
+        assert!(!LOGIN_PROFILE.contains(">> ~/.bashrc"));
     }
 
     /// Regression: Claude Code's Bash tool spawns login shells, which read .bash_profile. Without
@@ -748,15 +961,15 @@ mod tests {
     /// arrive over 9p owned by the host user, so the agent could read the project but not
     /// write to it.
     #[test]
-    fn golden_user_takes_the_host_uid() {
-        let yaml = build_golden_cloud_init(1000);
+    fn base_user_takes_the_host_uid() {
+        let yaml = build_base_cloud_init(1000);
         assert!(yaml.contains("adduser -D -u 1000"));
         // Alpine's own default user holds uid 1000 and has to go, or sandbox lands on 1001.
         assert!(yaml.contains("deluser alpine"));
         // The stock image waits 10s at a boot menu nobody is there to answer.
         assert!(yaml.contains("TIMEOUT 1"), "boot menu timeout not disabled");
 
-        let other = build_golden_cloud_init(1234);
+        let other = build_base_cloud_init(1234);
         assert!(other.contains("adduser -D -u 1234"));
         // A different uid must produce a different image, or stale images go undetected.
         assert_ne!(recipe_hash(&yaml), recipe_hash(&other));
@@ -764,18 +977,18 @@ mod tests {
 
     #[test]
     fn login_profile_runs_the_session_only_once() {
-        assert!(GOLDEN_PROFILE.contains("GELI_SESSION_ACTIVE"));
-        assert!(GOLDEN_PROFILE.contains("/tmp/.geli-session-active"));
+        assert!(LOGIN_PROFILE.contains("GELI_SESSION_ACTIVE"));
+        assert!(LOGIN_PROFILE.contains("/tmp/.geli-session-active"));
 
         // The poweroff must sit inside the guard, never at top level.
-        let guard = GOLDEN_PROFILE
+        let guard = LOGIN_PROFILE
             .find("GELI_SESSION_ACTIVE")
             .expect("guard missing");
-        let poweroff = GOLDEN_PROFILE.find("sudo poweroff").expect("poweroff missing");
+        let poweroff = LOGIN_PROFILE.find("sudo poweroff").expect("poweroff missing");
         assert!(poweroff > guard, "poweroff runs before the guard");
 
         // Both branches source the environment, or the agent's commands lose TERM and keys.
-        assert_eq!(GOLDEN_PROFILE.matches(". /etc/geli/env").count(), 2);
+        assert_eq!(LOGIN_PROFILE.matches(". /etc/geli/env").count(), 2);
     }
 
     #[test]
@@ -804,7 +1017,7 @@ mod tests {
     #[test]
     fn recipe_hash_tracks_recipe_changes() {
         let host_uid = host_uid();
-    let recipe = build_golden_cloud_init(host_uid);
+    let recipe = build_base_cloud_init(host_uid);
         assert_eq!(recipe_hash(&recipe), recipe_hash(&recipe));
         assert_ne!(recipe_hash(&recipe), recipe_hash(&format!("{}\n# extra", recipe)));
     }
@@ -854,6 +1067,7 @@ mod tests {
             ],
             hosts: vec![],
             install: String::new(),
+            version: None,
         };
         let flagged = sensitive_credentials(&greedy);
         assert_eq!(flagged, vec![".ssh/id_rsa", ".aws/credentials"]);
@@ -1100,16 +1314,25 @@ mod tests {
         let creds = vec![(".claude/.credentials.json".to_string(), "{\"t\":1}".to_string())];
 
         let files: Vec<(&str, String)> = vec![
-            ("golden.cloud-init.yaml", build_golden_cloud_init(1000)),
+            ("base.cloud-init.yaml", build_base_cloud_init(1000)),
             ("session.cloud-init.yaml", build_cloud_init(&plan, "claude", &env, &config, &creds)),
-            ("setup.sh", golden_setup_script(1000)),
-            ("verify.sh", golden_verify_script()),
-            ("profile.sh", GOLDEN_PROFILE.to_string()),
-            ("autologin.sh", GOLDEN_AUTOLOGIN.to_string()),
+            ("setup.sh", base_setup_script(1000)),
+            ("verify.sh", base_verify_script()),
+            ("profile.sh", LOGIN_PROFILE.to_string()),
+            ("autologin.sh", AUTOLOGIN_HELPER.to_string()),
             ("mounts.sh", plan.script.clone()),
             ("claude.json", config.clone()),
             ("lockdown.sh", build_lockdown(true)),
         ];
+        // One per agent: a layer recipe is the only place an agent's install reaches the guest.
+        let mut files = files;
+        for agent in agents() {
+            files.push((
+                // Leaked into the loop's lifetime on purpose — this is a dump, not a test.
+                Box::leak(format!("layer.{}.cloud-init.yaml", agent.command).into_boxed_str()),
+                build_layer_cloud_init(agent, 1000, &agent.command),
+            ));
+        }
         for (name, body) in files {
             std::fs::write(dir.join(name), body).unwrap();
         }
@@ -1371,24 +1594,119 @@ mod tests {
     }
 
     #[test]
-    fn golden_meta_round_trips() {
-        let meta = parse_golden_meta(
-            "cmdline=root=LABEL=/ console=ttyS0\nalpine=3.22.2\nnode=22.23.2\nclaude=2.1.289\n",
-        );
+    fn image_meta_round_trips() {
+        let meta = parse_image_meta("cmdline=root=LABEL=/ console=ttyS0\nalpine=3.22.2\nnode=22.23.2\n");
         assert_eq!(meta.alpine, "3.22.2");
         assert_eq!(meta.node, "22.23.2");
-        assert_eq!(meta.claude, "2.1.289");
         assert!(meta.cmdline.starts_with("root=LABEL=/"));
-        assert_eq!(describe_image(&meta), "alpine 3.22.2 · claude 2.1.289");
+        assert!(meta.agents.is_empty(), "the base image carries no agent");
+        assert_eq!(describe_image(&meta), "alpine 3.22.2");
+    }
+
+    /// The base image's metadata plus one file per layer is what the status block describes, so
+    /// the merge has to accumulate agents rather than replace them.
+    #[test]
+    fn image_meta_accumulates_one_entry_per_layer() {
+        let mut meta = parse_image_meta("alpine=3.22.2\nnode=22.23.2\n");
+        merge_image_meta(&mut meta, "agent.claude=2.1.289\n");
+        merge_image_meta(&mut meta, "agent.opencode=0.4.2\n");
+
+        assert_eq!(
+            meta.agents,
+            vec![
+                ("claude".to_string(), "2.1.289".to_string()),
+                ("opencode".to_string(), "0.4.2".to_string())
+            ]
+        );
+        assert_eq!(describe_image(&meta), "alpine 3.22.2 · claude 2.1.289 · opencode 0.4.2");
     }
 
     #[test]
-    fn golden_meta_tolerates_a_missing_or_partial_file() {
-        assert_eq!(parse_golden_meta(""), GoldenMeta::default());
-        let partial = parse_golden_meta("node=22.23.2\nagy=1.2.16\ngarbage line\n");
+    fn image_meta_tolerates_a_missing_or_partial_file() {
+        assert_eq!(parse_image_meta(""), ImageMeta::default());
+        let partial = parse_image_meta("node=22.23.2\nagent.agy=1.2.16\ngarbage line\n");
         assert_eq!(partial.node, "22.23.2");
         // An image line with holes in it should not print empty fields.
         assert_eq!(describe_image(&partial), "agy 1.2.16");
+    }
+
+    /// Two agents in either order must name the same chain, or the cache stores a copy per
+    /// permutation and the saving the layers exist for disappears.
+    #[test]
+    fn layer_key_is_the_set_not_the_order() {
+        let key = |names: &[&str]| layer_key(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(key(&["claude"]), "claude");
+        assert_eq!(key(&["opencode", "claude"]), "claude+opencode");
+        assert_eq!(key(&["claude", "opencode"]), key(&["opencode", "claude"]));
+        assert_eq!(key(&["claude", "claude"]), "claude");
+        assert_eq!(key(&[]), "");
+    }
+
+    /// A layer's recorded hash covers its parent's, so editing one agent's recipe invalidates
+    /// that layer and everything stacked above it — and leaves its siblings alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn layer_hash_follows_the_parent() {
+        let base = recipe_hash("base");
+        let claude = layer_hash(&base, "install claude");
+        let stacked = layer_hash(&claude, "install opencode");
+
+        assert_ne!(claude, layer_hash(&base, "install claude v2"));
+        assert_ne!(
+            stacked,
+            layer_hash(&layer_hash(&base, "install claude v2"), "install opencode"),
+            "a changed parent must invalidate what sits on it"
+        );
+        assert_ne!(claude, layer_hash(&recipe_hash("other base"), "install claude"));
+    }
+
+    /// The layer recipe is the one place an agent's `install` reaches the guest now, and the
+    /// sentinel has to sit behind the binary existing: cloud-init does not abort runcmd on
+    /// failure, so a layer whose install died would otherwise be published as working.
+    #[test]
+    fn layer_recipe_installs_one_agent_and_proves_it() {
+        let agent = agent_for_command("claude").expect("claude is a shipped recipe");
+        let doc = build_layer_cloud_init(agent, 1000, "claude");
+
+        let parsed = yaml_rust2::YamlLoader::load_from_str(&doc);
+        assert!(parsed.is_ok(), "layer cloud-init must parse: {:?}\n---\n{}", parsed.err(), doc);
+        assert!(doc.contains("@anthropic-ai/claude-code"), "it must install the agent");
+        assert!(doc.contains("retry()"), "an install is documented as having retry in scope");
+        assert!(doc.contains("command -v claude >/dev/null || exit 0"));
+        assert!(doc.contains("fstrim"), "a layer that does not trim keeps every deleted block");
+
+        let marker = doc.find(BUILD_OK_MARKER).expect("the sentinel must be there");
+        let check = doc.find("command -v claude").unwrap();
+        assert!(check < marker, "the sentinel must come after the check, not before");
+
+        // Only this agent. A layer carrying two could not be reused by a session wanting one.
+        for other in agents().iter().filter(|a| a.command != "claude") {
+            assert!(!doc.contains(&other.install), "{} leaked into claude's layer", other.command);
+        }
+    }
+
+    /// The base image is the layers' backing file: if it carried an agent too, the split would
+    /// save nothing for whoever does not use that one.
+    #[test]
+    fn base_image_carries_no_agent() {
+        let doc = build_base_cloud_init(1000);
+        for agent in agents() {
+            assert!(
+                !doc.contains(&agent.install),
+                "{} is installed in the base image, which is what layers are for",
+                agent.command
+            );
+        }
+    }
+
+    /// The login profile drops this flag before waiting on cloud-init, so it exists while a
+    /// layer is being built. Baked into the layer, it would send every real session down the
+    /// nested-shell branch: the command never runs and the VM sits there until the timeout.
+    #[test]
+    fn layer_recipe_clears_the_session_flag_it_inherits() {
+        assert!(LOGIN_PROFILE.contains("/tmp/.geli-session-active"));
+        let agent = agent_for_command("claude").unwrap();
+        assert!(agent_layer_script(agent, 1000, "claude").contains("rm -f /tmp/.geli-session-active"));
     }
 
     #[test]
@@ -1425,8 +1743,8 @@ mod tests {
     }
 
     #[test]
-    fn golden_recipe_silences_the_guest_and_hands_out_the_kernel() {
-        let yaml = build_golden_cloud_init(1000);
+    fn base_recipe_silences_the_guest_and_hands_out_the_kernel() {
+        let yaml = build_base_cloud_init(1000);
         // Nothing of the distro's own chatter should reach a clean session.
         assert!(yaml.contains("rm -f /etc/motd"));
         assert!(yaml.contains("/etc/issue"));
@@ -1436,7 +1754,7 @@ mod tests {
         // Direct boot needs these out of the image.
         assert!(yaml.contains(KERNEL_NAME));
         assert!(yaml.contains(INITRD_NAME));
-        assert!(yaml.contains(GOLDEN_META_NAME));
+        assert!(yaml.contains(BASE_META_NAME));
         assert!(yaml.contains("/proc/cmdline"), "the cmdline must be captured, not invented");
     }
 
@@ -1444,8 +1762,8 @@ mod tests {
     fn login_profile_flushes_before_cutting_power() {
         // The project lives on 9p; a forced poweroff without sync can lose writes.
         // Match the commands, not the comment that mentions them.
-        let sync = GOLDEN_PROFILE.find("\n        sync\n").expect("no sync before poweroff");
-        let off = GOLDEN_PROFILE.find("sudo poweroff -f").expect("not a forced poweroff");
+        let sync = LOGIN_PROFILE.find("\n        sync\n").expect("no sync before poweroff");
+        let off = LOGIN_PROFILE.find("sudo poweroff -f").expect("not a forced poweroff");
         assert!(sync < off, "sync must run before power is cut");
     }
 

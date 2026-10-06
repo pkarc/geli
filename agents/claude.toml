@@ -10,3 +10,5 @@ hosts = [
 ]
 install = '''
 retry npm install -g @anthropic-ai/claude-code'''
+
+version = "claude --version | cut -d' ' -f1"

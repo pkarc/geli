@@ -39,7 +39,8 @@ Early. It works, with caveats worth knowing before you rely on it:
 - A Linux host with KVM (`/dev/kvm` accessible)
 - `qemu-system-x86_64`, `qemu-img`, `genisoimage`
 - Rust toolchain, to build
-- ~1.2 GB of disk for the base and golden images, plus a sparse 20 GB session overlay
+- ~315 MB of disk for the cloud and base images, plus ~200-380 MB per agent you run, plus a
+  sparse 20 GB session overlay
 
 ## Install
 
@@ -51,11 +52,11 @@ cd geli
 
 `setup.sh` installs the host packages, downloads the Alpine cloud image into
 `~/qemu-sandbox/`, builds the release binary, copies it to `/usr/local/bin/`, and provisions the
-golden image. It uses `sudo` for the package install and the final copy.
+base image. It uses `sudo` for the package install and the final copy.
 
-That last step boots a VM once to install node, python, git and the three agents. It downloads
-about a gigabyte of packages, so budget five to twenty minutes depending on your connection — it
-is also the only slow part, and it is what makes every subsequent session start in seconds.
+That last step boots a VM once to install node, python, git and bash — two or three minutes. No
+agent is installed there: the first time you run one, geli builds its layer, says so, and takes
+a minute or two. Every run after that starts in seconds.
 
 ## Usage
 
@@ -63,12 +64,13 @@ is also the only slow part, and it is what makes every subsequent session start 
 geli <command> [args...]    # run a command inside the sandbox
 geli --restrict-net <cmd>   # let the sandbox reach only an allowlist of hosts
 geli --list                 # show the workspace registry
-geli --build-image          # rebuild the golden image (also how you update the agent)
+geli --build-image          # build the base image if it is missing or stale
+geli --build-image --agents claude,opencode   # and those agents' layers, now instead of on first use
 geli --no-credentials <cmd> # do not copy any credentials into the sandbox
 ```
 
 A session starts in **about nine seconds**, because it installs nothing and boots the image's
-kernel directly — see [The golden image](#the-golden-image).
+kernel directly — see [The images](#the-images).
 
 The first run in a directory asks how to namespace it and writes a `.geli.json`:
 
@@ -107,38 +109,74 @@ Two pieces of state back this:
 There is no command to remove a directory from a workspace yet — edit the `.txt` file. Paths that
 no longer exist are skipped automatically.
 
-## The golden image
+## The images
 
 Installing the toolchain and the agents on every boot cost about four and a half minutes per
-run. Instead it happens once, into a reusable image:
+run. Instead it happens once, into reusable images — and the agents are kept out of the shared
+one, so you only pay for the ones you actually run:
 
 | File in `~/qemu-sandbox/` | Role |
 |---|---|
 | `nocloud_alpine-3.22.2-...qcow2` | Pristine Alpine cloud image. Never written to. |
-| `geli-golden.qcow2` | Overlay on the base with the toolchain, the agents and autologin baked in. |
-| `geli-golden.recipe` | Hash of the recipe it was built from. |
-| `geli-vmlinuz`, `geli-initramfs` | Kernel and initramfs handed out by the build. Sessions boot these directly, skipping firmware and bootloader. |
-| `geli-golden.meta` | The kernel command line and the versions inside the image. |
+| `geli-base.qcow2` | Overlay on it with the toolchain, the sandbox user and autologin. **No agent.** |
+| `geli-layer-<agents>.qcow2` | One agent, installed on top of the base image. |
+| `geli-base.recipe`, `geli-layer-<agents>.recipe` | Hash of the recipe each was built from. |
+| `geli-vmlinuz`, `geli-initramfs` | Kernel and initramfs handed out by the base build. Sessions boot these directly, skipping firmware and bootloader. |
+| `geli-base.meta`, `geli-layer-<agents>.meta` | The kernel command line, and the version each image added. |
 
-Sessions are overlays on the golden image, and QEMU boots `geli-vmlinuz` directly rather than
-going through firmware and a bootloader. A session is therefore a kernel boot plus mounting your
-directories: **about nine seconds**, against the four and a half minutes it started at.
+So the chain is **cloud image ← base ← agent layer ← session**, and a session is a throwaway
+overlay on top. QEMU boots `geli-vmlinuz` directly rather than going through firmware and a
+bootloader, so a session is a kernel boot plus mounting your directories: **about nine seconds**,
+against the four and a half minutes it started at.
 
-Base and golden together are around 1.2 GB for all three agents.
+`geli --build-image` builds the base image only. An agent's layer is built the first time you run
+that agent — once, with a line saying so — or ahead of time:
 
-If the recipe in the binary no longer matches `geli-golden.recipe`, geli warns and keeps going —
-a stale image is out of date, not broken. If the image is missing it stops and tells you to run
-`geli --build-image`.
+```bash
+geli --build-image --agents claude,opencode
+```
 
-Moving `~/qemu-sandbox/` breaks the golden image: qcow2 records its backing file by absolute
-path. Rebuild it rather than trying to repair the chain.
+Rebuilding the base image discards every layer, because a layer's backing file is exactly the
+image that was just replaced. They are rebuilt on next use.
+
+What it costs, measured with `du` on the real images:
+
+| | |
+|---|---|
+| Alpine cloud image | 185 MB |
+| `geli-base.qcow2` | 130 MB |
+| `geli-layer-claude.qcow2` | 245 MB |
+| `geli-layer-opencode.qcow2` | 206 MB |
+| `geli-layer-agy.qcow2` | 377 MB |
+
+So `geli claude` on a fresh install costs 560 MB all in, against 1,107 MB for the single image
+that held all three agents. **The saving is in the common case, not the total**: all three layers
+together come to 958 MB, about 4% *more* than the 922 MB one-image build, because each layer pays
+its own qcow2 and npm overhead. What changes is that you no longer pay for OpenCode and
+Antigravity to run Claude Code — and that a tenth agent costs the people who do not use it
+nothing.
+
+There is a second, less obvious gain. A recipe that breaks now breaks one layer. While writing
+this, Antigravity's installer started serving its shell script gzipped, which made `agy`'s recipe
+download a binary and fail; `claude` and `opencode` were unaffected and still built. Under the
+single image that same failure took the whole build down with it.
+
+If the recipe in the binary no longer matches `geli-base.recipe`, geli warns and keeps going — a
+stale image is out of date, not broken. A layer whose recipe changed is simply rebuilt, and a
+layer's recorded hash includes its parent's, so editing one agent's TOML invalidates that agent
+and leaves the others alone.
+
+Moving `~/qemu-sandbox/` breaks the chain: qcow2 records its backing file by absolute path.
+Rebuild rather than trying to repair it.
 
 ## How it works
 
 Each invocation:
 
-1. Creates a copy-on-write qcow2 overlay on top of the golden image. Neither the golden image nor
-   the base is written to.
+1. Creates a copy-on-write qcow2 overlay on top of the invoked agent's layer, building that layer
+   first if this is the first run of that agent. Nothing below the session is written to. A
+   command that is not an agent overlays the base image directly, which is the cheapest boot
+   geli has.
 2. Attaches each workspace directory as a virtio-9p share, mounted at `/workspace/<folder>`.
 3. Generates a cloud-init ISO that performs the mounts and drops in your command. Autologin and
    the login profile already live in the image.
@@ -166,12 +204,13 @@ the window mid-session will not reach the guest — restart the session to pick 
 
 ## Agents
 
-The image carries three terminal agents — Claude Code, OpenCode and Antigravity CLI — and geli
-runs whatever command you give it, so anything else in the image works too.
+geli knows three terminal agents — Claude Code, OpenCode and Antigravity CLI — and runs whatever
+command you give it, so anything else in the image works too.
 
-Knowing the agent by name buys three things: it is installed for you, **only its credentials are
-copied into the guest**, and `--restrict-net` opens only the hosts it talks to. Running
-`geli opencode` puts no Claude token in the sandbox.
+Knowing the agent by name buys three things: it gets its own qcow2 layer, built on first use, so
+the image you boot holds that agent and nothing else; **only its credentials are copied into the
+guest**; and `--restrict-net` opens only the hosts it talks to. Running `geli opencode` puts no
+Claude token in the sandbox — and no Claude Code in the image either.
 
 ### Teaching geli a new agent
 
@@ -186,11 +225,14 @@ credentials = [".aider.conf.yml"]
 hosts       = ["api.openai.com"]
 install     = """
 retry pip install --break-system-packages aider-chat"""
+# optional; defaults to `<binary> --version`, trimmed to its first line
+version     = "aider --version | cut -d' ' -f2"
 ```
 
-`install` runs as root while the image is built, with a `retry` helper in scope for anything that
-touches the network. `binary` is checked before the image is published, so a recipe that silently
-fails to install cannot ship.
+`install` runs as root inside that agent's own qcow2 layer, with a `retry` helper in scope for
+anything that touches the network. `binary` is checked before the layer is published, so a recipe
+that silently fails to install cannot ship — and since each agent is its own layer, a broken
+recipe costs nothing to anyone not running it.
 
 `credentials` deserves care, both to write and to review: those files are copied out of the
 user's home into a VM that can reach the network. Name the credential, never the directory it
@@ -286,9 +328,10 @@ and the agent, so project dependencies installed as the user are unaffected.
 The VM boundary protects your host filesystem. It does not protect everything, and the gaps are
 worth stating plainly:
 
-- **The guest has unrestricted network access.** An agent that wants to exfiltrate the code it was
-  given can do so. Restricting egress to an allowlist is planned; today the only reason it is open
-  is that `apt` and `npm` run on every boot.
+- **The guest has unrestricted network access by default.** An agent that wants to exfiltrate the
+  code it was given can do so. `--restrict-net` narrows that to an allowlist — see
+  [Restricting what the sandbox can reach](#restricting-what-the-sandbox-can-reach) for what it
+  does and does not buy you.
 - **Your credentials are handed to the agent.** An API key, or your copied Claude account token,
   is written into the guest because the agent needs it. The sandbox protects your files, not your
   credential. Only `.credentials.json` is copied — never your Claude history or transcripts.
@@ -332,21 +375,25 @@ Antigravity's credential actually weighs.
 Done:
 
 1. ~~Make the sandbox boot and run the command~~
-2. ~~A golden image, so a session installs nothing~~ — 4.5 min → 15 s
+2. ~~A prebuilt image, so a session installs nothing~~ — 4.5 min → 15 s
 3. ~~Alpine as the guest base~~ — a third of Ubuntu's disk at the same speed
 4. ~~Quiet output and direct kernel boot~~ — 615 lines of console → 1 on stdout; 14 s → 9 s
 5. ~~Network egress policy~~ — `--restrict-net`
 6. ~~More than one agent~~ — OpenCode and Antigravity alongside Claude Code
 7. ~~Recipes as data~~ — one TOML file per agent, no Rust
+8. ~~A qcow2 layer per agent~~ — the base image carries no agent; each one is a cached layer
 
 Next:
 
-8. **A qcow2 layer per agent.** The image carries all three agents today, which is fine at three
-   and will not be at ten. A base image without agents, plus one cached layer per agent chosen at
-   build time or built on first use, means you only pay for the agents you actually run.
 9. **CI.** There is none. With recipes being the contribution surface, the per-agent sentinel is
-   the only gate and it currently runs on one laptop.
-10. **Close the DNS channel.** `--restrict-net` leaves slirp's resolver reachable, so names are
+   the only gate and it currently runs on one laptop. Layers make this cheaper to fix than it was:
+   a recipe's blast radius is now one image nobody else boots.
+10. **Let one session carry several agents.** The layer chain already supports it —
+    `geli-layer-claude+opencode.qcow2` is a layer on `geli-layer-claude.qcow2`, keyed by the
+    sorted set — but nothing asks for more than the invoked agent yet. The open question is
+    credentials: today only the invoked agent's travel, and an agent you asked to have in the VM
+    but whose credential stays out is not obviously useful.
+11. **Close the DNS channel.** `--restrict-net` leaves slirp's resolver reachable, so names are
     still a slow way out. Needs a packet filter in the image.
-11. Optional KVM, for hosts without hardware virtualization.
-12. Trim the 4 GB RAM ceiling — the guest uses 476 MB.
+12. Optional KVM, for hosts without hardware virtualization.
+13. Trim the 4 GB RAM ceiling — the guest uses 476 MB.

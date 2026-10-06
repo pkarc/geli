@@ -11,19 +11,47 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 // --- what lives in ~/qemu-sandbox ---
+//
+// Three kinds of image, and the distinction matters when reading the rest of this file:
+//
+//   the cloud image   downloaded, pristine, never written to      nocloud_alpine-….qcow2
+//   the base image    provisioned toolchain, no agents            geli-base.qcow2
+//   an agent layer    one agent, on the base or on another layer  geli-layer-<key>.qcow2
+//
+// A session is a throwaway overlay on the top of that chain. The old single `geli-golden.qcow2`
+// held the toolchain *and* every agent at once, which is why this split exists.
 
-pub(crate) const BASE_IMAGE_NAME: &str = "nocloud_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2";
-pub(crate) const GOLDEN_IMAGE_NAME: &str = "geli-golden.qcow2";
-pub(crate) const GOLDEN_RECIPE_NAME: &str = "geli-golden.recipe";
-pub(crate) const GOLDEN_BUILD_LOG: &str = "geli-golden-build.log";
-pub(crate) const GOLDEN_META_NAME: &str = "geli-golden.meta";
+pub(crate) const CLOUD_IMAGE_NAME: &str = "nocloud_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2";
+pub(crate) const BASE_IMAGE_NAME: &str = "geli-base.qcow2";
+pub(crate) const BASE_RECIPE_NAME: &str = "geli-base.recipe";
+pub(crate) const BASE_META_NAME: &str = "geli-base.meta";
+pub(crate) const BUILD_LOG_NAME: &str = "geli-build.log";
 pub(crate) const KERNEL_NAME: &str = "geli-vmlinuz";
 pub(crate) const INITRD_NAME: &str = "geli-initramfs";
-/// Virtual size of the golden image. The Ubuntu cloud image is only 3.5 GiB, which
-/// `apt install nodejs npm` alone overflows. qcow2 is sparse, so this costs nothing until used,
-/// and cloud-init's growpart expands the root partition to match on first boot. Session
-/// overlays inherit this size from their backing file.
+/// What `--build-image` wrote before images were layered. Only used to recognise it and say so.
+pub(crate) const LEGACY_IMAGE_NAME: &str = "geli-golden.qcow2";
+/// Virtual size of the base image. Alpine's cloud image is 202 MiB virtual, which
+/// `apk add nodejs npm` alone overflows. qcow2 is sparse, so this costs nothing until used, and
+/// cloud-init's growpart expands the root partition to match on first boot. Agent layers and
+/// session overlays inherit this size from their backing file.
 pub(crate) const SANDBOX_DISK_SIZE: &str = "20G";
+
+/// Filenames for the layer holding `key` — the chain of agents, in order, joined by `+`.
+///
+/// The key is the whole cache: `claude` is a layer on the base image, `claude+opencode` a layer
+/// on *that*, and a session asking for both reuses the first. Agents are sorted before the key
+/// is built, so the same set always names the same chain rather than one per permutation.
+pub(crate) fn layer_image_name(key: &str) -> String {
+    format!("geli-layer-{}.qcow2", key)
+}
+
+pub(crate) fn layer_recipe_name(key: &str) -> String {
+    format!("geli-layer-{}.recipe", key)
+}
+
+pub(crate) fn layer_meta_name(key: &str) -> String {
+    format!("geli-layer-{}.meta", key)
+}
 
 /// Where QEMU's console goes. Sessions inherit the terminal so the agent is interactive;
 /// image builds are unattended and go to a log we can inspect afterwards.

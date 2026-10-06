@@ -10,7 +10,7 @@ hosts = [
   "cloudcode-pa.googleapis.com",
 ]
 install = '''
-retry sh -c 'curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy.sh' \
+retry sh -c 'curl -fsSL --compressed https://antigravity.google/cli/install.sh -o /tmp/agy.sh' \
   && HOME=/root bash /tmp/agy.sh \
   && install -m 0755 /root/.local/bin/agy /usr/local/bin/agy \
   && rm -f /tmp/agy.sh'''
