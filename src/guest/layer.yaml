@@ -1,0 +1,11 @@
+#cloud-config
+write_files:
+  - path: /etc/geli/layer.sh
+    permissions: '0755'
+    content: |
+@LAYER@
+
+runcmd:
+  - sh /etc/geli/layer.sh
+  - cloud-init clean --logs --seed
+  - poweroff -f

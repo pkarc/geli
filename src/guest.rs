@@ -20,36 +20,70 @@ pub(crate) const MOUNT_OPTS: &str = "trans=virtio,version=9p2000.L,msize=1048576
 
 /// Printed by the build VM only if every expected tool is actually present. cloud-init does not
 /// abort runcmd on failure, so a sentinel that is merely "reached" would prove nothing.
-pub(crate) const GOLDEN_OK_MARKER: &str = "GELI_GOLDEN_OK";
+pub(crate) const BUILD_OK_MARKER: &str = "GELI_BUILD_OK";
 
 /// Major Node version the agent requires. Alpine's own `nodejs` package satisfies it, so unlike
 /// on Ubuntu there is no tarball to fetch — apt's Node 18 was the reason that existed.
 pub(crate) const REQUIRED_NODE_MAJOR: u32 = 22;
 
-/// Provisioning run once by `--build-image`.
+/// The retry helper, substituted into the base recipe and every agent layer so the two cannot
+/// drift. An agent's `install` field is documented as running with `retry` in scope.
+pub(crate) const GUEST_RETRY: &str = include_str!("guest/retry.sh");
+
+/// Provisioning run once by `--build-image`: the toolchain, the user, autologin — and no agent.
 ///
 /// `bash` is not optional: Alpine's default shell is busybox ash, and the agent's Bash tool
 /// needs real bash. Everything else is the same toolchain the Ubuntu recipe installed.
-pub(crate) fn golden_setup_script(host_uid: u32) -> String {
+pub(crate) fn base_setup_script(host_uid: u32) -> String {
     recipe(
         include_str!("guest/setup.sh"),
         &[
+            ("@RETRY@", GUEST_RETRY.trim_end()),
             ("@HOST_UID@", &host_uid.to_string()),
-            (
-                "@AGENT_INSTALLS@",
-                &agents().iter().map(|a| a.install.as_str()).collect::<Vec<_>>().join("\n"),
-            ),
             ("@MOUNT_OPTS@", MOUNT_OPTS),
-            ("@OUT_TAG@", GOLDEN_OUT_TAG),
+            ("@OUT_TAG@", BUILD_OUT_TAG),
             ("@KERNEL@", KERNEL_NAME),
             ("@INITRD@", INITRD_NAME),
-            ("@META@", GOLDEN_META_NAME),
+            ("@META@", BASE_META_NAME),
         ],
     )
 }
 
+/// Provisioning for one agent's qcow2 layer, run on top of the base image or another layer.
+///
+/// One agent per layer, deliberately: a layer that installed two could not be reused by a
+/// session that wants only one of them, which is the whole reason the chain exists.
+pub(crate) fn agent_layer_script(agent: &Agent, host_uid: u32, key: &str) -> String {
+    recipe(
+        include_str!("guest/layer.sh"),
+        &[
+            ("@RETRY@", GUEST_RETRY.trim_end()),
+            ("@INSTALL@", agent.install.trim()),
+            ("@BINARY@", &agent.binary),
+            ("@COMMAND@", &agent.command),
+            ("@VERSION@", &agent.version_command()),
+            ("@HOST_UID@", &host_uid.to_string()),
+            ("@MOUNT_OPTS@", MOUNT_OPTS),
+            ("@OUT_TAG@", BUILD_OUT_TAG),
+            ("@META@", &layer_meta_name(key)),
+            ("@OK_MARKER@", BUILD_OK_MARKER),
+        ],
+    )
+}
+
+/// The ordered set of agents a chain carries, as it appears in every layer filename.
+///
+/// Sorted, so a session asking for `opencode claude` reuses the chain built for `claude
+/// opencode` instead of building a second one that differs only in order.
+pub(crate) fn layer_key(commands: &[String]) -> String {
+    let mut sorted: Vec<&str> = commands.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted.join("+")
+}
+
 /// 9p tag the build VM uses to hand the kernel, initramfs and metadata back to the host.
-pub(crate) const GOLDEN_OUT_TAG: &str = "geliout";
+pub(crate) const BUILD_OUT_TAG: &str = "geliout";
 
 /// Console the kernel and OpenRC write to. The user's terminal is ttyS0; everything the guest
 /// says while booting goes here instead, into a log file on the host.
@@ -69,24 +103,16 @@ pub(crate) const BOOT_PHASES: &[(&str, &str)] = &[
 /// sandbox is ready — `runcmd` output lands in that log, so no extra channel is needed.
 pub(crate) const READY_MARKER: &str = "geli:ready";
 
-pub(crate) const GOLDEN_AUTOLOGIN: &str = include_str!("guest/autologin.sh");
+pub(crate) const AUTOLOGIN_HELPER: &str = include_str!("guest/autologin.sh");
 
 /// Printed only when every tool is present *and* Node is new enough. cloud-init does not abort
 /// runcmd on failure, so the host greps for this rather than trusting the build "finished".
-pub(crate) fn golden_verify_script() -> String {
+pub(crate) fn base_verify_script() -> String {
     recipe(
         include_str!("guest/verify.sh"),
         &[
             ("@NODE_MAJOR@", &REQUIRED_NODE_MAJOR.to_string()),
-            ("@OK_MARKER@", GOLDEN_OK_MARKER),
-            (
-                "@AGENT_BINARIES@",
-                &agents()
-                    .iter()
-                    .map(|a| format!("command -v {} >/dev/null || exit 0", a.binary))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
+            ("@OK_MARKER@", BUILD_OK_MARKER),
         ],
     )
 }
@@ -101,7 +127,7 @@ pub(crate) fn golden_verify_script() -> String {
 /// user's command, and hit `sudo poweroff`, killing the VM out from under it. The guard below
 /// makes only the boot's first login shell own the session; nested ones just load the
 /// environment, so the agent's commands still get TERM and the API keys.
-pub(crate) const GOLDEN_PROFILE: &str = include_str!("guest/profile.sh");
+pub(crate) const LOGIN_PROFILE: &str = include_str!("guest/profile.sh");
 
 pub(crate) struct MountPlan {
     /// Body of the shell script that performs every 9p mount inside the guest.
@@ -314,20 +340,30 @@ pub(crate) fn build_credentials_entry(credentials: &[(String, String)]) -> Strin
         .join("\n")
 }
 
-/// What `--build-image` recorded about the image it produced.
+/// What a build recorded about the image it produced.
+///
+/// One `.meta` per image: the base records what it provisioned, each agent layer records the
+/// version of the one agent it added. A session parses the base's and then every layer in its
+/// chain, so `agents` ends up holding exactly what is in the image it booted — no list of agent
+/// names appears in this file, which is what keeps a new recipe from needing Rust.
 #[derive(Default, Debug, PartialEq)]
-pub(crate) struct GoldenMeta {
+pub(crate) struct ImageMeta {
     /// The kernel command line the image boots itself with, captured rather than invented.
     pub(crate) cmdline: String,
     pub(crate) alpine: String,
     pub(crate) node: String,
-    pub(crate) claude: String,
-    pub(crate) opencode: String,
-    pub(crate) agy: String,
+    /// `(command, version)` for each agent the chain carries, in the order read.
+    pub(crate) agents: Vec<(String, String)>,
 }
 
-pub(crate) fn parse_golden_meta(raw: &str) -> GoldenMeta {
-    let mut meta = GoldenMeta::default();
+/// Parse one or more `.meta` files, later ones adding to earlier ones.
+pub(crate) fn parse_image_meta(raw: &str) -> ImageMeta {
+    let mut meta = ImageMeta::default();
+    merge_image_meta(&mut meta, raw);
+    meta
+}
+
+pub(crate) fn merge_image_meta(meta: &mut ImageMeta, raw: &str) {
     for line in raw.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -337,27 +373,26 @@ pub(crate) fn parse_golden_meta(raw: &str) -> GoldenMeta {
             "cmdline" => meta.cmdline = value,
             "alpine" => meta.alpine = value,
             "node" => meta.node = value,
-            "claude" => meta.claude = value,
-            "opencode" => meta.opencode = value,
-            "agy" => meta.agy = value,
-            _ => {}
+            key => {
+                if let Some(command) = key.strip_prefix("agent.") {
+                    meta.agents.push((command.to_string(), value));
+                }
+            }
         }
     }
-    meta
 }
 
-pub(crate) fn describe_image(meta: &GoldenMeta) -> String {
-    [
-        ("alpine", &meta.alpine),
-        ("claude", &meta.claude),
-        ("opencode", &meta.opencode),
-        ("agy", &meta.agy),
-    ]
-    .iter()
-    .filter(|(_, v)| !v.is_empty())
-    .map(|(k, v)| format!("{} {}", k, v))
-    .collect::<Vec<_>>()
-    .join(" · ")
+pub(crate) fn describe_image(meta: &ImageMeta) -> String {
+    let mut parts = Vec::new();
+    if !meta.alpine.is_empty() {
+        parts.push(format!("alpine {}", meta.alpine));
+    }
+    for (command, version) in &meta.agents {
+        if !version.is_empty() {
+            parts.push(format!("{} {}", command, version));
+        }
+    }
+    parts.join(" · ")
 }
 
 /// Furthest phase the boot log shows evidence of.
@@ -418,15 +453,23 @@ pub(crate) fn recipe(template: &str, values: &[(&str, &str)]) -> String {
 /// newer kernel and far fewer packages — which is the point of a sandbox. The differences from
 /// the Ubuntu recipe are apk instead of apt, an inittab line instead of a systemd drop-in, and
 /// no Node tarball, since Alpine already ships Node 22.
-pub(crate) fn build_golden_cloud_init(host_uid: u32) -> String {
+pub(crate) fn build_base_cloud_init(host_uid: u32) -> String {
     recipe(
-        include_str!("guest/golden.yaml"),
+        include_str!("guest/base.yaml"),
         &[
-            ("@AUTOLOGIN@", &indent_block(GOLDEN_AUTOLOGIN, 6)),
-            ("@PROFILE@", &indent_block(GOLDEN_PROFILE, 6)),
-            ("@SETUP@", &indent_block(&golden_setup_script(host_uid), 6)),
-            ("@VERIFY@", &indent_block(&golden_verify_script(), 6)),
+            ("@AUTOLOGIN@", &indent_block(AUTOLOGIN_HELPER, 6)),
+            ("@PROFILE@", &indent_block(LOGIN_PROFILE, 6)),
+            ("@SETUP@", &indent_block(&base_setup_script(host_uid), 6)),
+            ("@VERIFY@", &indent_block(&base_verify_script(), 6)),
         ],
+    )
+}
+
+/// cloud-config that turns a copy-on-write layer into "the base image plus one agent".
+pub(crate) fn build_layer_cloud_init(agent: &Agent, host_uid: u32, key: &str) -> String {
+    recipe(
+        include_str!("guest/layer.yaml"),
+        &[("@LAYER@", &indent_block(&agent_layer_script(agent, host_uid, key), 6))],
     )
 }
 

@@ -26,8 +26,21 @@ pub(crate) struct Agent {
     pub(crate) credentials: Vec<String>,
     /// Hosts added to the egress allowlist when this agent is invoked.
     pub(crate) hosts: Vec<String>,
-    /// Shell that installs it in the golden image. Runs as root, with `retry` in scope.
+    /// Shell that installs it into its own qcow2 layer. Runs as root, with `retry` in scope.
     pub(crate) install: String,
+    /// Shell that prints the installed version, recorded in the layer's `.meta` and shown in the
+    /// status block. Optional: most agents answer `--version` with one usable line.
+    #[serde(default)]
+    pub(crate) version: Option<String>,
+}
+
+impl Agent {
+    pub(crate) fn version_command(&self) -> String {
+        match &self.version {
+            Some(cmd) => cmd.clone(),
+            None => format!("{} --version", self.binary),
+        }
+    }
 }
 
 /// Home-directory paths no agent should be asking for. A recipe is a file a stranger can send,

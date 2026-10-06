@@ -14,10 +14,11 @@ Usage: `geli <command> [args...]` runs `<command>` inside the sandbox; `geli --l
 cargo build                    # debug build
 cargo build --release          # release build
 cargo test                     # unit tests, all on pure functions
-cargo test golden_cloud_init   # single test
+cargo test base_cloud_init     # single test
 cargo run -- --list            # run without installing
-cargo run -- --build-image     # (re)build the golden image; 5-20 min, mostly downloads
-./setup.sh                     # host deps + base image + binary + golden image
+cargo run -- --build-image     # (re)build the base image; 5-20 min, mostly downloads
+cargo run -- --build-image --agents claude   # and that agent's layer, instead of on first use
+./setup.sh                     # host deps + cloud image + binary + base image
 ```
 
 Recipes live in `agents/*.toml` and are discovered by `build.rs`, so touching one triggers a
@@ -32,7 +33,7 @@ deleting them on exit — the only way to inspect `user-data` or the guest's
 `/var/log/cloud-init-output.log` after a failed boot.
 
 There is no CI in this repo yet, which matters more now that recipes are the contribution
-surface: the per-agent sentinel in `golden_verify_script` is the only gate on a new recipe, and
+surface: the per-agent sentinel in `agent_layer_script` is the only gate on a new recipe, and
 it runs wherever someone happens to build.
 
 Running the sandbox requires, on the host: `qemu-system-x86_64`, `qemu-img`, `genisoimage`, KVM access, and the base image at `~/qemu-sandbox/nocloud_alpine-3.22.2-x86_64-bios-cloudinit-r0.qcow2`. `setup.sh` provisions all of these for Ubuntu/Debian hosts. `GELI_BASE_IMAGE` points `--build-image` at a different cloud image. `main.rs` re-checks qemu/genisoimage at runtime and exits with install instructions if missing.
@@ -69,15 +70,22 @@ Two concerns underneath, independent of the module split:
 
 So invoking `geli` from directory A in workspace `foo` mounts *every* directory registered under `foo`, with A as the active one the command `cd`s into.
 
-**Guest configuration (platform-independent, pure, tested).** `build_mount_script`, `build_cloud_init`, `build_golden_cloud_init`, `build_env_exports` and `indent_block` turn a workspace into a cloud-init document with no I/O. Keeping these pure is what makes the guest config testable without booting a VM — add tests here rather than debugging through the serial console.
+**Guest configuration (platform-independent, pure, tested).** `build_mount_script`, `build_cloud_init`, `build_base_cloud_init`, `build_layer_cloud_init`, `build_env_exports` and `indent_block` turn a workspace into a cloud-init document with no I/O. Keeping these pure is what makes the guest config testable without booting a VM — add tests here rather than debugging through the serial console.
 
-**There are two cloud-init documents, and the split is the whole performance story.** `build_golden_cloud_init` is baked once by `--build-image` and holds everything static: the toolchain, every agent's install, the autologin inittab line and `GOLDEN_PROFILE` (the login profile). `build_cloud_init` runs per session and holds only what depends on the workspace: mounts, env, credentials and the command. Anything slow or workspace-independent belongs in the golden recipe — putting it in the session document is what made boots take 4.5 minutes instead of nine seconds.
+**There are three cloud-init documents, and the split is the whole performance story.**
+`build_base_cloud_init` is baked once by `--build-image` and holds everything static *and shared*:
+the toolchain, the sandbox user, the autologin inittab line and `LOGIN_PROFILE`.
+`build_layer_cloud_init` is baked once per agent and holds exactly one agent's install.
+`build_cloud_init` runs per session and holds only what depends on the workspace: mounts, env,
+credentials and the command. Anything slow belongs in one of the first two — putting it in the
+session document is what made boots take 4.5 minutes instead of nine seconds; and anything shared
+belongs in the base rather than repeated in every layer.
 
 **Sandbox driver (`execute_sandbox`), `#[cfg]`-gated per OS.** Only the Linux implementation exists; macOS and Windows are stubs that print "not yet implemented".
 
 The Linux path builds a VM per invocation, keyed by host PID to avoid collisions:
 
-1. Copy-on-write overlay `/tmp/sandbox-session-<pid>.qcow2` backed by the golden image, which is itself an overlay on the pristine base (`base ← golden ← session`). Only the golden image is created with an explicit `SANDBOX_DISK_SIZE` (20G) — Alpine's base is 202 MiB virtual, which `apk add nodejs npm` alone overflows — and sessions inherit that size from their backing file.
+1. Copy-on-write overlay `/tmp/sandbox-session-<pid>.qcow2` on top of the invoked agent's layer, which is an overlay on the base image, which is an overlay on the pristine cloud image (`cloud ← base ← layer ← session`). `resolve_chain` builds any missing layer first, so a first run of an agent takes minutes and every later one seconds. Only the base image is created with an explicit `SANDBOX_DISK_SIZE` (20G) — Alpine's cloud image is 202 MiB virtual, which `apk add nodejs npm` alone overflows — and everything above it inherits that size from its backing file.
 2. One `-fsdev`/`virtio-9p-pci` pair per workspace directory (tags `projshare1`, `projshare2`, …), mounted to `/workspace/<folder-name>` in the guest. Two extra 9p shares map `~/.cache/geli-sandbox/{npm,pip}` into the guest so package downloads persist across runs.
 3. A cloud-init `user-data` + `meta-data` pair packed into an ISO by `genisoimage` and attached as a second drive. For a session this only performs the 9p mounts and writes `/etc/geli/session` (the `cd` plus the user's command); the baked-in `.bash_profile` waits on `cloud-init status --wait`, sources it, syncs and forces power off.
 4. QEMU boots the extracted kernel directly (`-kernel`/`-initrd`), skipping SeaBIOS, iPXE and the bootloader — ~6s of the old session time. The guest's console goes to `ttyS1`, written to `console.log` in the session's share dir; `ttyS0` is `mon:stdio` with inherited stdio, so the agent is fully interactive and sees nothing but its own output.
@@ -98,9 +106,8 @@ binary that proves the build worked, the credential paths it needs and the hosts
 egress is restricted. `build.rs` discovers them, so adding an agent is one file and no Rust —
 that is the point: this is the contribution surface.
 
-Recipes are sorted by command before use, so the golden image's recipe hash does not depend on
-the filesystem's directory order. The golden image
-carries all three; `agent_for_command` matches the first word of the user's command, however it
+Recipes are sorted by command before use, so a chain's key and an image's recipe hash do not
+depend on the filesystem's directory order. `agent_for_command` matches the first word of the user's command, however it
 is pathed, and *only that agent's* credentials travel into the guest. An unrecognised command
 (`geli bash`) carries none.
 
@@ -140,12 +147,12 @@ What this does **not** give: an allowed destination is still a way out — `gith
 
 - **The cloud-init YAML has a deliberately fixed shape.** Everything variable (mounts, env, the user's command) is injected as a literal block scalar via `indent_block`, so the document's structure never depends on the number of workspace directories. An earlier version built `runcmd` entries by string-replacing newlines; the indentation didn't match and the YAML never parsed, which fails *silently* — the VM boots fine and the command simply never runs. If you add anything variable here, put it in a `content: |` block, not in a list item, and extend `cloud_init_parses`.
 - **The command goes in `.bash_profile`, never `.bashrc`.** `.bashrc` runs for every shell, so a subshell spawned by the agent would re-run the command and `poweroff` mid-session. The autologin helper runs `login -f`, which gives a login shell, which is what reads `.bash_profile`.
-- **The guest's `sandbox` user is created in the golden setup script, not by cloud-init.** Alpine's users module cannot set an explicit `uid` and fails the whole module when asked to — silently, leaving no user, which then breaks `write_files` entries that specify an owner, which leaves `/etc/geli/mounts.sh` unwritten, which leaves the workspace unmounted. The uid must match the host's: files arrive over 9p owned by the host user, so a mismatch leaves the agent able to read the project but not write to it. Alpine's own `alpine` user holds uid 1000 and is deleted to free it.
-- **`write_files` runs before `runcmd`**, so golden-recipe files are staged under `/etc/geli/` and installed into `/home/sandbox/` from the setup script, after the user exists. In the *session* document the user is already in the image, so `owner: sandbox:sandbox` works directly.
-- **Sessions do not use the bootloader at all.** `--build-image` hands `vmlinuz`, `initramfs` and the kernel cmdline out through a 9p share (the only point where the guest runs as root), and the host keeps them as `geli-vmlinuz` / `geli-initramfs` / `geli-golden.meta` beside the golden image. They are re-extracted on every build; replacing the golden by hand leaves them mismatched. A consequence worth knowing: a kernel updated *inside* a session has no effect.
+- **The guest's `sandbox` user is created in the base setup script, not by cloud-init.** Alpine's users module cannot set an explicit `uid` and fails the whole module when asked to — silently, leaving no user, which then breaks `write_files` entries that specify an owner, which leaves `/etc/geli/mounts.sh` unwritten, which leaves the workspace unmounted. The uid must match the host's: files arrive over 9p owned by the host user, so a mismatch leaves the agent able to read the project but not write to it. Alpine's own `alpine` user holds uid 1000 and is deleted to free it.
+- **`write_files` runs before `runcmd`**, so base-recipe files are staged under `/etc/geli/` and installed into `/home/sandbox/` from the setup script, after the user exists. In the *session* document the user is already in the image, so `owner: sandbox:sandbox` works directly.
+- **Sessions do not use the bootloader at all.** `--build-image` hands `vmlinuz`, `initramfs` and the kernel cmdline out through a 9p share (the only point where the guest runs as root), and the host keeps them as `geli-vmlinuz` / `geli-initramfs` / `geli-base.meta` beside the base image. They are re-extracted on every base build; replacing the image by hand leaves them mismatched. A consequence worth knowing: a kernel updated *inside* a session has no effect.
 - **`boot_cmdline` rewrites the image's own command line, it does not invent one.** `root=` and `modules=` are carried over verbatim — they describe how that particular image finds its filesystem, and hardcoding `root=LABEL=/` is exactly the kind of guess that breaks silently on a differently-labelled base.
-- **Alpine's cloud image ships a 10-second SYSLINUX boot menu.** Direct boot sidesteps it, and the golden build also sets `TIMEOUT 1` for anyone booting the image by hand. It never appeared in `uptime` or any in-guest measurement — only in wall-clock time, looking like QEMU overhead. **Measuring boot from inside the guest sees neither the firmware nor the bootloader**, which is where the time was.
-- **Every network step in the golden build is wrapped in `retry`.** Roughly a fifth of outbound connections drop mid-TLS on some networks, and `set -e` turned any one of them into a failed build.
+- **Alpine's cloud image ships a 10-second SYSLINUX boot menu.** Direct boot sidesteps it, and the base build also sets `TIMEOUT 1` for anyone booting the image by hand. It never appeared in `uptime` or any in-guest measurement — only in wall-clock time, looking like QEMU overhead. **Measuring boot from inside the guest sees neither the firmware nor the bootloader**, which is where the time was.
+- **Every network step in a build is wrapped in `retry`.** The helper lives in `src/guest/retry.sh` and is substituted into both the base recipe and every agent layer, so the two cannot drift. Roughly a fifth of outbound connections drop mid-TLS on some networks, and `set -e` turned any one of them into a failed build.
 - **There is no getty on `ttyS0`.** busybox `getty -n` writes an unconditional CRLF before exec'ing the login program, and no flag suppresses it — that was the blank line that used to open every session's stdout. It was long blamed on `login`; capturing the bytes in a pty showed `login -f` alone prints nothing. busybox init opens the tty named in the `inittab` id field as the controlling terminal with sane modes, so the helper runs straight from `inittab`.
 - **Autologin is an `/etc/inittab` line plus a login helper**, since Alpine has no systemd. It is baked into the image, so it races the session's cloud-init. init can hand out a shell before `/etc/geli/session` has been written. `GOLDEN_PROFILE` blocks on `cloud-init status --wait` for exactly this reason; if the session file is still missing afterwards it drops to a shell with a pointer to the cloud-init log instead of powering off blind.
 - **The host's `~/.claude/.credentials.json` is copied into the guest by default** (`--no-credentials` opts out). The reasoning is the stated threat model: the sandbox exists to keep the agent away from files it was not given, and a credential is not one of those. It is also what makes the agent bill the user's plan instead of API credits. Only that one file is copied — not the rest of `~/.claude`, which holds conversation transcripts and prompt history across every project. Keep it that way.
@@ -155,6 +162,8 @@ What this does **not** give: an allowed destination is still a way out — `gith
 - **Disposable VMs lose agent state, so `build_claude_config` seeds `/home/sandbox/.claude.json`.** Without it Claude Code re-runs onboarding every session: approve the API key, then trust the folder, every time. It records `hasCompletedOnboarding`, `hasTrustDialogAccepted` for every mounted workspace, and the last 20 characters of the key under `customApiKeyResponses.approved` (never the whole key). Anything else the agent should treat as already-answered belongs here too.
 - **The serial console dictates a generic `TERM` and a fixed 80x24.** `build_terminal_setup` overrides both from the host's terminal in `/etc/geli/env`, which `.bash_profile` sources after login — otherwise agent TUIs render in eight colours in a cramped window. Serial lines carry no SIGWINCH, so the size is a snapshot taken at launch and will not follow a resize.
 - **The session script echoes a line before running the user's command.** A command that produces no output would otherwise be indistinguishable from a sandbox that never ran it — the exact failure mode that made the credential bug hard to diagnose.
-- **A golden build is verified by a guarded sentinel.** cloud-init does *not* abort `runcmd` on failure, so the build VM only echoes `GOLDEN_OK_MARKER` behind `command -v claude && command -v git && command -v node`. The host greps the console log for it and refuses to publish the image otherwise — the `.building` file is renamed into place only on success.
+- **Every build is verified by a guarded sentinel.** cloud-init does *not* abort `runcmd` on failure, so a build VM only echoes `BUILD_OK_MARKER` behind a real check: the toolchain for the base image, `command -v <binary>` for an agent layer. `run_build_vm` greps the console log for it and returns `None` otherwise, and the `.building` file is renamed into place only on success.
+- **An agent layer is built on an image whose autologin already works**, so the login profile runs during the build too and leaves `/tmp/.geli-session-active` behind. Baked into the layer, that flag sends every real session down the nested-shell branch: the command never runs and the VM sits there until the readiness poll times out. `layer.sh` removes it explicitly, and a test asserts it does.
+- **Rebuilding the base image deletes every layer** (`discard_layers`). A layer's backing file is the image that was just replaced; keeping it would leave a chain pointing at a file that no longer exists. A layer's recorded hash also includes its parent's, so a changed recipe invalidates that layer and anything stacked on it, and nothing else.
 - `agent_args` is captured with `trailing_var_arg` + `allow_hyphen_values` and re-joined with spaces before going into the guest shell, so arguments are not shell-quoted.
 - Workspace names are sanitized to lowercase alphanumerics plus `-`, because they become filenames and the guest hostname.

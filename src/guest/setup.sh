@@ -1,18 +1,7 @@
 #!/bin/sh
 set -eux
 
-# Roughly a fifth of outbound connections on a given network can time out or drop mid-TLS, and
-# `set -e` turns any one of them into a failed build. Every network step gets retries.
-retry() {
-  n=0
-  until [ "$n" -ge 5 ]; do
-    "$@" && return 0
-    n=$((n + 1))
-    echo "geli: network step failed, retry $n/5: $*"
-    sleep 3
-  done
-  return 1
-}
+@RETRY@
 
 retry apk update
 retry apk add --no-cache bash nodejs npm git python3 py3-pip sudo curl
@@ -26,7 +15,9 @@ adduser -D -u @HOST_UID@ -s /bin/bash sandbox
 printf 'sandbox ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/sandbox
 chmod 0440 /etc/sudoers.d/sandbox
 
-@AGENT_INSTALLS@
+# No agent is installed here on purpose. Each one is a qcow2 layer on top of this image, built
+# by `geli --build-image --agents` or on first use, so an image only carries the agents its
+# owner actually runs. See layer.sh.
 
 install -o sandbox -g sandbox -m 0644 /etc/geli/bash_profile /home/sandbox/.bash_profile
 
@@ -72,9 +63,6 @@ cp /boot/initramfs-virt /mnt/geli-out/@INITRD@
   printf 'cmdline=%s\n' "$(cat /proc/cmdline)"
   printf 'alpine=%s\n' "$(cut -d' ' -f1-2 /etc/alpine-release 2>/dev/null || echo unknown)"
   printf 'node=%s\n' "$(node --version 2>/dev/null | tr -d v)"
-  printf 'claude=%s\n' "$(claude --version 2>/dev/null | cut -d' ' -f1)"
-  printf 'opencode=%s\n' "$(opencode --version 2>/dev/null | head -1)"
-  printf 'agy=%s\n' "$(agy --version 2>/dev/null | head -1)"
 } > /mnt/geli-out/@META@
 
 chown -R @HOST_UID@:@HOST_UID@ /mnt/geli-out

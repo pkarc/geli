@@ -1,7 +1,7 @@
 #!/bin/sh
 command -v git >/dev/null || exit 0
 command -v node >/dev/null || exit 0
-@AGENT_BINARIES@
+command -v bash >/dev/null || exit 0
 
 major=$(node -p 'process.versions.node.split(".")[0]')
 [ "$major" -ge @NODE_MAJOR@ ] || exit 0
