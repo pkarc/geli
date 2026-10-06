@@ -285,9 +285,22 @@ pub fn run_qemu(
 
 /// Show which phase the guest is in and return once it reports ready.
 ///
-/// Returns false on timeout. That matters: a guest whose cloud-init broke will never write
-/// the marker, and the terminal has to be handed over regardless rather than spin forever.
-pub fn track_boot(log: &Path, animate: bool, color: bool, timeout: Duration) -> bool {
+/// Returns false if the guest never reports ready. Two ways that happens, and both have to end
+/// the wait:
+///
+/// - **the VM is gone.** A guest that powers itself off early — a broken cloud-init, or the
+///   lockdown refusing to run a session it cannot restrict — will never write the marker, and
+///   polling for it until the deadline left the user watching a spinner for the full 90 seconds
+///   over a VM that died in five. Checked every tick, which costs nothing.
+/// - **the timeout.** A guest that is merely wedged still holds the terminal hostage, and it has
+///   to be handed over regardless rather than spin forever.
+pub fn track_boot(
+    log: &Path,
+    vm: &mut Child,
+    animate: bool,
+    color: bool,
+    timeout: Duration,
+) -> bool {
     const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     let started = Instant::now();
     let deadline = started + timeout;
@@ -302,6 +315,16 @@ pub fn track_boot(log: &Path, animate: bool, color: bool, timeout: Duration) -> 
                 let _ = io::stderr().flush();
             }
             return true;
+        }
+
+        // Read the log before this check, not after: the marker and the power-off can land
+        // between two ticks, and a guest that did its job and then exited is still ready.
+        if matches!(vm.try_wait(), Ok(Some(_))) {
+            if animate {
+                eprint!("\r\x1b[2K");
+                let _ = io::stderr().flush();
+            }
+            return fs::read_to_string(log).unwrap_or_default().contains(READY_MARKER);
         }
 
         let phase = boot_phase(&text);

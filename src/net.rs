@@ -13,9 +13,14 @@ use crate::{agents::*, guest::*, qemu::*, ui::*};
 
 // --- EGRESS POLICY ---
 //
-// With `--restrict-net` the guest gets `restrict=on`, which blocks outbound traffic *and* DNS,
-// and a single forwarded port to a proxy running inside geli. The proxy resolves names on the
-// host and only connects to destinations on the allowlist.
+// With `--restrict-net` the guest's only way out is a CONNECT proxy running inside geli, which
+// resolves names on the host and only connects to destinations on the allowlist. Three things
+// hold that in place, and all three run as root in `mounts.sh` before the agent starts:
+//
+//   1. the default route is deleted, so nothing off-link is reachable by name or by IP;
+//   2. an nftables ruleset drops all egress except TCP to the proxy's port, which is what closes
+//      what is still *on-link* — slirp's DNS resolver above all;
+//   3. the agent's sudoers is narrowed to `/sbin/poweroff`, so it cannot undo 1 or 2.
 //
 // What this buys: an arbitrary server is no longer reachable from the sandbox. What it does not
 // buy: an agent with `github.com` allowed can still push to a gist. The allowlist narrows
@@ -44,8 +49,15 @@ pub(crate) const ALLOWED_PORT: u16 = 443;
 /// This is deliberately *not* `restrict=on` plus `guestfwd`. Measured on QEMU 8.2.2: a guestfwd
 /// forwards exactly one connection and then times out forever, with or without `restrict`, so a
 /// session died after its first request. Egress is cut by removing the guest's default route
-/// instead, which leaves only the on-link 10.0.2.0/24 — the proxy — reachable.
+/// instead, which leaves the on-link 10.0.2.0/24 reachable — the proxy, and everything else slirp
+/// puts on that subnet, which is why the route deletion is not the whole policy.
 pub(crate) const GUEST_PROXY_HOST: &str = "10.0.2.2";
+
+/// slirp's built-in DNS resolver. On-link, so deleting the default route leaves it answering:
+/// measured, `nslookup example.com 10.0.2.3` returned real addresses in a `--restrict-net`
+/// session. Names are low bandwidth but they are a channel, and this is the address the ruleset
+/// exists to cut off.
+pub(crate) const GUEST_DNS: &str = "10.0.2.3";
 
 /// Matches a host against the allowlist. A rule starting with `.` or `*.` also matches
 /// subdomains, which private registries tend to need.
@@ -99,15 +111,68 @@ pub(crate) fn parse_proxy_request(head: &str) -> ProxyRequest {
 /// Two halves, and both are needed. Dropping the default route leaves the internet unreachable
 /// by name *and* by IP while the on-link proxy still answers. Narrowing sudo is what makes that
 /// stick: the agent is root in the guest by default, and root can simply add the route back.
-pub(crate) fn build_lockdown(restricted: bool) -> String {
-    if !restricted {
+pub(crate) fn build_lockdown(proxy_port: Option<u16>) -> String {
+    // No proxy means no `--restrict-net`: the two cannot disagree, because the proxy is the only
+    // way out that the policy leaves open. The port itself is not needed here — it is baked into
+    // the ruleset file this script applies.
+    if proxy_port.is_none() {
         return String::new();
     }
-    "\n# --- restricted egress ---\n\
-     ip route del default || true\n\
-     printf 'sandbox ALL=(ALL) NOPASSWD: /sbin/poweroff\\n' > /etc/sudoers.d/sandbox\n\
-     chmod 0440 /etc/sudoers.d/sandbox\n"
-        .to_string()
+
+    format!(
+        "\n# --- restricted egress ---\n\
+         ip route del default || true\n\
+         \n\
+         # The ruleset is what closes the on-link paths the route deletion leaves open. It is\n\
+         # applied atomically from a file, and a failure to apply it is fatal on purpose: the\n\
+         # status block has already told the user egress is restricted, and running the agent\n\
+         # anyway would make that a lie. Better a session that dies with a reason in the log.\n\
+         if ! nft -f /etc/geli/egress.nft; then\n\
+         \x20   echo 'geli: FAILED to apply the egress ruleset; refusing to run unrestricted'\n\
+         \x20   sync\n\
+         \x20   poweroff -f\n\
+         fi\n\
+         \n\
+         # Belt and braces, and it also makes failure fast: with the resolver gone, a lookup\n\
+         # fails at once instead of waiting out a timeout on a dropped packet. The ruleset is\n\
+         # what makes it binding — this file alone an agent could work around by querying\n\
+         # {dns} directly, which is exactly what the measurement showed.\n\
+         : > /etc/resolv.conf\n\
+         \n\
+         # Last, so the agent cannot undo any of the above. Everything from here on is as the\n\
+         # sandbox user, with sudo narrowed to turning the machine off.\n\
+         printf 'sandbox ALL=(ALL) NOPASSWD: /sbin/poweroff\\n' > /etc/sudoers.d/sandbox\n\
+         chmod 0440 /etc/sudoers.d/sandbox\n",
+        dns = GUEST_DNS,
+    )
+}
+
+/// The nftables ruleset for a restricted session, as a guest file rather than a Rust string.
+pub(crate) fn build_egress_ruleset(port: u16) -> String {
+    recipe(
+        include_str!("guest/egress.nft"),
+        &[
+            ("@PROXY_HOST@", GUEST_PROXY_HOST),
+            ("@PROXY_PORT@", &port.to_string()),
+            ("@DNS@", GUEST_DNS),
+        ],
+    )
+}
+
+/// `write_files` entry carrying the ruleset, or nothing at all when egress is unrestricted.
+///
+/// Optional in the same way the credentials entry is: an unrestricted session should not have a
+/// policy file sitting in it at all, so there is nothing to wonder about when reading the guest.
+pub(crate) fn build_egress_entry(proxy_port: Option<u16>) -> String {
+    let Some(port) = proxy_port else {
+        return String::new();
+    };
+    format!(
+        "  - path: /etc/geli/egress.nft\n    \
+         permissions: '0600'\n    \
+         content: |\n{}\n",
+        indent_block(&build_egress_ruleset(port), 6)
+    )
 }
 
 /// Proxy variables for the guest. Lowercase forms too: several tools read only those.

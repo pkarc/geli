@@ -480,6 +480,7 @@ pub(crate) fn build_cloud_init(
     env_exports: &str,
     claude_config: &str,
     credentials: &[(String, String)],
+    proxy_port: Option<u16>,
 ) -> String {
     // The breadcrumb goes to the boot console, not stdout. It exists so a command that produces
     // no output is still distinguishable from a sandbox that never ran it — but the user's stdout
@@ -502,6 +503,7 @@ pub(crate) fn build_cloud_init(
             ("@SESSION@", &indent_block(&session, 6)),
             ("@CLAUDE_CONFIG@", &indent_block(claude_config, 6)),
             ("@CREDENTIALS@", &build_credentials_entry(credentials)),
+            ("@EGRESS@", &build_egress_entry(proxy_port)),
         ],
     )
 }

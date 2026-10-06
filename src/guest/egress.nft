@@ -1,0 +1,27 @@
+#!/usr/sbin/nft -f
+# Egress policy for a --restrict-net session, applied by mounts.sh as root before the agent runs.
+#
+# Deleting the default route already makes the internet unreachable by name and by IP. What it
+# does not close is what is still *on-link*: slirp puts its DNS resolver at @DNS@, one hop away,
+# so an agent could keep encoding data into the names it looked up. This closes that, and with it
+# every other on-link path — raw sockets, ICMP, and anything over IPv6, which the `inet` family
+# covers in the same rules.
+#
+# The whole allowance is one TCP port on the host alias. The guest never needs to resolve anything
+# itself: it speaks CONNECT by name to the proxy, which resolves on the host and checks the
+# allowlist there. That is what makes a default-drop policy survivable here.
+
+flush ruleset
+
+table inet geli {
+    chain output {
+        type filter hook output priority 0; policy drop;
+
+        # The agent's own loopback: language servers, test fixtures, its own http servers.
+        oifname "lo" accept
+
+        # The CONNECT proxy inside geli, and nothing else. Not the whole host alias: a port left
+        # open on @PROXY_HOST@ is a tunnel out through whatever happens to be listening there.
+        ip daddr @PROXY_HOST@ tcp dport @PROXY_PORT@ accept
+    }
+}
