@@ -106,6 +106,17 @@ pub fn check_host_tools() {
         );
         std::process::exit(1);
     }
+
+    // Not fatal. Emulation is slow, not broken, and refusing to run at all on a host without
+    // hardware virtualization would be geli deciding something that is the user's to decide.
+    // But it has to be said, because the symptom otherwise is "geli got mysteriously slow".
+    if !kvm_available() {
+        eprintln!("\n[!] No hardware virtualization: /dev/kvm is missing or not yours to use.");
+        eprintln!("    geli will fall back to emulation, which is many times slower — a session");
+        eprintln!("    takes minutes instead of seconds, and building an image takes much longer.");
+        eprintln!("    If the device exists, you are probably not in the `kvm` group:");
+        eprintln!("      sudo usermod -aG kvm $USER     # then log out and back in\n");
+    }
 }
 
 /// Create a private staging directory. The cloud-init payload carries API keys in plaintext,
@@ -193,6 +204,57 @@ pub struct DirectBoot {
     pub console_log: PathBuf,
 }
 
+/// Whether this host can hand the guest real hardware virtualization.
+///
+/// Opened, not merely stat'ed: `/dev/kvm` existing proves nothing about whether this user may use
+/// it. CI is the case that makes the distinction concrete — the hosted runners have the device,
+/// but the runner user is not in the `kvm` group until a udev rule says so, and a `stat` check
+/// would have called that host accelerated and then failed at launch.
+pub fn kvm_available() -> bool {
+    if std::env::var_os("GELI_NO_KVM").is_some() {
+        return false;
+    }
+    fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok()
+}
+
+/// How much memory the guest gets. `GELI_MEMORY` overrides it in either direction.
+///
+/// It is a ceiling, not a reservation: Linux hands QEMU pages as the guest touches them, so the
+/// old 4 GiB was never actually spent. What a high ceiling does cost is page cache — a Linux
+/// guest will fill whatever it is given, and QEMU's RSS does not shrink when the guest frees it.
+/// Measured as peak QEMU RSS, which is an upper bound since it includes QEMU itself:
+///
+/// | ceiling | agent reading a file | `npm install express` |
+/// |---|---|---|
+/// | 4 GiB | 728 MB | — |
+/// | 2 GiB | 635 MB | 430 MB |
+/// | 1 GiB | 588 MB | 425 MB |
+///
+/// Everything above worked, 1 GiB included. 2 GiB is the default anyway: at 1 GiB a trivial agent
+/// task already touched 57% of the ceiling, and the failure mode for guessing low is the guest
+/// being OOM-killed mid-session, which is far worse than a ceiling nobody reaches. Note how RSS
+/// tracks the ceiling rather than the workload — that is the page cache, and it is the reason to
+/// come down from 4 GiB at all.
+pub fn guest_memory() -> String {
+    std::env::var("GELI_MEMORY").unwrap_or_else(|_| "2G".to_string())
+}
+
+/// How the guest's CPU is provided. The two halves must move together: `-cpu host` is a KVM-only
+/// model and QEMU refuses it outright under emulation, so pairing it with a missing `-enable-kvm`
+/// is not a slow sandbox, it is one that will not start.
+///
+/// With acceleration, `host` passes the real CPU through. Without it, `max` is the nearest thing
+/// TCG offers — every feature this QEMU can emulate. Neither is `qemu64`, QEMU's default: a
+/// deliberately conservative model missing most modern instruction sets, which sends guest
+/// userspace down feature-detection paths nothing else exercises.
+pub fn accel_args(kvm: bool) -> Vec<String> {
+    if kvm {
+        vec!["-enable-kvm".into(), "-cpu".into(), "host".into()]
+    } else {
+        vec!["-cpu".into(), "max".into()]
+    }
+}
+
 pub fn run_qemu(
     disk: &Path,
     iso: &Path,
@@ -200,15 +262,10 @@ pub fn run_qemu(
     io_mode: QemuIo,
     direct: Option<&DirectBoot>,
 ) -> io::Result<Child> {
-    let mut args: Vec<String> = vec![
-        "-m".into(),
-        "4G".into(),
-        "-enable-kvm".into(),
-        // Without this QEMU emulates `qemu64`, a deliberately conservative CPU model missing
-        // most modern instruction sets. Passing the host CPU through is both much faster and
-        // avoids guest userspace that feature-detects its way into bad paths.
-        "-cpu".into(),
-        "host".into(),
+    let mut args: Vec<String> = vec!["-m".into(), guest_memory()];
+    args.extend(accel_args(kvm_available()));
+
+    args.extend([
         "-smp".into(),
         "2".into(),
         "-nographic".into(),
@@ -221,7 +278,7 @@ pub fn run_qemu(
         format!("file={},format=raw,if=virtio", iso.display()),
         "-netdev".into(),
         "user,id=net0".into(),
-    ];
+    ]);
 
     if direct.is_some() {
         // The iPXE option ROM prints a banner and is never used — nothing here network-boots.

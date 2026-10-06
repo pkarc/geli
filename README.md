@@ -36,7 +36,8 @@ Early. It works, with caveats worth knowing before you rely on it:
 
 ## Requirements
 
-- A Linux host with KVM (`/dev/kvm` accessible)
+- A Linux host. KVM (`/dev/kvm` accessible) is strongly recommended but no longer required —
+  without it geli falls back to emulation, measured at about ten times slower
 - `qemu-system-x86_64`, `qemu-img`, `genisoimage`
 - Rust toolchain, to build
 - ~315 MB of disk for the cloud and base images, plus ~200-380 MB per agent you run, plus a
@@ -197,10 +198,42 @@ sessions.
 | `ANTHROPIC_API_KEY` | Forwarded into the guest. |
 | `OPENAI_API_KEY` | Forwarded into the guest. |
 | `GELI_KEEP=1` | Keep the session disk and cloud-init files on exit, for debugging. |
+| `GELI_MEMORY` | Guest memory ceiling, default `2G`. |
+| `GELI_NO_KVM=1` | Force emulation even where KVM is available. For reproducing what a host without it sees. |
 | `TERM`, `COLORTERM` | Forwarded, so the agent's TUI gets your colours instead of the serial console's `vt220`. |
 
 Your terminal's size is forwarded too, at launch. Serial consoles carry no `SIGWINCH`, so resizing
 the window mid-session will not reach the guest — restart the session to pick up a new size.
+
+### Memory, and why it is 2 GB
+
+It is a ceiling, not a reservation: Linux hands QEMU pages as the guest touches them, so the 4 GB
+geli used to ask for was never actually spent. What a high ceiling *does* cost is page cache — a
+Linux guest fills whatever it is given, and QEMU's resident size never gives it back. Peak QEMU
+RSS, which is an upper bound since it includes QEMU itself:
+
+| ceiling | agent reading a file | `npm install express` |
+|---|---|---|
+| 4 GB | 728 MB | — |
+| 2 GB | 635 MB | 430 MB |
+| 1 GB | 588 MB | 425 MB |
+
+Notice the peak tracks the *ceiling*, not the workload. Everything above worked, 1 GB included, so
+`GELI_MEMORY=1G` is a reasonable choice on a small host. 2 GB is the default because at 1 GB a
+trivial task already touched 57% of the ceiling, and guessing low means the guest gets OOM-killed
+mid-session — a much worse failure than a ceiling nobody reaches.
+
+### Without KVM
+
+geli used to pass `-enable-kvm` unconditionally and simply fail to start where it was unavailable.
+It now detects it, and detects it by *opening* `/dev/kvm` rather than checking that the file is
+there: on GitHub's runners the device exists but is not usable until a udev rule puts the user in
+the `kvm` group, and a `stat` check would call that host accelerated and then fail at launch.
+
+Falling back is a warning, not an error — emulation is slow, not broken. Measured on one host,
+`geli which node`: **10 s accelerated, 99 s emulated.** Building an image that way is worse still.
+The CPU model moves with the accelerator, since `-cpu host` is KVM-only and QEMU refuses it under
+emulation.
 
 ## Agents
 
@@ -422,13 +455,14 @@ Done:
 9. ~~CI~~ — `check` on every push; `image` builds the affected layers and runs a real session
 10. ~~Close the DNS channel~~ — an nftables default-drop ruleset; `nslookup` against slirp's
     resolver went from answering to failing
+11. ~~Optional KVM~~ — detected by opening `/dev/kvm`, with an emulated fallback: 10 s against 99 s
+12. ~~Trim the RAM ceiling~~ — 4 GB → 2 GB, and the premise was wrong: it was never being spent
 
 Next:
 
-11. **Let one session carry several agents.** The layer chain already supports it —
+13. **Let one session carry several agents.** The layer chain already supports it —
     `geli-layer-claude+opencode.qcow2` is a layer on `geli-layer-claude.qcow2`, keyed by the
     sorted set — but nothing asks for more than the invoked agent yet. The open question is
     credentials: today only the invoked agent's travel, and an agent you asked to have in the VM
     but whose credential stays out is not obviously useful.
-12. Optional KVM, for hosts without hardware virtualization.
-13. Trim the 4 GB RAM ceiling — the guest uses 476 MB.
+
