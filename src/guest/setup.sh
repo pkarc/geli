@@ -4,7 +4,7 @@ set -eux
 @RETRY@
 
 retry apk update
-retry apk add --no-cache bash nodejs npm git python3 py3-pip sudo curl
+retry apk add --no-cache bash nodejs npm git python3 py3-pip sudo curl nftables
 
 # The user is created here, not through cloud-init: Alpine's users module cannot set an explicit
 # uid and fails the whole module when asked to. The uid has to match the host's, because files

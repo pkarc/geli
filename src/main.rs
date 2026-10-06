@@ -603,7 +603,20 @@ fn execute_sandbox(
     let sandbox_img = PathBuf::from(format!("/tmp/sandbox-session-{}.qcow2", pid));
 
     let cur_canon = cur.canonicalize()?;
-    let plan = build_mount_script(&dirs, &cur_canon, &build_lockdown(restrict_net));
+
+    // The proxy has to exist before the guest's own configuration is generated, not just before
+    // it boots: the egress ruleset names the one port the guest may reach, and that port is
+    // whatever the OS handed the listener. So this comes before `build_mount_script`.
+    let proxy = if restrict_net {
+        let allow = session_allowlist(agent, &read_local_allowlist(cur));
+        let count = allow.len();
+        Some((start_proxy(allow, vm_share_dir.join("net.log"))?, count))
+    } else {
+        None
+    };
+    let proxy_port = proxy.as_ref().map(|(p, _)| p.port);
+
+    let plan = build_mount_script(&dirs, &cur_canon, &build_lockdown(proxy_port));
 
     let mut qemu_args: Vec<String> = Vec::new();
     let mut status_mounts: Vec<StatusMount> = Vec::new();
@@ -681,14 +694,6 @@ fn execute_sandbox(
     }
 
     let api_key_for_config = anthropic_key.clone();
-    // The proxy has to exist before the guest boots: slirp forwards a port straight to it.
-    let proxy = if restrict_net {
-        let allow = session_allowlist(agent, &read_local_allowlist(cur));
-        let count = allow.len();
-        Some((start_proxy(allow, vm_share_dir.join("net.log"))?, count))
-    } else {
-        None
-    };
 
     let mut env_exports = build_env_exports(&[
         ("ANTHROPIC_API_KEY", anthropic_key),
@@ -713,6 +718,7 @@ fn execute_sandbox(
         &env_exports,
         &claude_config,
         &credentials,
+        proxy_port,
     );
     let iso = make_cloud_init_iso(
         &vm_share_dir,
@@ -768,18 +774,27 @@ fn execute_sandbox(
     // the loading line has the screen to itself. It also owns the readiness poll: the phase it
     // displays and the signal to hand over come from the same log.
     let ready = {
-        let log = console_log.clone();
         let animate = std::io::stderr().is_terminal();
         let color = animate && std::env::var_os("NO_COLOR").is_none();
-        std::thread::spawn(move || {
-            track_boot(&log, animate, color, std::time::Duration::from_secs(90))
-        })
-        .join()
-        .unwrap_or(false)
+        track_boot(
+            &console_log,
+            &mut child,
+            animate,
+            color,
+            std::time::Duration::from_secs(90),
+        )
     };
 
     if !ready {
-        eprintln!("[!] The sandbox never reported ready. Console log: {}", console_log.display());
+        eprintln!("[!] The sandbox never reported ready.");
+        // The reason is almost always the last thing the guest said, and sending the user to a
+        // file that is about to be deleted on exit is not help. Show the tail here.
+        let log = fs::read_to_string(&console_log).unwrap_or_default();
+        let tail: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).rev().take(6).collect();
+        for line in tail.iter().rev() {
+            eprintln!("    | {}", line.trim_end());
+        }
+        eprintln!("    Full console log: {}", console_log.display());
         eprintln!("    Re-run with GELI_KEEP=1 to keep it after exit.");
     }
 
@@ -863,7 +878,7 @@ mod tests {
         let plan = build_mount_script(&dirs, Path::new(current), "");
         let env = build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]);
         let config = build_claude_config(&plan.folders, "sk-ant-test-key-0123456789");
-        build_cloud_init(&plan, cmd, &env, &config, &[])
+        build_cloud_init(&plan, cmd, &env, &config, &[], None)
     }
 
     /// The bug that made geli never work: a YAML document that does not parse.
@@ -896,6 +911,25 @@ mod tests {
     }
 
     /// The whole point of the golden image: a session must not install anything.
+    /// A restricted session carries one more `write_files` entry, and the ruleset inside it has
+    /// braces and semicolons of its own. Unparsed cloud-init fails *silently* — the VM boots and
+    /// the command never runs — so the restricted document needs its own case.
+    #[test]
+    fn restricted_session_cloud_init_parses() {
+        let dirs = [PathBuf::from("/home/u/proj")];
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), &build_lockdown(Some(45678)));
+        let config = build_claude_config(&plan.folders, "sk-ant-test");
+        let creds = vec![(".claude/.credentials.json".to_string(), "{\"t\":1}".to_string())];
+        let yaml = build_cloud_init(&plan, "claude", "", &config, &creds, Some(45678));
+
+        let parsed = YamlLoader::load_from_str(&yaml);
+        assert!(parsed.is_ok(), "{:?}\n---\n{}", parsed.err(), yaml);
+
+        // And the ruleset has to have actually survived into the document, not just parsed.
+        assert!(yaml.contains("/etc/geli/egress.nft"));
+        assert!(yaml.contains("tcp dport 45678 accept"));
+    }
+
     #[test]
     fn session_cloud_init_installs_nothing() {
         let yaml = session_cloud_init(&["/home/u/proj"], "/home/u/proj", "claude");
@@ -1182,7 +1216,7 @@ mod tests {
             build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]),
             build_terminal_setup("screen-256color", "truecolor", Some((24, 100)))
         );
-        let yaml = build_cloud_init(&plan, "claude", &env, "{}", &[]);
+        let yaml = build_cloud_init(&plan, "claude", &env, "{}", &[], None);
 
         assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
         assert!(yaml.contains("screen-256color"));
@@ -1254,7 +1288,7 @@ mod tests {
             ".claude/.credentials.json".to_string(),
             r#"{"claudeAiOauth":{"accessToken":"tok","refreshToken":"ref"}}"#.to_string(),
         )];
-        let yaml = build_cloud_init(&plan, "claude", "", "{}", &creds);
+        let yaml = build_cloud_init(&plan, "claude", "", "{}", &creds, None);
 
         assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
         assert!(yaml.contains("/home/sandbox/.claude/.credentials.json"));
@@ -1303,7 +1337,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let dirs = [PathBuf::from("/home/u/proj"), PathBuf::from("/home/u/api")];
-        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), &build_lockdown(true));
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), &build_lockdown(Some(45678)));
         let env = format!(
             "{}\n{}\n{}",
             build_env_exports(&[("ANTHROPIC_API_KEY", "sk-fixed".to_string())]),
@@ -1315,14 +1349,15 @@ mod tests {
 
         let files: Vec<(&str, String)> = vec![
             ("base.cloud-init.yaml", build_base_cloud_init(1000)),
-            ("session.cloud-init.yaml", build_cloud_init(&plan, "claude", &env, &config, &creds)),
+            ("session.cloud-init.yaml", build_cloud_init(&plan, "claude", &env, &config, &creds, Some(45678))),
             ("setup.sh", base_setup_script(1000)),
             ("verify.sh", base_verify_script()),
             ("profile.sh", LOGIN_PROFILE.to_string()),
             ("autologin.sh", AUTOLOGIN_HELPER.to_string()),
             ("mounts.sh", plan.script.clone()),
             ("claude.json", config.clone()),
-            ("lockdown.sh", build_lockdown(true)),
+            ("lockdown.sh", build_lockdown(Some(45678))),
+            ("egress.nft", build_egress_ruleset(45678)),
         ];
         // One per agent: a layer recipe is the only place an agent's install reaches the guest.
         let mut files = files;
@@ -1466,19 +1501,59 @@ mod tests {
         assert!(!env.contains("10.0.2.100"));
     }
 
-    /// Both halves of the lockdown are load-bearing. Dropping the route cuts egress; narrowing
-    /// sudo is what stops the agent — root in the guest by default — from adding it back.
+    /// All three parts of the lockdown are load-bearing. Dropping the route cuts what is off-link;
+    /// the ruleset cuts what is still on-link, DNS above all; narrowing sudo is what stops the
+    /// agent — root in the guest by default — from undoing either.
     #[test]
-    fn lockdown_cuts_the_route_and_takes_away_root() {
-        assert_eq!(build_lockdown(false), "", "an open session must not be touched");
+    fn lockdown_cuts_the_route_the_resolver_and_root() {
+        assert_eq!(build_lockdown(None), "", "an open session must not be touched");
 
-        let locked = build_lockdown(true);
+        let locked = build_lockdown(Some(45678));
         assert!(locked.contains("ip route del default"));
+        assert!(locked.contains("nft -f /etc/geli/egress.nft"));
         assert!(locked.contains("NOPASSWD: /sbin/poweroff"));
         assert!(
             !locked.contains("NOPASSWD: ALL"),
             "leaving blanket sudo would let the agent undo the route"
         );
+
+        // The status block has already told the user egress is restricted by the time this runs.
+        // Carrying on with an unapplied ruleset would make that a lie, so it has to be fatal.
+        let fail = locked.find("if ! nft -f").expect("the ruleset must be applied conditionally");
+        let off = locked.find("poweroff -f").expect("a failed ruleset must stop the session");
+        assert!(fail < off);
+    }
+
+    /// Sudo is narrowed *after* the route and the ruleset, because the agent is root until then.
+    /// Narrowing first would leave the two steps that matter running with less privilege than
+    /// they need; narrowing last is what makes them stick.
+    #[test]
+    fn lockdown_takes_privilege_away_last() {
+        let locked = build_lockdown(Some(45678));
+        let route = locked.find("ip route del default").unwrap();
+        let nft = locked.find("nft -f").unwrap();
+        let sudo = locked.find("NOPASSWD: /sbin/poweroff").unwrap();
+        assert!(route < sudo && nft < sudo);
+    }
+
+    /// The ruleset's whole allowance is one TCP port on the host alias. A rule naming the host
+    /// without the port would be a tunnel out through anything else listening there.
+    #[test]
+    fn egress_ruleset_opens_only_the_proxy_port() {
+        let rules = build_egress_ruleset(45678);
+        assert!(rules.contains("policy drop"));
+        assert!(rules.contains("ip daddr 10.0.2.2 tcp dport 45678 accept"));
+        assert!(rules.contains(r#"oifname "lo" accept"#), "the agent's own loopback must survive");
+
+        // The resolver is the reason this file exists; it must not appear as an accept rule.
+        for line in rules.lines().filter(|l| l.trim_start().starts_with("ip daddr")) {
+            assert!(!line.contains(GUEST_DNS), "the resolver must not be reachable: {}", line);
+        }
+        // `inet`, not `ip`: a v4-only table would leave IPv6 egress wide open.
+        assert!(rules.contains("table inet geli"));
+
+        assert_eq!(build_egress_entry(None), "", "an open session gets no policy file at all");
+        assert!(build_egress_entry(Some(45678)).contains("/etc/geli/egress.nft"));
     }
 
     /// The lockdown has to be in place before the agent runs, and the readiness marker is what
@@ -1488,11 +1563,13 @@ mod tests {
         let plan = build_mount_script(
             &[PathBuf::from("/home/u/proj")],
             Path::new("/home/u/proj"),
-            &build_lockdown(true),
+            &build_lockdown(Some(45678)),
         );
-        let route = plan.script.find("ip route del default").expect("no lockdown");
         let ready = plan.script.find(READY_MARKER).expect("no ready marker");
-        assert!(route < ready, "the agent could run before egress was cut");
+        for step in ["ip route del default", "nft -f /etc/geli/egress.nft", "/sbin/poweroff"] {
+            let at = plan.script.find(step).unwrap_or_else(|| panic!("no {} in the script", step));
+            assert!(at < ready, "the agent could run before `{}`", step);
+        }
     }
 
     #[test]

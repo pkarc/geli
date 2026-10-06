@@ -144,14 +144,14 @@ What it costs, measured with `du` on the real images:
 | | |
 |---|---|
 | Alpine cloud image | 185 MB |
-| `geli-base.qcow2` | 130 MB |
-| `geli-layer-claude.qcow2` | 245 MB |
+| `geli-base.qcow2` | 132 MB |
+| `geli-layer-claude.qcow2` | 247 MB |
 | `geli-layer-opencode.qcow2` | 206 MB |
 | `geli-layer-agy.qcow2` | 377 MB |
 
-So `geli claude` on a fresh install costs 560 MB all in, against 1,107 MB for the single image
+So `geli claude` on a fresh install costs 564 MB all in, against 1,107 MB for the single image
 that held all three agents. **The saving is in the common case, not the total**: all three layers
-together come to 958 MB, about 4% *more* than the 922 MB one-image build, because each layer pays
+together come to 962 MB, about 4% *more* than the 922 MB one-image build, because each layer pays
 its own qcow2 and npm overhead. What changes is that you no longer pay for OpenCode and
 Antigravity to run Claude Code — and that a tenth agent costs the people who do not use it
 nothing.
@@ -298,8 +298,18 @@ A project can add its own in `.geli.json`:
 { "workspace": "acme", "allow": ["registry.internal.example"] }
 ```
 
-A proxy inside geli resolves and filters on the host; the guest's default route is deleted so the
-proxy is the only way out. Blocked attempts are logged and summarised when the session ends:
+A proxy inside geli resolves and filters on the host, and three things in the guest make it the
+only way out. They run as root, in `mounts.sh`, before the agent starts:
+
+1. **the default route is deleted**, so nothing off-link is reachable by name or by IP;
+2. **an nftables ruleset drops all egress** except TCP to the proxy's port — which is what closes
+   what the route deletion leaves behind, slirp's on-link DNS resolver above all;
+3. **the agent's `sudo` is narrowed to `poweroff`**, so it cannot undo either of the first two.
+
+If the ruleset cannot be applied, the session powers off instead of running your command. By then
+the status block has already said egress is restricted, and running anyway would make that a lie.
+
+Blocked attempts are logged and summarised when the session ends:
 
 ```
 geli · net: 14 allowed, 9 blocked (http-intake.logs.us5.datadoghq.com, mcp-proxy.anthropic.com)
@@ -317,11 +327,12 @@ and the agent, so project dependencies installed as the user are unaffected.
 - **An allowed destination is still a way out.** With `github.com` reachable, an agent can push to
   a gist. The allowlist stops an *arbitrary* server from being reached; it does not make the data
   unable to leave.
-- **DNS queries still resolve.** slirp's resolver sits on the same subnet as the proxy, so names
-  remain a slow, noisy channel out. Closing it needs a packet filter in the image.
+- **Anything that ignores proxy variables loses the network entirely** — see below. That is the
+  cost of a default-drop policy, and it is the intended shape: unreachable rather than
+  unsupervised.
 - **Anything that ignores proxy variables loses the network entirely**: `git` over SSH, `ping`,
-  raw sockets, and busybox `wget` (which sends plaintext absolute-form requests a CONNECT proxy
-  correctly refuses). `npm`, `pip` and `git` over HTTPS all work.
+  raw sockets, DNS, and busybox `wget` (which sends plaintext absolute-form requests a CONNECT
+  proxy correctly refuses). `npm`, `pip` and `git` over HTTPS all work.
 
 ## Security notes
 
@@ -409,15 +420,15 @@ Done:
 7. ~~Recipes as data~~ — one TOML file per agent, no Rust
 8. ~~A qcow2 layer per agent~~ — the base image carries no agent; each one is a cached layer
 9. ~~CI~~ — `check` on every push; `image` builds the affected layers and runs a real session
+10. ~~Close the DNS channel~~ — an nftables default-drop ruleset; `nslookup` against slirp's
+    resolver went from answering to failing
 
 Next:
 
-10. **Let one session carry several agents.** The layer chain already supports it —
+11. **Let one session carry several agents.** The layer chain already supports it —
     `geli-layer-claude+opencode.qcow2` is a layer on `geli-layer-claude.qcow2`, keyed by the
     sorted set — but nothing asks for more than the invoked agent yet. The open question is
     credentials: today only the invoked agent's travel, and an agent you asked to have in the VM
     but whose credential stays out is not obviously useful.
-11. **Close the DNS channel.** `--restrict-net` leaves slirp's resolver reachable, so names are
-    still a slow way out. Needs a packet filter in the image.
 12. Optional KVM, for hosts without hardware virtualization.
 13. Trim the 4 GB RAM ceiling — the guest uses 476 MB.
