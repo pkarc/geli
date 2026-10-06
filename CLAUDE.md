@@ -50,9 +50,15 @@ download of a binary; nothing but a scheduled build finds that.
 The per-agent layer is what makes this affordable. A PR touching one recipe builds one layer, so a
 broken or outdated recipe is one red job rather than an image nobody can finish building.
 
-**`cargo fmt --check` is deliberately not a gate.** This code is laid out by hand in places
-rustfmt would undo. If that changes, reformat in one commit of its own rather than hiding it in
-another change.
+**Do not run `cargo fmt`, and `cargo fmt --check` is deliberately not a gate.** The layout here is
+deliberate: some expressions are split so they read in one glance — the aligned `||` in
+`has_credentials`, for instance — and rustfmt cannot tell a meaningful break from an accidental
+one. Measured, so the choice is not folklore: with no `rustfmt.toml` a bare `cargo fmt` touches
+622 lines (+489/−133), mostly exploding method chains one call per line; `max_width = 100` with
+`use_small_heuristics = "Max"` is the least invasive at 287 (+124/−163). Neither changes
+behaviour — stripping whitespace leaves the files identical apart from redundant closure braces
+and the order of `mod`/`use` declarations — but neither reads better either. Match the surrounding
+code by hand. If this is ever revisited, it is one commit of nothing but formatting.
 
 **A recipe's `install` is arbitrary root shell, and `image` runs it.** That is the point, and it is
 also why the workflow uses `pull_request` and never `pull_request_target`: a fork's job gets a
