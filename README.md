@@ -482,9 +482,15 @@ Done:
 
 Next:
 
-13. **Let one session carry several agents.** The layer chain already supports it —
-    `geli-layer-claude+opencode.qcow2` is a layer on `geli-layer-claude.qcow2`, keyed by the
-    sorted set — but nothing asks for more than the invoked agent yet. The open question is
-    credentials: today only the invoked agent's travel, and an agent you asked to have in the VM
-    but whose credential stays out is not obviously useful.
+13. **macOS and Windows.** `execute_sandbox` is `#[cfg]`-gated and only the Linux implementation
+    exists; the others print "not yet implemented". This is the largest limitation geli has left.
+14. **`geli --prune`.** Cleaning up images no live chain references is manual today. geli says
+    when it spots a pre-layers image but does not remove it.
+
+Rejected, with the reasoning written down rather than left to be re-litigated:
+
+- [Reusing a running VM instead of starting one](docs/plans/04-reutilizar-vm.md) — credential
+  isolation, the egress policy and the mounted set are per-VM properties by construction.
+- [Several agents in one VM](docs/plans/05-varios-agentes-por-vm.md) — no application, and it
+  forced a credentials decision with no obviously right answer.
 
