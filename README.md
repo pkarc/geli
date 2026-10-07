@@ -124,6 +124,7 @@ one, so you only pay for the ones you actually run:
 | `geli-base.recipe`, `geli-layer-<agents>.recipe` | Hash of the recipe each was built from. |
 | `geli-vmlinuz`, `geli-initramfs` | Kernel and initramfs handed out by the base build. Sessions boot these directly, skipping firmware and bootloader. |
 | `geli-base.meta`, `geli-layer-<agents>.meta` | The kernel command line, and the version each image added. |
+| `geli-base.log`, `geli-layer-<agents>.log` | Console log of each build. One per image: builds truncate what they write to, so a shared file left only the last one. |
 
 So the chain is **cloud image ← base ← agent layer ← session**, and a session is a throwaway
 overlay on top. QEMU boots `geli-vmlinuz` directly rather than going through firmware and a

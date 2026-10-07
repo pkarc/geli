@@ -25,7 +25,17 @@ pub(crate) const CLOUD_IMAGE_NAME: &str = "nocloud_alpine-3.22.2-x86_64-bios-clo
 pub(crate) const BASE_IMAGE_NAME: &str = "geli-base.qcow2";
 pub(crate) const BASE_RECIPE_NAME: &str = "geli-base.recipe";
 pub(crate) const BASE_META_NAME: &str = "geli-base.meta";
-pub(crate) const BUILD_LOG_NAME: &str = "geli-build.log";
+/// One console log per image, not one per run.
+///
+/// A single shared log meant `--build-image --agents a,b,c` ended with only `c`'s console, because
+/// each build truncates the file it writes to. The failing build survived — it is the last one, and
+/// the process stops there — but every successful one before it was gone, and CI uploaded the
+/// incomplete remainder as its only evidence.
+pub(crate) const BASE_LOG_NAME: &str = "geli-base.log";
+
+pub(crate) fn layer_log_name(key: &str) -> String {
+    format!("geli-layer-{}.log", key)
+}
 pub(crate) const KERNEL_NAME: &str = "geli-vmlinuz";
 pub(crate) const INITRD_NAME: &str = "geli-initramfs";
 /// What `--build-image` wrote before images were layered. Only used to recognise it and say so.
