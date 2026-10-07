@@ -192,6 +192,27 @@ Each invocation:
 `~/.cache/geli-sandbox/{npm,pip}` is mounted into the guest so package downloads survive across
 sessions.
 
+### Running several at once
+
+Each invocation is its own VM — three tmux panes are three QEMU processes, not three shells in one
+machine. That is deliberate, and [docs/plans/04-reutilizar-vm.md](docs/plans/04-reutilizar-vm.md)
+records why reusing a running VM was rejected: credential isolation, the egress policy and the
+mounted set are all per-VM properties today, and sharing a VM gives them all up to save ten
+seconds.
+
+It costs less than the `-m 2G` ceiling suggests. Measured with three concurrent `claude` sessions:
+373, 351 and 343 MB of QEMU resident size, **1,071 MB for all three**.
+
+Concurrent sessions do not interfere: everything per-session is keyed by the host pid and the
+proxy takes an ephemeral port. The one exception used to be layer building — two panes starting
+the same agent for the *first* time raced for the same files, and one died with a bare
+`Error: Os { code: 2 }`. There is now a lock per image: one builds, the others wait and then find
+the layer ready. If the process holding the lock dies, the next run says so and takes over.
+
+Still unmeasured: `~/.cache/geli-sandbox/{npm,pip}` is one 9p share across concurrent guests, and
+npm is not gentle with concurrent access to its cache. Nothing has gone wrong, but nothing has
+been tested with two sessions installing packages at once either.
+
 ### Environment
 
 | Variable | Effect |
