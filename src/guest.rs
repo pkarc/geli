@@ -49,11 +49,11 @@ pub(crate) fn base_setup_script(host_uid: u32) -> String {
     )
 }
 
-/// Provisioning for one agent's qcow2 layer, run on top of the base image or another layer.
+/// Provisioning for one agent's qcow2 layer, run on top of the base image.
 ///
-/// One agent per layer, deliberately: a layer that installed two could not be reused by a
-/// session that wants only one of them, which is the whole reason the chain exists.
-pub(crate) fn agent_layer_script(agent: &Agent, host_uid: u32, key: &str) -> String {
+/// One agent per layer, and one layer per session: a layer that installed two could not be reused
+/// by a session wanting only one of them, which is the whole reason layers exist.
+pub(crate) fn agent_layer_script(agent: &Agent, host_uid: u32) -> String {
     recipe(
         include_str!("guest/layer.sh"),
         &[
@@ -65,21 +65,10 @@ pub(crate) fn agent_layer_script(agent: &Agent, host_uid: u32, key: &str) -> Str
             ("@HOST_UID@", &host_uid.to_string()),
             ("@MOUNT_OPTS@", MOUNT_OPTS),
             ("@OUT_TAG@", BUILD_OUT_TAG),
-            ("@META@", &layer_meta_name(key)),
+            ("@META@", &layer_meta_name(&agent.command)),
             ("@OK_MARKER@", BUILD_OK_MARKER),
         ],
     )
-}
-
-/// The ordered set of agents a chain carries, as it appears in every layer filename.
-///
-/// Sorted, so a session asking for `opencode claude` reuses the chain built for `claude
-/// opencode` instead of building a second one that differs only in order.
-pub(crate) fn layer_key(commands: &[String]) -> String {
-    let mut sorted: Vec<&str> = commands.iter().map(String::as_str).collect();
-    sorted.sort_unstable();
-    sorted.dedup();
-    sorted.join("+")
 }
 
 /// 9p tag the build VM uses to hand the kernel, initramfs and metadata back to the host.
@@ -466,10 +455,10 @@ pub(crate) fn build_base_cloud_init(host_uid: u32) -> String {
 }
 
 /// cloud-config that turns a copy-on-write layer into "the base image plus one agent".
-pub(crate) fn build_layer_cloud_init(agent: &Agent, host_uid: u32, key: &str) -> String {
+pub(crate) fn build_layer_cloud_init(agent: &Agent, host_uid: u32) -> String {
     recipe(
         include_str!("guest/layer.yaml"),
-        &[("@LAYER@", &indent_block(&agent_layer_script(agent, host_uid, key), 6))],
+        &[("@LAYER@", &indent_block(&agent_layer_script(agent, host_uid), 6))],
     )
 }
 

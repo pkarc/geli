@@ -5,10 +5,11 @@ que ya está corriendo». Esta es «una VM que lleve dentro más de un agente».
 
 ## Qué era, y qué no
 
-No era «implementar capas combinadas». Eso ya está: `layer_key` ordena los nombres y los une con
-`+`, y `resolve_chain` recorre los prefijos construyendo una capa por agente. Si algo pidiera
-`[claude, agy]` construiría `geli-layer-agy` y encima `geli-layer-agy+claude`, y la sesión vería
-los dos binarios.
+No era «implementar capas combinadas». Eso ya estaba: `layer_key` ordenaba los nombres y los unía
+con `+`, y `resolve_chain` recorría los prefijos construyendo una capa por agente. Si algo hubiera
+pedido `[claude, agy]` habría construido `geli-layer-agy` y encima `geli-layer-agy+claude`, y la
+sesión vería los dos binarios. Nada lo pidió nunca, y al tomar esta decisión esa maquinaria se
+quitó — ver más abajo.
 
 Lo que faltaba era **una forma de pedirlo** —algo como `geli --with agy claude`— porque
 `agent_for_command` mira la primera palabra del comando y devuelve un solo agente. La cadena
@@ -46,13 +47,21 @@ dentro. Con `--with agy` hay que elegir:
 Ninguna de las dos es mala por sí sola, pero no hay una obviamente correcta, y pagar esa decisión
 por una función sin aplicación clara es el orden equivocado.
 
-## Lo que queda en el código
+## El código, ya limpiado
 
-La maquinaria de apilado sigue ahí y es correcta, pero inalcanzable: nada llamará nunca a
-`resolve_chain` con más de un agente. Son unas quince líneas de generalidad no ejercitada —
-`layer_key` ordenando y deduplicando, el bucle sobre prefijos, y el test
-`layer_key_is_the_set_not_the_order` que comprueba un comportamiento que ningún camino usa.
+La maquinaria de apilado se quitó en el mismo momento de tomar la decisión, en vez de dejarla como
+generalidad inalcanzable. Código que *parece* ejercitado y no lo está es una trampa para quien
+venga después.
 
-Es deuda pequeña y vale señalarla: código que *parece* ejercitado y no lo está es una trampa para
-quien venga después. Si se decide limpiarla, `resolve_chain` pasa a tomar `Option<&Agent>` y queda
-lineal.
+| antes | ahora |
+|---|---|
+| `resolve_chain(dir, &[&Agent])` recorriendo prefijos | `resolve_image(dir, Option<&Agent>)`, lineal |
+| `layer_key()` ordenando, deduplicando y uniendo con `+` | eliminada; el nombre de la capa es el comando del agente |
+| `ensure_layer(..., key, ...)` | sin `key`: lo deriva de `agent.command`, así que no hay dos fuentes que puedan discrepar |
+| `build_layer_cloud_init(agent, uid, key)` | `build_layer_cloud_init(agent, uid)` |
+| test `layer_key_is_the_set_not_the_order` | eliminado: comprobaba un comportamiento que ningún camino usaba |
+
+Probado con la disciplina habitual del repo: `dump_generated_documents` antes y después del
+refactor, **13 documentos del invitado byte a byte idénticos**. Y las tres rutas verificadas en
+vivo — un agente sobre su capa, un comando que no es agente sobre la base sin agentes, y una capa
+ausente que se construye sola en el primer uso.
