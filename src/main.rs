@@ -397,6 +397,10 @@ fn layer_hash(parent_hash: &str, recipe: &str) -> String {
 /// Build the qcow2 layer for `agent` on top of `parent`, if it is missing or stale.
 ///
 /// Returns the layer's path and its recipe hash, so the next agent in the chain can stack on it.
+///
+/// Safe to run from several shells at once, which matters because layers are built on *first use*:
+/// two tmux panes starting the same agent for the first time is the ordinary way to hit this. One
+/// takes the lock and builds; the others wait and then find the layer already there.
 #[cfg(target_os = "linux")]
 fn ensure_layer(
     dir: &Path,
@@ -410,13 +414,37 @@ fn ensure_layer(
 
     let target = dir.join(layer_image_name(key));
     let recipe_path = dir.join(layer_recipe_name(key));
-    let recorded = fs::read_to_string(&recipe_path).unwrap_or_default();
+    let lock_path = dir.join(layer_lock_name(key));
 
-    if target.exists() && recorded.trim() == hash {
-        return Ok((target, hash));
-    }
+    // Checked inside the loop, not before it: a waiter's whole purpose is to re-read this after
+    // the other process has published its work.
+    let current = || {
+        target.exists()
+            && fs::read_to_string(&recipe_path).unwrap_or_default().trim() == hash
+    };
 
-    let pending = dir.join(format!("{}.building", layer_image_name(key)));
+    let _lock = loop {
+        if current() {
+            return Ok((target, hash));
+        }
+        match try_build_lock(&lock_path)? {
+            Some(lock) => break lock,
+            None => {
+                if !wait_for_builder(&lock_path, &agent.command, std::time::Duration::from_secs(1800)) {
+                    eprintln!(
+                        "\n[!] Gave up waiting for another geli to build the {} layer.",
+                        agent.command
+                    );
+                    eprintln!("    If nothing is building, remove {}", lock_path.display());
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
+    // Keyed by pid as well as by image. The lock already makes a collision impossible, but a
+    // shared path meant a crashed build left a file the next one would silently build on top of.
+    let pending = dir.join(format!("{}.building.{}", layer_image_name(key), std::process::id()));
     let log_path = dir.join(layer_log_name(key));
     let _ = fs::remove_file(&pending);
     create_overlay(parent, &pending, None)?;
@@ -1844,6 +1872,57 @@ mod tests {
         let sync = LOGIN_PROFILE.find("\n        sync\n").expect("no sync before poweroff");
         let off = LOGIN_PROFILE.find("sudo poweroff -f").expect("not a forced poweroff");
         assert!(sync < off, "sync must run before power is cut");
+    }
+
+    /// Layers are built on first use, so two shells starting the same agent race for the same
+    /// files. Measured before the lock existed: two `geli agy` a second apart, and the second
+    /// deleted the first's half-built overlay and died with a bare `Error: Os { code: 2 }`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_one_process_may_build_an_image() {
+        let lock = std::env::temp_dir().join(format!("geli-lock-test-{}", std::process::id()));
+        let _ = fs::remove_file(&lock);
+
+        let first = try_build_lock(&lock).unwrap();
+        assert!(first.is_some(), "the first caller must get the lock");
+        assert!(
+            try_build_lock(&lock).unwrap().is_none(),
+            "a second caller must be told to wait, not handed the same lock"
+        );
+        assert!(lock_holder_alive(&lock), "this process holds it and is plainly alive");
+
+        // Dropping is what releases it, which is what covers every early return in ensure_layer.
+        drop(first);
+        assert!(!lock.exists(), "the lock must not outlive its guard");
+        assert!(try_build_lock(&lock).unwrap().is_some(), "and must be retakeable afterwards");
+        let _ = fs::remove_file(&lock);
+    }
+
+    /// A build killed mid-flight cannot leave a lock that blocks every later run: `process::exit`
+    /// skips the guard's `Drop`, so the holder's pid in the file is the only way to tell "still
+    /// building" from "died holding this".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lock_whose_holder_died_is_not_held() {
+        let lock = std::env::temp_dir().join(format!("geli-stale-test-{}", std::process::id()));
+
+        // pid 1 is always alive; a pid this high is not in use on Linux.
+        fs::write(&lock, "1\n").unwrap();
+        assert!(lock_holder_alive(&lock));
+
+        fs::write(&lock, "4294967290\n").unwrap();
+        assert!(!lock_holder_alive(&lock), "a dead holder must not hold the lock forever");
+
+        // An unreadable lock is treated as held rather than stolen — the cautious direction.
+        fs::write(&lock, "written by something older\n").unwrap();
+        assert!(lock_holder_alive(&lock));
+
+        // And waiting on a lock whose holder is gone clears it and returns, rather than timing out.
+        fs::write(&lock, "4294967290\n").unwrap();
+        assert!(wait_for_builder(&lock, "test", std::time::Duration::from_secs(5)));
+        assert!(!lock.exists(), "the stale lock must be cleared, not merely stepped over");
+
+        let _ = fs::remove_file(&lock);
     }
 
     /// Every image gets its own console log. They shared one, and since each build truncates the

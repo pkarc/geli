@@ -36,6 +36,86 @@ pub(crate) const BASE_LOG_NAME: &str = "geli-base.log";
 pub(crate) fn layer_log_name(key: &str) -> String {
     format!("geli-layer-{}.log", key)
 }
+
+pub(crate) fn layer_lock_name(key: &str) -> String {
+    format!("geli-layer-{}.building.lock", key)
+}
+
+/// Proof that this process, and no other, is the one building a given image.
+///
+/// Images are built on first use, so two shells starting the same agent for the first time race
+/// for the same files. Measured before this existed: two `geli agy` a second apart, and the second
+/// deleted the first's half-built overlay, then died with a bare `Error: Os { code: 2 }`. Exactly
+/// what two tmux panes do.
+///
+/// Released on drop, which covers every early return — but *not* `process::exit`, which a failed
+/// build takes. That is why the holder's pid goes in the file: a waiter can tell "still building"
+/// from "died holding this".
+pub struct BuildLock {
+    path: PathBuf,
+}
+
+impl Drop for BuildLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// `Some(lock)` means go ahead and build. `None` means someone else got there first.
+pub fn try_build_lock(path: &Path) -> io::Result<Option<BuildLock>> {
+    match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            // Best effort: the pid is for diagnosing a stale lock, not for correctness. The
+            // exclusivity is `create_new`, which is atomic.
+            let _ = writeln!(file, "{}", std::process::id());
+            Ok(Some(BuildLock { path: path.to_path_buf() }))
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether the process named in a lock file is still alive. A lock nobody holds is a leftover from
+/// a build that was killed, and refusing to build again because of it would be worse than the race
+/// this is all here to prevent.
+pub fn lock_holder_alive(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        // The file vanished between the two calls: whoever held it is done, which is not "alive".
+        return false;
+    };
+    match text.trim().parse::<u32>() {
+        Ok(pid) => Path::new(&format!("/proc/{}", pid)).exists(),
+        // An unreadable lock is treated as held: a geli too old to write a pid may be building.
+        Err(_) => true,
+    }
+}
+
+/// Wait out another geli's build of the same image.
+///
+/// Returns when the lock is gone — either the build finished, or its holder died and the lock was
+/// cleared here. The timeout is generous because the thing being waited on is a real image build:
+/// Antigravity's layer takes about three minutes on this hardware.
+pub fn wait_for_builder(lock: &Path, label: &str, timeout: Duration) -> bool {
+    if !lock.exists() {
+        return true;
+    }
+
+    eprintln!("[*] Another geli is building the {} layer. Waiting for it.", label);
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        if !lock.exists() {
+            return true;
+        }
+        if !lock_holder_alive(lock) {
+            eprintln!("[*] That build died without finishing. Taking over.");
+            let _ = fs::remove_file(lock);
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
+}
 pub(crate) const KERNEL_NAME: &str = "geli-vmlinuz";
 pub(crate) const INITRD_NAME: &str = "geli-initramfs";
 /// What `--build-image` wrote before images were layered. Only used to recognise it and say so.
