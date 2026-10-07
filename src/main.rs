@@ -326,7 +326,7 @@ fn build_base_image(dir: &Path) -> io::Result<()> {
     let recipe = build_base_cloud_init(host_uid());
     let target = dir.join(BASE_IMAGE_NAME);
     let pending = dir.join(format!("{}.building", BASE_IMAGE_NAME));
-    let log_path = dir.join(BUILD_LOG_NAME);
+    let log_path = dir.join(BASE_LOG_NAME);
 
     create_overlay(&cloud_img, &pending, Some(SANDBOX_DISK_SIZE))?;
 
@@ -366,8 +366,10 @@ fn build_base_image(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Remove every agent layer. Called when the base image is rebuilt, since a layer's backing file
-/// is gone at that point.
+/// Remove every agent layer — image, recipe, metadata and console log alike. Called when the base
+/// image is rebuilt, since a layer's backing file is gone at that point, and a log describing an
+/// image that no longer exists is worse than no log. Safe to run here: it happens after the base
+/// build and before any layer build, so it never deletes a log that was just written.
 #[cfg(target_os = "linux")]
 fn discard_layers(dir: &Path) -> io::Result<usize> {
     let mut dropped = 0;
@@ -415,7 +417,7 @@ fn ensure_layer(
     }
 
     let pending = dir.join(format!("{}.building", layer_image_name(key)));
-    let log_path = dir.join(BUILD_LOG_NAME);
+    let log_path = dir.join(layer_log_name(key));
     let _ = fs::remove_file(&pending);
     create_overlay(parent, &pending, None)?;
 
@@ -1842,6 +1844,29 @@ mod tests {
         let sync = LOGIN_PROFILE.find("\n        sync\n").expect("no sync before poweroff");
         let off = LOGIN_PROFILE.find("sudo poweroff -f").expect("not a forced poweroff");
         assert!(sync < off, "sync must run before power is cut");
+    }
+
+    /// Every image gets its own console log. They shared one, and since each build truncates the
+    /// file it writes, `--build-image --agents a,b` ended holding only `b`'s console — CI then
+    /// uploaded that remainder as the run's only evidence.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_image_logs_to_its_own_file() {
+        let names = [
+            BASE_LOG_NAME.to_string(),
+            layer_log_name("claude"),
+            layer_log_name("opencode"),
+            layer_log_name("claude+opencode"),
+        ];
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "two builds would overwrite each other: {:?}", names);
+
+        // `discard_layers` sweeps `geli-layer-*`, so a layer's log has to be caught by it too —
+        // otherwise rebuilding the base leaves logs describing images that are gone.
+        for name in names.iter().filter(|n| *n != BASE_LOG_NAME) {
+            assert!(name.starts_with("geli-layer-"), "{} escapes discard_layers", name);
+        }
+        assert!(!BASE_LOG_NAME.starts_with("geli-layer-"), "the base log must survive that sweep");
     }
 
     /// `-cpu host` is a KVM-only model, so the accelerator and the CPU model have to move

@@ -173,14 +173,15 @@ jobs:
           test -z "$(./target/release/geli which claude)" \
             || { echo "::error::an agent leaked into the base image"; exit 1; }
 
-      # The console log is the only account of why a build failed, and upload-artifact does not
-      # expand `~`, so it has to be copied into the workspace first.
-      - name: Keep the build log
+      # The console logs are the only account of why a build failed, and upload-artifact does not
+      # expand `~`, so they have to be copied into the workspace first. All of them: there is one
+      # per image now, and a run that builds two layers has two to explain.
+      - name: Keep the build logs
         if: always()
-        run: cp ~/qemu-sandbox/geli-build.log . || true
+        run: mkdir -p build-logs && cp ~/qemu-sandbox/*.log build-logs/ || true
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: build-log
-          path: geli-build.log
+          name: build-logs
+          path: build-logs/
           if-no-files-found: ignore
