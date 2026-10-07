@@ -405,11 +405,13 @@ fn layer_hash(parent_hash: &str, recipe: &str) -> String {
 fn ensure_layer(
     dir: &Path,
     agent: &Agent,
-    key: &str,
     parent: &Path,
     parent_hash: &str,
 ) -> io::Result<(PathBuf, String)> {
-    let recipe = build_layer_cloud_init(agent, host_uid(), key);
+    // Every name this layer owns comes from the agent's command, so there is no separate key that
+    // could disagree with the agent being installed.
+    let key = agent.command.as_str();
+    let recipe = build_layer_cloud_init(agent, host_uid());
     let hash = layer_hash(parent_hash, &recipe);
 
     let target = dir.join(layer_image_name(key));
@@ -473,31 +475,34 @@ fn ensure_layer(
     Ok((target, hash))
 }
 
-/// The image a session should overlay, building whatever is missing.
+/// The image a session should overlay: the invoked agent's layer, built if it is missing, or the
+/// base image when the command is not an agent at all.
 ///
-/// The chain is base ← one layer per agent, in sorted order, each keyed by the agents at and
-/// below it. A session wanting only `claude` reuses the `claude` layer that a `claude+opencode`
-/// chain also sits on, instead of a second copy of the same install.
+/// One agent, deliberately — see `docs/plans/05-varios-agentes-por-vm.md`. This used to walk a
+/// variable-length chain so a session could carry several agents, but nothing ever asked for more
+/// than one, and that design was rejected rather than left pending.
 ///
-/// Also returns the merged metadata: the base's, plus one entry per layer, which is what the
-/// status block prints as the contents of the image.
+/// Also returns the metadata the status block prints as the contents of the image: the base's,
+/// plus the layer's own entry.
 #[cfg(target_os = "linux")]
-fn resolve_chain(dir: &Path, chain: &[&Agent]) -> io::Result<(PathBuf, ImageMeta)> {
+fn resolve_image(dir: &Path, agent: Option<&Agent>) -> io::Result<(PathBuf, ImageMeta)> {
     let base = dir.join(BASE_IMAGE_NAME);
     let mut meta = parse_image_meta(&fs::read_to_string(dir.join(BASE_META_NAME)).unwrap_or_default());
-    let mut image = base;
-    let mut hash = fs::read_to_string(dir.join(BASE_RECIPE_NAME)).unwrap_or_default().trim().to_string();
 
-    let commands: Vec<String> = chain.iter().map(|a| a.command.clone()).collect();
-    for (i, agent) in chain.iter().enumerate() {
-        let key = layer_key(&commands[..=i]);
-        let (layer, layer_hash) = ensure_layer(dir, agent, &key, &image, &hash)?;
-        merge_image_meta(&mut meta, &fs::read_to_string(dir.join(layer_meta_name(&key))).unwrap_or_default());
-        image = layer;
-        hash = layer_hash;
-    }
+    // A command geli does not know gets the base image itself — the cheapest boot there is, and
+    // one with no agent in it at all.
+    let Some(agent) = agent else {
+        return Ok((base, meta));
+    };
 
-    Ok((image, meta))
+    let base_hash = fs::read_to_string(dir.join(BASE_RECIPE_NAME)).unwrap_or_default().trim().to_string();
+    let (layer, _) = ensure_layer(dir, agent, &base, &base_hash)?;
+    merge_image_meta(
+        &mut meta,
+        &fs::read_to_string(dir.join(layer_meta_name(&agent.command))).unwrap_or_default(),
+    );
+
+    Ok((layer, meta))
 }
 
 /// Whether the base image on disk is the one this binary's recipe describes.
@@ -547,7 +552,7 @@ fn build_images(selected: &[String]) -> io::Result<()> {
             );
             continue;
         };
-        resolve_chain(&dir, &[agent])?;
+        resolve_image(&dir, Some(agent))?;
     }
 
     println!("    Sandbox sessions boot its kernel directly, installing nothing.");
@@ -620,8 +625,7 @@ fn execute_sandbox(
     // The base image carries no agent, so the invoked one's layer has to exist before the
     // session can overlay anything. Missing means first use: build it now, once, and say so —
     // this is the only time geli takes minutes instead of seconds.
-    let chain: Vec<&Agent> = agent.into_iter().collect();
-    let (session_backing, meta) = resolve_chain(&images, &chain)?;
+    let (session_backing, meta) = resolve_image(&images, agent)?;
 
     let host_cache_dir = home.join(".cache").join("geli-sandbox");
     let npm_cache = host_cache_dir.join("npm");
@@ -1395,7 +1399,7 @@ mod tests {
             files.push((
                 // Leaked into the loop's lifetime on purpose — this is a dump, not a test.
                 Box::leak(format!("layer.{}.cloud-init.yaml", agent.command).into_boxed_str()),
-                build_layer_cloud_init(agent, 1000, &agent.command),
+                build_layer_cloud_init(agent, 1000),
             ));
         }
         for (name, body) in files {
@@ -1737,18 +1741,6 @@ mod tests {
         assert_eq!(describe_image(&partial), "agy 1.2.16");
     }
 
-    /// Two agents in either order must name the same chain, or the cache stores a copy per
-    /// permutation and the saving the layers exist for disappears.
-    #[test]
-    fn layer_key_is_the_set_not_the_order() {
-        let key = |names: &[&str]| layer_key(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(key(&["claude"]), "claude");
-        assert_eq!(key(&["opencode", "claude"]), "claude+opencode");
-        assert_eq!(key(&["claude", "opencode"]), key(&["opencode", "claude"]));
-        assert_eq!(key(&["claude", "claude"]), "claude");
-        assert_eq!(key(&[]), "");
-    }
-
     /// A layer's recorded hash covers its parent's, so editing one agent's recipe invalidates
     /// that layer and everything stacked above it — and leaves its siblings alone.
     #[cfg(target_os = "linux")]
@@ -1773,7 +1765,7 @@ mod tests {
     #[test]
     fn layer_recipe_installs_one_agent_and_proves_it() {
         let agent = agent_for_command("claude").expect("claude is a shipped recipe");
-        let doc = build_layer_cloud_init(agent, 1000, "claude");
+        let doc = build_layer_cloud_init(agent, 1000);
 
         let parsed = yaml_rust2::YamlLoader::load_from_str(&doc);
         assert!(parsed.is_ok(), "layer cloud-init must parse: {:?}\n---\n{}", parsed.err(), doc);
@@ -1813,7 +1805,7 @@ mod tests {
     fn layer_recipe_clears_the_session_flag_it_inherits() {
         assert!(LOGIN_PROFILE.contains("/tmp/.geli-session-active"));
         let agent = agent_for_command("claude").unwrap();
-        assert!(agent_layer_script(agent, 1000, "claude").contains("rm -f /tmp/.geli-session-active"));
+        assert!(agent_layer_script(agent, 1000).contains("rm -f /tmp/.geli-session-active"));
     }
 
     #[test]
@@ -1935,7 +1927,7 @@ mod tests {
             BASE_LOG_NAME.to_string(),
             layer_log_name("claude"),
             layer_log_name("opencode"),
-            layer_log_name("claude+opencode"),
+            layer_log_name("agy"),
         ];
         let unique: std::collections::HashSet<&String> = names.iter().collect();
         assert_eq!(unique.len(), names.len(), "two builds would overwrite each other: {:?}", names);

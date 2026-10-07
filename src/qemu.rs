@@ -126,11 +126,12 @@ pub(crate) const LEGACY_IMAGE_NAME: &str = "geli-golden.qcow2";
 /// session overlays inherit this size from their backing file.
 pub(crate) const SANDBOX_DISK_SIZE: &str = "20G";
 
-/// Filenames for the layer holding `key` — the chain of agents, in order, joined by `+`.
+/// Filenames for one agent's layer. `key` is the agent's command, which is also the whole cache:
+/// `geli claude` looks for `geli-layer-claude.qcow2` and builds it if it is not there.
 ///
-/// The key is the whole cache: `claude` is a layer on the base image, `claude+opencode` a layer
-/// on *that*, and a session asking for both reuses the first. Agents are sorted before the key
-/// is built, so the same set always names the same chain rather than one per permutation.
+/// Layers are siblings on the base image, never stacked on each other — see
+/// `docs/plans/05-varios-agentes-por-vm.md`. Running `claude` and later `agy` leaves two
+/// independent layers, and neither VM holds the other's agent.
 pub(crate) fn layer_image_name(key: &str) -> String {
     format!("geli-layer-{}.qcow2", key)
 }
