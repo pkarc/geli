@@ -63,6 +63,8 @@ a minute or two. Every run after that starts in seconds.
 
 ```bash
 geli <command> [args...]    # run a command inside the sandbox
+geli --ssh <cmd>            # forward host SSH keys for git operations
+geli --ssh-key <path> <cmd> # forward a specific SSH private key
 geli --restrict-net <cmd>   # let the sandbox reach only an allowlist of hosts
 geli --list                 # show the workspace registry
 geli --build-image          # build the base image if it is missing or stale
@@ -342,6 +344,26 @@ files you did not give it, and a credential is not one of those. If you would ra
 One caveat: the copy is one-way. If the token is refreshed inside the sandbox, the new one dies
 with the VM. Should a refresh ever invalidate the host's copy, re-run `claude` on the host to log
 back in.
+
+### SSH keys and Git operations
+
+By default geli copies no SSH keys into the sandbox. If an agent needs to push, pull, or fetch dependencies over SSH (`git@github.com:...`), pass `--ssh` or `--ssh-key`:
+
+```bash
+geli --ssh claude                      # copies default keys (~/.ssh/id_{ed25519,ecdsa,rsa}) and known_hosts
+geli --ssh-key ~/.ssh/deploy_key agy   # copies a specific key
+```
+
+Or enable it persistently for a workspace in `.geli.json`:
+
+```json
+{
+  "workspace": "my-project",
+  "ssh": true
+}
+```
+
+Keys are placed in `/home/sandbox/.ssh/` with strict `0600` permissions. geli also configures `StrictHostKeyChecking accept-new` so git commands never hang waiting for manual host verification prompts.
 
 ## Restricting what the sandbox can reach
 

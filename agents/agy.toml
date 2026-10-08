@@ -1,13 +1,27 @@
 command = "agy"
 binary = "agy"
 label = "Google account credentials"
-credentials = [".gemini/oauth_creds.json", ".gemini/google_accounts.json", ".gemini/installation_id"]
+credentials = [
+  ".gemini/antigravity-cli/antigravity-oauth-token",
+  ".gemini/antigravity-cli/installation_id",
+  ".gemini/antigravity-cli/jetski_state.pbtxt",
+  ".gemini/antigravity-cli/settings.json",
+  ".gemini/settings.json",
+  ".gemini/state.json",
+  ".gemini/google_accounts.json",
+  ".gemini/trustedFolders.json",
+  ".gemini/oauth_creds.json",
+  ".gemini/installation_id",
+]
 hosts = [
   "antigravity.google",
   "generativelanguage.googleapis.com",
   "oauth2.googleapis.com",
   "accounts.google.com",
   "cloudcode-pa.googleapis.com",
+  "daily-cloudcode-pa.googleapis.com",
+  "aicode.googleapis.com",
+  "aiplatform.googleapis.com",
 ]
 install = '''
 retry sh -c 'curl -fsSL --compressed https://antigravity.google/cli/install.sh -o /tmp/agy.sh' \

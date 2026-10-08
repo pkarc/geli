@@ -21,9 +21,17 @@ struct Cli {
     #[arg(long, value_delimiter = ',', value_name = "claude,opencode")]
     agents: Vec<String>,
 
-    /// Do not copy the host's Claude credentials into the sandbox
+    /// Do not copy the host's credentials into the sandbox
     #[arg(long)]
     no_credentials: bool,
+
+    /// Forward host SSH keys into the sandbox for git operations
+    #[arg(long)]
+    ssh: bool,
+
+    /// Forward a specific SSH private key into the sandbox
+    #[arg(long, value_name = "PATH")]
+    ssh_key: Option<PathBuf>,
 
     /// Allow the sandbox to reach only an allowlist of hosts, instead of the whole internet
     #[arg(long)]
@@ -41,6 +49,9 @@ struct LocalConfig {
     /// `.geli.json` files that already exist keep loading.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allow: Vec<String>,
+    /// Forward SSH keys into the sandbox for git operations.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    ssh: bool,
 }
 
 fn main() -> io::Result<()> {
@@ -68,12 +79,22 @@ fn main() -> io::Result<()> {
     let mapped_dirs = get_directories_in_workspace(&workspace_name)?;
     let command_to_run = args.agent_args.join(" ");
 
+    let mut local_ssh = read_local_ssh(&current_dir);
+    if args.ssh && !local_ssh && io::stdin().is_terminal() {
+        if prompt_enable_persistent_ssh(&current_dir, &workspace_name)? {
+            local_ssh = true;
+        }
+    }
+    let forward_ssh = !args.no_credentials && (args.ssh || local_ssh || args.ssh_key.is_some());
+
     execute_sandbox(
         &workspace_name,
         &current_dir,
         mapped_dirs,
         &command_to_run,
         !args.no_credentials,
+        forward_ssh,
+        args.ssh_key.as_deref(),
         args.restrict_net,
     )?;
     Ok(())
@@ -99,6 +120,57 @@ fn read_local_allowlist(current_dir: &Path) -> Vec<String> {
         .and_then(|raw| serde_json::from_str::<LocalConfig>(&raw).ok())
         .map(|c| c.allow)
         .unwrap_or_default()
+}
+
+fn read_local_ssh(current_dir: &Path) -> bool {
+    fs::read_to_string(current_dir.join(LOCAL_CONFIG_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<LocalConfig>(&raw).ok())
+        .map(|c| c.ssh)
+        .unwrap_or_default()
+}
+
+fn save_local_ssh(current_dir: &Path, workspace: &str, enabled: bool) -> io::Result<()> {
+    let local_config_path = current_dir.join(LOCAL_CONFIG_FILE);
+    let mut config: LocalConfig = if local_config_path.exists() {
+        let file = File::open(&local_config_path)?;
+        serde_json::from_reader(file).unwrap_or(LocalConfig {
+            workspace: workspace.to_string(),
+            allow: Vec::new(),
+            ssh: false,
+        })
+    } else {
+        LocalConfig {
+            workspace: workspace.to_string(),
+            allow: Vec::new(),
+            ssh: false,
+        }
+    };
+
+    config.ssh = enabled;
+    let local_file = File::create(&local_config_path)?;
+    serde_json::to_writer_pretty(local_file, &config).map_err(io::Error::other)?;
+    Ok(())
+}
+
+fn prompt_enable_persistent_ssh(current_dir: &Path, workspace: &str) -> io::Result<bool> {
+    print!(
+        "[?] Enable SSH forwarding permanently for workspace '{}' in .geli.json? (y/N): ",
+        workspace
+    );
+    io::stdout().flush()?;
+
+    let mut choice = String::new();
+    io::stdin().lock().read_line(&mut choice)?;
+    let trimmed = choice.trim().to_lowercase();
+
+    if trimmed == "y" || trimmed == "yes" {
+        save_local_ssh(current_dir, workspace, true)?;
+        println!("[+] Saved: SSH is now enabled permanently for this workspace.\n");
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 fn get_or_create_workspace(current_dir: &Path) -> io::Result<String> {
@@ -172,6 +244,7 @@ fn get_or_create_workspace(current_dir: &Path) -> io::Result<String> {
     let config_payload = LocalConfig {
         workspace: ws_name.clone(),
         allow: Vec::new(),
+        ssh: false,
     };
     let local_file = File::create(local_config_path)?;
     serde_json::to_writer_pretty(local_file, &config_payload).map_err(io::Error::other)?;
@@ -566,6 +639,259 @@ fn build_images(selected: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn collect_ssh_credentials(
+    home: &Path,
+    ssh_key: Option<&Path>,
+) -> io::Result<Vec<(String, String)>> {
+    let mut creds = Vec::new();
+    let ssh_dir = home.join(".ssh");
+
+    let mut found_any_key = false;
+    let mut key_names = Vec::new();
+
+    if let Some(explicit_path) = ssh_key {
+        let resolved = if explicit_path.starts_with("~/") || explicit_path == Path::new("~") {
+            if let Ok(stripped) = explicit_path.strip_prefix("~") {
+                home.join(stripped)
+            } else {
+                explicit_path.to_path_buf()
+            }
+        } else if explicit_path.is_relative() {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(explicit_path)
+        } else {
+            explicit_path.to_path_buf()
+        };
+
+        // If the user specified a .pub file, prefer the private key counterpart if available
+        let resolved = if resolved.extension().and_then(|e| e.to_str()) == Some("pub") {
+            let priv_candidate = resolved.with_extension("");
+            if priv_candidate.exists() {
+                priv_candidate
+            } else {
+                resolved
+            }
+        } else {
+            resolved
+        };
+
+        if !resolved.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("SSH key not found at '{}'", resolved.display()),
+            ));
+        }
+
+        let content = fs::read_to_string(&resolved)?;
+        let key_name = resolved
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("id_custom")
+            .to_string();
+
+        creds.push((format!(".ssh/{}", key_name), content));
+        key_names.push(key_name.clone());
+        found_any_key = true;
+
+        let pub_path = PathBuf::from(format!("{}.pub", resolved.display()));
+        if pub_path.exists() {
+            if let Ok(pub_content) = fs::read_to_string(&pub_path) {
+                creds.push((format!(".ssh/{}.pub", key_name), pub_content));
+            }
+        }
+    } else {
+        const DEFAULT_KEYS: &[&str] = &["id_ed25519", "id_ecdsa", "id_rsa"];
+        for key in DEFAULT_KEYS {
+            let key_path = ssh_dir.join(key);
+            if key_path.exists() {
+                if let Ok(content) = fs::read_to_string(&key_path) {
+                    creds.push((format!(".ssh/{}", key), content));
+                    key_names.push(key.to_string());
+                    found_any_key = true;
+
+                    let pub_path = ssh_dir.join(format!("{}.pub", key));
+                    if pub_path.exists() {
+                        if let Ok(pub_content) = fs::read_to_string(&pub_path) {
+                            creds.push((format!(".ssh/{}.pub", key), pub_content));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !found_any_key {
+        eprintln!(
+            "[!] SSH forwarding was requested, but no SSH private keys were found in {}.\n\
+             \x20   Specify a key explicitly with --ssh-key <path>.",
+            ssh_dir.display()
+        );
+    }
+
+    let known_hosts_path = ssh_dir.join("known_hosts");
+    if known_hosts_path.exists() {
+        if let Ok(known_hosts) = fs::read_to_string(&known_hosts_path) {
+            creds.push((".ssh/known_hosts".to_string(), known_hosts));
+        }
+    }
+
+    let mut config_lines = vec![
+        "Host *".to_string(),
+        "    StrictHostKeyChecking accept-new".to_string(),
+    ];
+    for name in &key_names {
+        config_lines.push(format!("    IdentityFile ~/.ssh/{}", name));
+    }
+    config_lines.push(String::new());
+    creds.push((".ssh/config".to_string(), config_lines.join("\n")));
+
+    Ok(creds)
+}
+
+pub(crate) fn prepare_agy_credentials(
+    home: &Path,
+    folders: &[String],
+) -> Vec<(String, String)> {
+    let mut creds = Vec::new();
+
+    // 1. Tokens and IDs
+    for rel in [
+        ".gemini/antigravity-cli/antigravity-oauth-token",
+        ".gemini/antigravity-cli/installation_id",
+        ".gemini/google_accounts.json",
+        ".gemini/oauth_creds.json",
+        ".gemini/installation_id",
+    ] {
+        if let Ok(content) = fs::read_to_string(home.join(rel)) {
+            creds.push((rel.to_string(), content));
+        }
+    }
+
+    // 2. ~/.gemini/antigravity-cli/jetski_state.pbtxt (skips onboarding flow)
+    let existing_jetski = fs::read_to_string(home.join(".gemini/antigravity-cli/jetski_state.pbtxt"))
+        .unwrap_or_default();
+    let mut jetski_content = existing_jetski;
+    if !jetski_content.contains("POST_ONBOARDING_STEP_TYPE_") {
+        jetski_content.push_str(
+            "\npost_onboarding: {\n  completed_steps: POST_ONBOARDING_STEP_TYPE_MANAGER_WELCOME\n  completed_steps: POST_ONBOARDING_STEP_TYPE_USAGE_MODE\n  completed_steps: POST_ONBOARDING_STEP_TYPE_AGENT_CONFIGURATION\n  completed_steps: POST_ONBOARDING_STEP_TYPE_ADD_WORKSPACE\n}\n",
+        );
+    }
+    if !jetski_content.contains("AGENT_ONBOARDING_STATE_COMPLETED") {
+        jetski_content.push_str("agent_onboarding_completed: AGENT_ONBOARDING_STATE_COMPLETED\n");
+    }
+    creds.push((
+        ".gemini/antigravity-cli/jetski_state.pbtxt".to_string(),
+        jetski_content,
+    ));
+
+    // 3. ~/.gemini/settings.json (Theme selection and sessionRetention warning acknowledgment)
+    let existing_settings: serde_json::Value = fs::read_to_string(home.join(".gemini/settings.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let mut settings_obj = existing_settings.as_object().cloned().unwrap_or_default();
+
+    let ui = settings_obj
+        .entry("ui")
+        .or_insert_with(|| serde_json::json!({}));
+    if ui.get("theme").is_none() {
+        if let Some(ui_map) = ui.as_object_mut() {
+            ui_map.insert("theme".to_string(), serde_json::json!("Ayu"));
+        }
+    }
+    settings_obj.insert("onboardingComplete".to_string(), serde_json::json!(true));
+    settings_obj.insert("consumerOnboardingComplete".to_string(), serde_json::json!(true));
+    settings_obj.insert("enterpriseOnboardingComplete".to_string(), serde_json::json!(true));
+
+    let general = settings_obj
+        .entry("general")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(gen_map) = general.as_object_mut() {
+        let session = gen_map
+            .entry("sessionRetention")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(sess_map) = session.as_object_mut() {
+            sess_map.insert("warningAcknowledged".to_string(), serde_json::json!(true));
+            sess_map.insert("enabled".to_string(), serde_json::json!(true));
+        }
+    }
+
+    creds.push((
+        ".gemini/settings.json".to_string(),
+        serde_json::to_string_pretty(&settings_obj).unwrap_or_default(),
+    ));
+
+    // 4. ~/.gemini/antigravity-cli/settings.json (colorScheme & trustedWorkspaces & onboarding flags)
+    let existing_cli_settings: serde_json::Value =
+        fs::read_to_string(home.join(".gemini/antigravity-cli/settings.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+
+    let mut cli_settings_obj = existing_cli_settings.as_object().cloned().unwrap_or_default();
+    cli_settings_obj.insert("onboardingComplete".to_string(), serde_json::json!(true));
+    cli_settings_obj.insert("consumerOnboardingComplete".to_string(), serde_json::json!(true));
+    cli_settings_obj.insert("enterpriseOnboardingComplete".to_string(), serde_json::json!(true));
+    if cli_settings_obj.get("colorScheme").is_none() {
+        cli_settings_obj.insert("colorScheme".to_string(), serde_json::json!("tokyo night"));
+    }
+    if cli_settings_obj.get("initialColorScheme").is_none() {
+        cli_settings_obj.insert("initialColorScheme".to_string(), serde_json::json!("tokyo night"));
+    }
+
+    let mut trusted_ws: Vec<String> = cli_settings_obj
+        .get("trustedWorkspaces")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    for f in folders {
+        let ws_path = format!("/workspace/{}", f);
+        if !trusted_ws.contains(&ws_path) {
+            trusted_ws.push(ws_path);
+        }
+    }
+    cli_settings_obj.insert(
+        "trustedWorkspaces".to_string(),
+        serde_json::json!(trusted_ws),
+    );
+
+    creds.push((
+        ".gemini/antigravity-cli/settings.json".to_string(),
+        serde_json::to_string_pretty(&cli_settings_obj).unwrap_or_default(),
+    ));
+
+    // 5. ~/.gemini/trustedFolders.json (Pre-trust mounted workspace folders)
+    let mut trusted_folders: serde_json::Map<String, serde_json::Value> =
+        fs::read_to_string(home.join(".gemini/trustedFolders.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+
+    for f in folders {
+        trusted_folders.insert(format!("/workspace/{}", f), serde_json::json!("TRUST_FOLDER"));
+    }
+    creds.push((
+        ".gemini/trustedFolders.json".to_string(),
+        serde_json::to_string_pretty(&trusted_folders).unwrap_or_default(),
+    ));
+
+    // 6. ~/.gemini/state.json (Suppress tips/banners)
+    let existing_state: serde_json::Value = fs::read_to_string(home.join(".gemini/state.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({
+            "tipsShown": 10,
+            "focusUiEnabled": false
+        }));
+    creds.push((
+        ".gemini/state.json".to_string(),
+        serde_json::to_string_pretty(&existing_state).unwrap_or_default(),
+    ));
+
+    creds
+}
+
 #[cfg(target_os = "linux")]
 fn execute_sandbox(
     ws: &str,
@@ -573,6 +899,8 @@ fn execute_sandbox(
     dirs: Vec<PathBuf>,
     cmd: &str,
     forward_credentials: bool,
+    forward_ssh: bool,
+    ssh_key: Option<&Path>,
     restrict_net: bool,
 ) -> io::Result<()> {
 
@@ -691,7 +1019,10 @@ fn execute_sandbox(
 
     // Only the invoked agent's credentials travel, and only the credential — not the history
     // sitting beside it. Opt out entirely with --no-credentials.
-    let credentials: Vec<(String, String)> = match (forward_credentials, agent) {
+    let agent_credentials: Vec<(String, String)> = match (forward_credentials, agent) {
+        (true, Some(agent)) if agent.command == "agy" => {
+            prepare_agy_credentials(&home, &plan.folders)
+        }
         (true, Some(agent)) => agent
             .credentials
             .iter()
@@ -702,9 +1033,31 @@ fn execute_sandbox(
         _ => Vec::new(),
     };
 
+    let ssh_credentials = if forward_ssh {
+        match collect_ssh_credentials(&home, ssh_key) {
+            Ok(creds) => creds,
+            Err(e) => {
+                eprintln!("[!] Error reading SSH credentials: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    if forward_ssh && restrict_net {
+        eprintln!(
+            "[!] Warning: --restrict-net is enabled. The CONNECT proxy currently only permits port 443,\n\
+             \x20   so SSH (port 22) connections may be blocked unless connecting via port 443.\n"
+        );
+    }
+
+    let mut credentials = agent_credentials.clone();
+    credentials.extend(ssh_credentials.clone());
+
     let has_credentials = !anthropic_key.trim().is_empty()
         || !openai_key.trim().is_empty()
-        || !credentials.is_empty();
+        || !agent_credentials.is_empty();
 
     if let Some(agent) = agent {
         let risky = sensitive_credentials(agent);
@@ -765,12 +1118,21 @@ fn execute_sandbox(
     // is not an agent) and inherits its virtual size.
     create_overlay(&session_backing, &sandbox_img, None)?;
 
-    let auth = match (credentials.is_empty(), agent) {
+    let base_auth = match (agent_credentials.is_empty(), agent) {
         (false, Some(a)) => format!("{} · bills your plan", a.label),
         (true, _) if !api_key_for_config.trim().is_empty() => {
             "ANTHROPIC_API_KEY · bills API credits".to_string()
         }
         _ => "none".to_string(),
+    };
+    let auth = if forward_ssh && !ssh_credentials.is_empty() {
+        if base_auth == "none" {
+            "SSH keys forwarded".to_string()
+        } else {
+            format!("{} + SSH", base_auth)
+        }
+    } else {
+        base_auth
     };
     let net = match &proxy {
         Some((_, count)) => format!("restricted · {} domains allowed", count),
@@ -884,6 +1246,8 @@ fn execute_sandbox(
     _dirs: Vec<PathBuf>,
     _cmd: &str,
     _forward_credentials: bool,
+    _forward_ssh: bool,
+    _ssh_key: Option<&Path>,
     _restrict_net: bool,
 ) -> io::Result<()> {
     eprintln!("macOS backend is not yet implemented.");
@@ -896,6 +1260,8 @@ fn execute_sandbox(
     _dirs: Vec<PathBuf>,
     _cmd: &str,
     _forward_credentials: bool,
+    _forward_ssh: bool,
+    _ssh_key: Option<&Path>,
     _restrict_net: bool,
 ) -> io::Result<()> {
     eprintln!("Windows backend is not yet implemented.");
@@ -1176,15 +1542,16 @@ mod tests {
         assert_eq!(claude.credentials, vec![".claude/.credentials.json".to_string()]);
 
         let agy = agent_for_command("agy").unwrap();
-        // 1.8 KB of token lives beside 2.3 GB of conversation history and a 1.3 GB index.
+        // Tokens live beside 2.3 GB of conversation history and logs.
         assert!(agy.credentials.iter().all(|p| p.starts_with(".gemini/")));
-        for history in ["antigravity-cli", "brain", "conversations", "history"] {
+        for history in ["brain", "conversations", "history.jsonl", "conversation_summaries.db"] {
             assert!(
                 !agy.credentials.iter().any(|p| p.contains(history)),
                 "{} would drag history into the guest",
                 history
             );
         }
+        assert!(agy.credentials.contains(&".gemini/antigravity-cli/antigravity-oauth-token".to_string()));
 
         // No agent may claim another's files.
         for a in agents() {
@@ -1632,13 +1999,20 @@ mod tests {
             serde_json::from_str(r#"{"workspace":"w","allow":["a.test"]}"#).unwrap();
         assert_eq!(new.allow, vec!["a.test".to_string()]);
 
-        // An empty allowlist must not be written back into users' files.
+        // An empty allowlist or false ssh flag must not be written back into users' files.
         let written = serde_json::to_string(&LocalConfig {
             workspace: "w".into(),
             allow: Vec::new(),
+            ssh: false,
         })
         .unwrap();
         assert!(!written.contains("allow"));
+        assert!(!written.contains("ssh"));
+
+        let ssh_cfg: LocalConfig = serde_json::from_str(r#"{"workspace":"w","ssh":true}"#).unwrap();
+        assert!(ssh_cfg.ssh);
+        let written_ssh = serde_json::to_string(&ssh_cfg).unwrap();
+        assert!(written_ssh.contains("\"ssh\":true"));
     }
 
     /// Phases must come from the guest's own output. A loader that advances on a timer is
@@ -1981,5 +2355,110 @@ mod tests {
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("abc"), "'abc'");
         assert_eq!(shell_quote("a'b"), r"'a'\''b'");
+    }
+
+    #[test]
+    fn ssh_credentials_collects_default_keys_and_config() {
+        let temp = std::env::temp_dir().join(format!("geli_ssh_test_{}", std::process::id()));
+        let ssh_dir = temp.join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+
+        fs::write(ssh_dir.join("id_ed25519"), "test_private_key").unwrap();
+        fs::write(ssh_dir.join("id_ed25519.pub"), "test_public_key").unwrap();
+        fs::write(ssh_dir.join("known_hosts"), "github.com ssh-ed25519 AAAA...").unwrap();
+
+        let creds = collect_ssh_credentials(&temp, None).unwrap();
+        assert!(creds.iter().any(|(p, c)| p == ".ssh/id_ed25519" && c == "test_private_key"));
+        assert!(creds.iter().any(|(p, c)| p == ".ssh/id_ed25519.pub" && c == "test_public_key"));
+        assert!(creds.iter().any(|(p, c)| p == ".ssh/known_hosts" && c.contains("github.com")));
+
+        let config_entry = creds.iter().find(|(p, _)| p == ".ssh/config").map(|(_, c)| c.as_str()).unwrap();
+        assert!(config_entry.contains("StrictHostKeyChecking accept-new"));
+        assert!(config_entry.contains("IdentityFile ~/.ssh/id_ed25519"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn ssh_credentials_collects_custom_key() {
+        let temp = std::env::temp_dir().join(format!("geli_custom_key_test_{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        let key_file = temp.join("custom_deploy_key");
+        fs::write(&key_file, "custom_secret").unwrap();
+
+        let creds = collect_ssh_credentials(&temp, Some(&key_file)).unwrap();
+        assert!(creds.iter().any(|(p, c)| p == ".ssh/custom_deploy_key" && c == "custom_secret"));
+
+        let config_entry = creds.iter().find(|(p, _)| p == ".ssh/config").map(|(_, c)| c.as_str()).unwrap();
+        assert!(config_entry.contains("IdentityFile ~/.ssh/custom_deploy_key"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn cli_parses_ssh_flags() {
+        use clap::Parser;
+        let args = Cli::parse_from(["geli", "--ssh", "claude"]);
+        assert!(args.ssh);
+        assert_eq!(args.ssh_key, None);
+        assert_eq!(args.agent_args, vec!["claude"]);
+
+        let args_key = Cli::parse_from(["geli", "--ssh-key", "/tmp/my_key", "opencode"]);
+        assert!(!args_key.ssh);
+        assert_eq!(args_key.ssh_key, Some(PathBuf::from("/tmp/my_key")));
+        assert_eq!(args_key.agent_args, vec!["opencode"]);
+    }
+
+    #[test]
+    fn save_local_ssh_updates_local_config() {
+        let temp = std::env::temp_dir().join(format!("geli_save_ssh_test_{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+
+        // When no config exists yet
+        save_local_ssh(&temp, "test_ws", true).unwrap();
+        assert!(read_local_ssh(&temp));
+
+        // When config exists with allowlist
+        let config_path = temp.join(LOCAL_CONFIG_FILE);
+        let cfg: LocalConfig = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(cfg.workspace, "test_ws");
+        assert!(cfg.ssh);
+
+        // Disabling ssh
+        save_local_ssh(&temp, "test_ws", false).unwrap();
+        assert!(!read_local_ssh(&temp));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn prepare_agy_credentials_skips_onboarding_and_theme() {
+        let temp = std::env::temp_dir().join(format!("geli_agy_test_{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+
+        let creds = prepare_agy_credentials(&temp, &["my-repo".to_string()]);
+
+        // 1. jetski_state.pbtxt must contain onboarding complete markers
+        let jetski = creds.iter().find(|(p, _)| p == ".gemini/antigravity-cli/jetski_state.pbtxt").map(|(_, c)| c.as_str()).unwrap();
+        assert!(jetski.contains("AGENT_ONBOARDING_STATE_COMPLETED"));
+        assert!(jetski.contains("POST_ONBOARDING_STEP_TYPE_"));
+
+        // 2. settings.json must contain theme and warning acknowledgement
+        let settings = creds.iter().find(|(p, _)| p == ".gemini/settings.json").map(|(_, c)| c.as_str()).unwrap();
+        assert!(settings.contains("\"theme\": \"Ayu\""));
+        assert!(settings.contains("\"warningAcknowledged\": true"));
+        assert!(settings.contains("\"onboardingComplete\": true"));
+
+        // 3. trustedWorkspaces and trustedFolders must pre-trust /workspace/my-repo
+        let cli_settings = creds.iter().find(|(p, _)| p == ".gemini/antigravity-cli/settings.json").map(|(_, c)| c.as_str()).unwrap();
+        assert!(cli_settings.contains("/workspace/my-repo"));
+        assert!(cli_settings.contains("tokyo night"));
+        assert!(cli_settings.contains("\"onboardingComplete\": true"));
+
+        let trusted_folders = creds.iter().find(|(p, _)| p == ".gemini/trustedFolders.json").map(|(_, c)| c.as_str()).unwrap();
+        assert!(trusted_folders.contains("/workspace/my-repo"));
+        assert!(trusted_folders.contains("TRUST_FOLDER"));
+
+        let _ = fs::remove_dir_all(&temp);
     }
 }

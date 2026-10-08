@@ -28,3 +28,6 @@ runcmd:
   - bash /etc/geli/mounts.sh
   - chown -R sandbox:sandbox /home/sandbox/.claude /home/sandbox/.claude.json || true
   - chown -R sandbox:sandbox /home/sandbox/.cache /workspace || true
+  - chmod 700 /home/sandbox/.ssh 2>/dev/null || true
+  - chown -R sandbox:sandbox /home/sandbox/.ssh 2>/dev/null || true
+  - chown -R sandbox:sandbox /home/sandbox/.gemini 2>/dev/null || true
