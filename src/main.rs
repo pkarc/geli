@@ -80,10 +80,12 @@ fn main() -> io::Result<()> {
     let command_to_run = args.agent_args.join(" ");
 
     let mut local_ssh = read_local_ssh(&current_dir);
-    if args.ssh && !local_ssh && io::stdin().is_terminal() {
-        if prompt_enable_persistent_ssh(&current_dir, &workspace_name)? {
-            local_ssh = true;
-        }
+    if args.ssh
+        && !local_ssh
+        && io::stdin().is_terminal()
+        && prompt_enable_persistent_ssh(&current_dir, &workspace_name)?
+    {
+        local_ssh = true;
     }
     let forward_ssh = !args.no_credentials && (args.ssh || local_ssh || args.ssh_key.is_some());
 
@@ -92,10 +94,12 @@ fn main() -> io::Result<()> {
         &current_dir,
         mapped_dirs,
         &command_to_run,
-        !args.no_credentials,
-        forward_ssh,
-        args.ssh_key.as_deref(),
-        args.restrict_net,
+        &SessionPolicy {
+            credentials: !args.no_credentials,
+            ssh: forward_ssh,
+            ssh_key: args.ssh_key.as_deref(),
+            restrict_net: args.restrict_net,
+        },
     )?;
     Ok(())
 }
@@ -728,15 +732,33 @@ pub(crate) fn collect_ssh_credentials(
     }
 
     let known_hosts_path = ssh_dir.join("known_hosts");
-    if known_hosts_path.exists() {
-        if let Ok(known_hosts) = fs::read_to_string(&known_hosts_path) {
-            creds.push((".ssh/known_hosts".to_string(), known_hosts));
-        }
+    let mut has_known_hosts = false;
+    if let Ok(known_hosts) = fs::read_to_string(&known_hosts_path) {
+        has_known_hosts = !known_hosts.trim().is_empty();
+        creds.push((".ssh/known_hosts".to_string(), known_hosts));
     }
+
+    // `accept-new` only where there is nothing to check against. With the host's `known_hosts`
+    // forwarded — which is the normal case, and github.com is almost certainly already in it —
+    // strict checking costs nothing and keeps the one warning you would get if the host you are
+    // pushing to were not the host you think. Blanket `accept-new` trusts whatever answers first,
+    // and a sandbox is exactly where an unexpected answer deserves to be noticed.
+    //
+    // Without `known_hosts` the choice is between `accept-new` and a session that hangs on a
+    // prompt nobody is there to answer, so it is `accept-new` and geli says so.
+    let strict = if has_known_hosts {
+        "yes"
+    } else {
+        eprintln!(
+            "[!] No ~/.ssh/known_hosts to forward, so the sandbox will trust whichever host\n\
+             \x20   answers first (StrictHostKeyChecking=accept-new)."
+        );
+        "accept-new"
+    };
 
     let mut config_lines = vec![
         "Host *".to_string(),
-        "    StrictHostKeyChecking accept-new".to_string(),
+        format!("    StrictHostKeyChecking {}", strict),
     ];
     for name in &key_names {
         config_lines.push(format!("    IdentityFile ~/.ssh/{}", name));
@@ -747,149 +769,20 @@ pub(crate) fn collect_ssh_credentials(
     Ok(creds)
 }
 
-pub(crate) fn prepare_agy_credentials(
-    home: &Path,
-    folders: &[String],
-) -> Vec<(String, String)> {
-    let mut creds = Vec::new();
-
-    // 1. Tokens and IDs
-    for rel in [
-        ".gemini/antigravity-cli/antigravity-oauth-token",
-        ".gemini/antigravity-cli/installation_id",
-        ".gemini/google_accounts.json",
-        ".gemini/oauth_creds.json",
-        ".gemini/installation_id",
-    ] {
-        if let Ok(content) = fs::read_to_string(home.join(rel)) {
-            creds.push((rel.to_string(), content));
-        }
-    }
-
-    // 2. ~/.gemini/antigravity-cli/jetski_state.pbtxt (skips onboarding flow)
-    let existing_jetski = fs::read_to_string(home.join(".gemini/antigravity-cli/jetski_state.pbtxt"))
-        .unwrap_or_default();
-    let mut jetski_content = existing_jetski;
-    if !jetski_content.contains("POST_ONBOARDING_STEP_TYPE_") {
-        jetski_content.push_str(
-            "\npost_onboarding: {\n  completed_steps: POST_ONBOARDING_STEP_TYPE_MANAGER_WELCOME\n  completed_steps: POST_ONBOARDING_STEP_TYPE_USAGE_MODE\n  completed_steps: POST_ONBOARDING_STEP_TYPE_AGENT_CONFIGURATION\n  completed_steps: POST_ONBOARDING_STEP_TYPE_ADD_WORKSPACE\n}\n",
-        );
-    }
-    if !jetski_content.contains("AGENT_ONBOARDING_STATE_COMPLETED") {
-        jetski_content.push_str("agent_onboarding_completed: AGENT_ONBOARDING_STATE_COMPLETED\n");
-    }
-    creds.push((
-        ".gemini/antigravity-cli/jetski_state.pbtxt".to_string(),
-        jetski_content,
-    ));
-
-    // 3. ~/.gemini/settings.json (Theme selection and sessionRetention warning acknowledgment)
-    let existing_settings: serde_json::Value = fs::read_to_string(home.join(".gemini/settings.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    let mut settings_obj = existing_settings.as_object().cloned().unwrap_or_default();
-
-    let ui = settings_obj
-        .entry("ui")
-        .or_insert_with(|| serde_json::json!({}));
-    if ui.get("theme").is_none() {
-        if let Some(ui_map) = ui.as_object_mut() {
-            ui_map.insert("theme".to_string(), serde_json::json!("Ayu"));
-        }
-    }
-    settings_obj.insert("onboardingComplete".to_string(), serde_json::json!(true));
-    settings_obj.insert("consumerOnboardingComplete".to_string(), serde_json::json!(true));
-    settings_obj.insert("enterpriseOnboardingComplete".to_string(), serde_json::json!(true));
-
-    let general = settings_obj
-        .entry("general")
-        .or_insert_with(|| serde_json::json!({}));
-    if let Some(gen_map) = general.as_object_mut() {
-        let session = gen_map
-            .entry("sessionRetention")
-            .or_insert_with(|| serde_json::json!({}));
-        if let Some(sess_map) = session.as_object_mut() {
-            sess_map.insert("warningAcknowledged".to_string(), serde_json::json!(true));
-            sess_map.insert("enabled".to_string(), serde_json::json!(true));
-        }
-    }
-
-    creds.push((
-        ".gemini/settings.json".to_string(),
-        serde_json::to_string_pretty(&settings_obj).unwrap_or_default(),
-    ));
-
-    // 4. ~/.gemini/antigravity-cli/settings.json (colorScheme & trustedWorkspaces & onboarding flags)
-    let existing_cli_settings: serde_json::Value =
-        fs::read_to_string(home.join(".gemini/antigravity-cli/settings.json"))
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
-
-    let mut cli_settings_obj = existing_cli_settings.as_object().cloned().unwrap_or_default();
-    cli_settings_obj.insert("onboardingComplete".to_string(), serde_json::json!(true));
-    cli_settings_obj.insert("consumerOnboardingComplete".to_string(), serde_json::json!(true));
-    cli_settings_obj.insert("enterpriseOnboardingComplete".to_string(), serde_json::json!(true));
-    if cli_settings_obj.get("colorScheme").is_none() {
-        cli_settings_obj.insert("colorScheme".to_string(), serde_json::json!("tokyo night"));
-    }
-    if cli_settings_obj.get("initialColorScheme").is_none() {
-        cli_settings_obj.insert("initialColorScheme".to_string(), serde_json::json!("tokyo night"));
-    }
-
-    let mut trusted_ws: Vec<String> = cli_settings_obj
-        .get("trustedWorkspaces")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-
-    for f in folders {
-        let ws_path = format!("/workspace/{}", f);
-        if !trusted_ws.contains(&ws_path) {
-            trusted_ws.push(ws_path);
-        }
-    }
-    cli_settings_obj.insert(
-        "trustedWorkspaces".to_string(),
-        serde_json::json!(trusted_ws),
-    );
-
-    creds.push((
-        ".gemini/antigravity-cli/settings.json".to_string(),
-        serde_json::to_string_pretty(&cli_settings_obj).unwrap_or_default(),
-    ));
-
-    // 5. ~/.gemini/trustedFolders.json (Pre-trust mounted workspace folders)
-    let mut trusted_folders: serde_json::Map<String, serde_json::Value> =
-        fs::read_to_string(home.join(".gemini/trustedFolders.json"))
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
-
-    for f in folders {
-        trusted_folders.insert(format!("/workspace/{}", f), serde_json::json!("TRUST_FOLDER"));
-    }
-    creds.push((
-        ".gemini/trustedFolders.json".to_string(),
-        serde_json::to_string_pretty(&trusted_folders).unwrap_or_default(),
-    ));
-
-    // 6. ~/.gemini/state.json (Suppress tips/banners)
-    let existing_state: serde_json::Value = fs::read_to_string(home.join(".gemini/state.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(|| serde_json::json!({
-            "tipsShown": 10,
-            "focusUiEnabled": false
-        }));
-    creds.push((
-        ".gemini/state.json".to_string(),
-        serde_json::to_string_pretty(&existing_state).unwrap_or_default(),
-    ));
-
-    creds
+/// What this invocation is allowed to carry into the sandbox, and how far it may reach.
+///
+/// Grouped rather than passed as four more arguments: they are one decision — how much of the
+/// host this session gets — and reading them together is how you see that `--no-credentials`
+/// turns off SSH forwarding too.
+pub(crate) struct SessionPolicy<'a> {
+    /// Copy the invoked agent's credentials out of the user's home.
+    pub(crate) credentials: bool,
+    /// Copy SSH private keys in as well. Implies `credentials`; see `Cli`.
+    pub(crate) ssh: bool,
+    /// Forward this key instead of the usual `~/.ssh/id_*`.
+    pub(crate) ssh_key: Option<&'a Path>,
+    /// Cut egress to the allowlist.
+    pub(crate) restrict_net: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -898,11 +791,10 @@ fn execute_sandbox(
     cur: &Path,
     dirs: Vec<PathBuf>,
     cmd: &str,
-    forward_credentials: bool,
-    forward_ssh: bool,
-    ssh_key: Option<&Path>,
-    restrict_net: bool,
+    policy: &SessionPolicy,
 ) -> io::Result<()> {
+    let SessionPolicy { credentials: forward_credentials, ssh: forward_ssh, ssh_key, restrict_net } =
+        *policy;
 
     let pid = std::process::id();
     let home = dirs_home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -1020,9 +912,6 @@ fn execute_sandbox(
     // Only the invoked agent's credentials travel, and only the credential — not the history
     // sitting beside it. Opt out entirely with --no-credentials.
     let agent_credentials: Vec<(String, String)> = match (forward_credentials, agent) {
-        (true, Some(agent)) if agent.command == "agy" => {
-            prepare_agy_credentials(&home, &plan.folders)
-        }
         (true, Some(agent)) => agent
             .credentials
             .iter()
@@ -1045,10 +934,16 @@ fn execute_sandbox(
         Vec::new()
     };
 
+    // Not "may be blocked": the egress ruleset is default-drop with a single rule for the proxy's
+    // port, so nothing reaches port 22, and git over SSH does not read the proxy variables the way
+    // curl and npm do. Saying "may" would send someone hunting for a configuration that does not
+    // exist. The keys are still worth forwarding here — SSH commit signing is entirely local.
     if forward_ssh && restrict_net {
         eprintln!(
-            "[!] Warning: --restrict-net is enabled. The CONNECT proxy currently only permits port 443,\n\
-             \x20   so SSH (port 22) connections may be blocked unless connecting via port 443.\n"
+            "[!] --restrict-net blocks SSH outright: egress is default-drop except the proxy's\n\
+             \x20   port, and git over SSH ignores the proxy variables. Pushing and fetching over\n\
+             \x20   ssh:// will fail. The forwarded keys still work for local use, such as\n\
+             \x20   signing commits. Use an https:// remote to push under --restrict-net.\n"
         );
     }
 
@@ -1098,13 +993,20 @@ fn execute_sandbox(
         host_terminal_size(),
     ));
 
-    let claude_config = build_claude_config(&plan.folders, &api_key_for_config);
+    // Not gated on --no-credentials: these are built from this sandbox's own workspace, not read
+    // from the user's home, so there is nothing to opt out of. And an agent running on a bare
+    // ANTHROPIC_API_KEY still needs its onboarding answered.
+    let seed = match agent {
+        Some(a) => seed_files(a, &plan.folders, &api_key_for_config),
+        None => Vec::new(),
+    };
+
     let user_data = build_cloud_init(
         &plan,
         cmd,
         &env_exports,
-        &claude_config,
         &credentials,
+        &seed,
         proxy_port,
     );
     let iso = make_cloud_init_iso(
@@ -1245,10 +1147,7 @@ fn execute_sandbox(
     _cur: &Path,
     _dirs: Vec<PathBuf>,
     _cmd: &str,
-    _forward_credentials: bool,
-    _forward_ssh: bool,
-    _ssh_key: Option<&Path>,
-    _restrict_net: bool,
+    _policy: &SessionPolicy,
 ) -> io::Result<()> {
     eprintln!("macOS backend is not yet implemented.");
     Ok(())
@@ -1259,10 +1158,7 @@ fn execute_sandbox(
     _cur: &Path,
     _dirs: Vec<PathBuf>,
     _cmd: &str,
-    _forward_credentials: bool,
-    _forward_ssh: bool,
-    _ssh_key: Option<&Path>,
-    _restrict_net: bool,
+    _policy: &SessionPolicy,
 ) -> io::Result<()> {
     eprintln!("Windows backend is not yet implemented.");
     Ok(())
@@ -1277,8 +1173,8 @@ mod tests {
         let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
         let plan = build_mount_script(&dirs, Path::new(current), "");
         let env = build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]);
-        let config = build_claude_config(&plan.folders, "sk-ant-test-key-0123456789");
-        build_cloud_init(&plan, cmd, &env, &config, &[], None)
+        let seed = vec![(".claude.json".to_string(), build_claude_config(&plan.folders, "sk-ant-test-key-0123456789"))];
+        build_cloud_init(&plan, cmd, &env, &[], &seed, None)
     }
 
     /// The bug that made geli never work: a YAML document that does not parse.
@@ -1318,9 +1214,9 @@ mod tests {
     fn restricted_session_cloud_init_parses() {
         let dirs = [PathBuf::from("/home/u/proj")];
         let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), &build_lockdown(Some(45678)));
-        let config = build_claude_config(&plan.folders, "sk-ant-test");
+        let seed = vec![(".claude.json".to_string(), build_claude_config(&plan.folders, "sk-ant-test"))];
         let creds = vec![(".claude/.credentials.json".to_string(), "{\"t\":1}".to_string())];
-        let yaml = build_cloud_init(&plan, "claude", "", &config, &creds, Some(45678));
+        let yaml = build_cloud_init(&plan, "claude", "", &creds, &seed, Some(45678));
 
         let parsed = YamlLoader::load_from_str(&yaml);
         assert!(parsed.is_ok(), "{:?}\n---\n{}", parsed.err(), yaml);
@@ -1617,7 +1513,7 @@ mod tests {
             build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]),
             build_terminal_setup("screen-256color", "truecolor", Some((24, 100)))
         );
-        let yaml = build_cloud_init(&plan, "claude", &env, "{}", &[], None);
+        let yaml = build_cloud_init(&plan, "claude", &env, &[], &[], None);
 
         assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
         assert!(yaml.contains("screen-256color"));
@@ -1689,7 +1585,7 @@ mod tests {
             ".claude/.credentials.json".to_string(),
             r#"{"claudeAiOauth":{"accessToken":"tok","refreshToken":"ref"}}"#.to_string(),
         )];
-        let yaml = build_cloud_init(&plan, "claude", "", "{}", &creds, None);
+        let yaml = build_cloud_init(&plan, "claude", "", &creds, &[], None);
 
         assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
         assert!(yaml.contains("/home/sandbox/.claude/.credentials.json"));
@@ -1745,18 +1641,18 @@ mod tests {
             build_proxy_env(Some(45678)),
             build_terminal_setup("xterm-256color", "truecolor", Some((46, 190)))
         );
-        let config = build_claude_config(&plan.folders, "sk-ant-fixed-0123456789");
+        let seed = vec![(".claude.json".to_string(), build_claude_config(&plan.folders, "sk-ant-fixed-0123456789"))];
         let creds = vec![(".claude/.credentials.json".to_string(), "{\"t\":1}".to_string())];
 
         let files: Vec<(&str, String)> = vec![
             ("base.cloud-init.yaml", build_base_cloud_init(1000)),
-            ("session.cloud-init.yaml", build_cloud_init(&plan, "claude", &env, &config, &creds, Some(45678))),
+            ("session.cloud-init.yaml", build_cloud_init(&plan, "claude", &env, &creds, &seed, Some(45678))),
             ("setup.sh", base_setup_script(1000)),
             ("verify.sh", base_verify_script()),
             ("profile.sh", LOGIN_PROFILE.to_string()),
             ("autologin.sh", AUTOLOGIN_HELPER.to_string()),
             ("mounts.sh", plan.script.clone()),
-            ("claude.json", config.clone()),
+            ("claude.json", seed[0].1.clone()),
             ("lockdown.sh", build_lockdown(Some(45678))),
             ("egress.nft", build_egress_ruleset(45678)),
         ];
@@ -2372,9 +2268,25 @@ mod tests {
         assert!(creds.iter().any(|(p, c)| p == ".ssh/id_ed25519.pub" && c == "test_public_key"));
         assert!(creds.iter().any(|(p, c)| p == ".ssh/known_hosts" && c.contains("github.com")));
 
-        let config_entry = creds.iter().find(|(p, _)| p == ".ssh/config").map(|(_, c)| c.as_str()).unwrap();
-        assert!(config_entry.contains("StrictHostKeyChecking accept-new"));
-        assert!(config_entry.contains("IdentityFile ~/.ssh/id_ed25519"));
+        let config = |creds: &[(String, String)]| {
+            creds.iter().find(|(p, _)| p == ".ssh/config").map(|(_, c)| c.clone()).unwrap()
+        };
+
+        // known_hosts came across, so there is something to check against and checking is strict.
+        let strict = config(&creds);
+        assert!(strict.contains("StrictHostKeyChecking yes"), "{}", strict);
+        assert!(strict.contains("IdentityFile ~/.ssh/id_ed25519"));
+
+        // Without it the alternative is a session hanging on a prompt nobody will answer, so
+        // first contact is accepted — but only then, not as a blanket default.
+        fs::remove_file(ssh_dir.join("known_hosts")).unwrap();
+        let lenient = config(&collect_ssh_credentials(&temp, None).unwrap());
+        assert!(lenient.contains("StrictHostKeyChecking accept-new"), "{}", lenient);
+
+        // An empty known_hosts is no better than a missing one.
+        fs::write(ssh_dir.join("known_hosts"), "\n  \n").unwrap();
+        let empty = config(&collect_ssh_credentials(&temp, None).unwrap());
+        assert!(empty.contains("StrictHostKeyChecking accept-new"), "{}", empty);
 
         let _ = fs::remove_dir_all(&temp);
     }
@@ -2431,34 +2343,93 @@ mod tests {
         let _ = fs::remove_dir_all(&temp);
     }
 
+    /// Antigravity asks four onboarding questions, a theme, a retention warning and a trust
+    /// prompt per folder, each in a different file. A disposable VM gets asked all of it again
+    /// every session unless these are seeded.
     #[test]
-    fn prepare_agy_credentials_skips_onboarding_and_theme() {
-        let temp = std::env::temp_dir().join(format!("geli_agy_test_{}", std::process::id()));
-        fs::create_dir_all(&temp).unwrap();
+    fn antigravity_seed_answers_every_first_run_prompt() {
+        let agent = agent_for_command("agy").unwrap();
+        let seed = seed_files(agent, &["my-repo".to_string()], "");
+        let file = |p: &str| {
+            seed.iter().find(|(path, _)| path == p).map(|(_, c)| c.clone())
+                .unwrap_or_else(|| panic!("{} missing from the seed", p))
+        };
 
-        let creds = prepare_agy_credentials(&temp, &["my-repo".to_string()]);
-
-        // 1. jetski_state.pbtxt must contain onboarding complete markers
-        let jetski = creds.iter().find(|(p, _)| p == ".gemini/antigravity-cli/jetski_state.pbtxt").map(|(_, c)| c.as_str()).unwrap();
+        let jetski = file(".gemini/antigravity-cli/jetski_state.pbtxt");
         assert!(jetski.contains("AGENT_ONBOARDING_STATE_COMPLETED"));
         assert!(jetski.contains("POST_ONBOARDING_STEP_TYPE_"));
 
-        // 2. settings.json must contain theme and warning acknowledgement
-        let settings = creds.iter().find(|(p, _)| p == ".gemini/settings.json").map(|(_, c)| c.as_str()).unwrap();
+        let settings = file(".gemini/settings.json");
         assert!(settings.contains("\"theme\": \"Ayu\""));
         assert!(settings.contains("\"warningAcknowledged\": true"));
         assert!(settings.contains("\"onboardingComplete\": true"));
 
-        // 3. trustedWorkspaces and trustedFolders must pre-trust /workspace/my-repo
-        let cli_settings = creds.iter().find(|(p, _)| p == ".gemini/antigravity-cli/settings.json").map(|(_, c)| c.as_str()).unwrap();
-        assert!(cli_settings.contains("/workspace/my-repo"));
-        assert!(cli_settings.contains("tokyo night"));
-        assert!(cli_settings.contains("\"onboardingComplete\": true"));
+        let cli = file(".gemini/antigravity-cli/settings.json");
+        assert!(cli.contains("/workspace/my-repo"));
+        assert!(cli.contains("tokyo night"));
 
-        let trusted_folders = creds.iter().find(|(p, _)| p == ".gemini/trustedFolders.json").map(|(_, c)| c.as_str()).unwrap();
-        assert!(trusted_folders.contains("/workspace/my-repo"));
-        assert!(trusted_folders.contains("TRUST_FOLDER"));
+        let trusted = file(".gemini/trustedFolders.json");
+        assert!(trusted.contains("/workspace/my-repo"));
+        assert!(trusted.contains("TRUST_FOLDER"));
 
-        let _ = fs::remove_dir_all(&temp);
+        // Every seeded document must be valid on its own; a malformed one is a first-run prompt
+        // that comes back, which looks like geli not working rather than a broken file.
+        for (path, body) in &seed {
+            if path.ends_with(".json") {
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(body).is_ok(),
+                    "{} is not valid JSON:\n{}",
+                    path,
+                    body
+                );
+            }
+        }
+    }
+
+    /// The seed is built from the mounted workspace and nothing else. An earlier version merged
+    /// the host's own copies, which carried `~/.gemini/trustedFolders.json` whole — 29 absolute
+    /// paths naming other clients' projects, on the machine where this was found — into a VM with
+    /// network access. The sandbox has no business learning what else exists on the host.
+    #[test]
+    fn seeding_never_reads_the_host() {
+        let home = std::env::temp_dir().join(format!("geli-seed-host-{}", std::process::id()));
+        fs::create_dir_all(home.join(".gemini")).unwrap();
+        fs::write(
+            home.join(".gemini/trustedFolders.json"),
+            r#"{"/home/u/other-client/secret-project": "TRUST_FOLDER"}"#,
+        )
+        .unwrap();
+
+        for agent in agents() {
+            for (path, body) in seed_files(agent, &["mine".to_string()], "sk-ant-key") {
+                assert!(
+                    !body.contains("other-client") && !body.contains("secret-project"),
+                    "{} for {} leaked a host path",
+                    path,
+                    agent.command
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// `credentials` means "copied out of the user's home", and the status block says so. A path
+    /// that geli synthesises must not be declared there, or the recipe misleads whoever reads it
+    /// to audit what leaves their machine.
+    #[test]
+    fn recipes_do_not_claim_credentials_that_are_really_seeded() {
+        for agent in agents() {
+            let seeded: Vec<String> =
+                seed_files(agent, &["w".to_string()], "").into_iter().map(|(p, _)| p).collect();
+            for declared in &agent.credentials {
+                assert!(
+                    !seeded.contains(declared),
+                    "{} declares {} as a credential, but geli builds it",
+                    agent.command,
+                    declared
+                );
+            }
+        }
     }
 }

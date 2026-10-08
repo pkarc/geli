@@ -237,6 +237,94 @@ pub(crate) fn build_mount_script(dirs: &[PathBuf], current_canonical: &Path, loc
 /// the API key, then trust the folder, every time.
 ///
 /// `approved` holds the last 20 characters of the key rather than the key itself.
+/// Config an agent should find already answered, **synthesised by geli rather than copied**.
+///
+/// The distinction from `credentials` is the whole point of this function existing separately:
+/// a credential is read out of the user's home and the status block names it; a seed file is
+/// built here from nothing but the mounted workspace and, for Claude, the tail of an API key. So
+/// a seed file cannot carry host state the user did not ask for, and does not belong on the list
+/// of things that left their home.
+///
+/// **Nothing here reads the host's copy of these files, deliberately.** An earlier version merged
+/// them, which meant Antigravity's `~/.gemini/trustedFolders.json` travelled whole: measured on
+/// one developer's machine, 29 absolute paths naming projects for several different clients, into
+/// a VM with network access. The agent needs to know this sandbox's folders are trusted; it has
+/// no business learning what else exists.
+///
+/// This is also the one place where per-agent Rust is justified, so it is kept to one `match`
+/// rather than scattered. Suppressing a first-run flow means knowing that agent's file formats,
+/// and a TOML field expressive enough to describe "merge these keys into this JSON document"
+/// would be a programming language with worse ergonomics than this. Everything *else* about an
+/// agent stays data in `agents/*.toml`.
+pub(crate) fn seed_files(agent: &Agent, folders: &[String], api_key: &str) -> Vec<(String, String)> {
+    match agent.command.as_str() {
+        "claude" => vec![(".claude.json".to_string(), build_claude_config(folders, api_key))],
+        "agy" => antigravity_seed(folders),
+        _ => Vec::new(),
+    }
+}
+
+/// The guest paths a session mounts, which is all a seed file is ever allowed to know.
+fn workspace_paths(folders: &[String]) -> Vec<String> {
+    folders.iter().map(|f| format!("/workspace/{}", f)).collect()
+}
+
+/// Antigravity's first run asks four onboarding questions, a theme, a retention warning and a
+/// trust prompt per folder. Each lives in a different file, which is why there are five.
+fn antigravity_seed(folders: &[String]) -> Vec<(String, String)> {
+    use serde_json::json;
+
+    let paths = workspace_paths(folders);
+    let pretty = |v: serde_json::Value| serde_json::to_string_pretty(&v).unwrap_or_default();
+
+    vec![
+        (
+            ".gemini/antigravity-cli/jetski_state.pbtxt".to_string(),
+            "post_onboarding: {\n  \
+               completed_steps: POST_ONBOARDING_STEP_TYPE_MANAGER_WELCOME\n  \
+               completed_steps: POST_ONBOARDING_STEP_TYPE_USAGE_MODE\n  \
+               completed_steps: POST_ONBOARDING_STEP_TYPE_AGENT_CONFIGURATION\n  \
+               completed_steps: POST_ONBOARDING_STEP_TYPE_ADD_WORKSPACE\n\
+             }\n\
+             agent_onboarding_completed: AGENT_ONBOARDING_STATE_COMPLETED\n"
+                .to_string(),
+        ),
+        (
+            ".gemini/settings.json".to_string(),
+            pretty(json!({
+                "onboardingComplete": true,
+                "consumerOnboardingComplete": true,
+                "enterpriseOnboardingComplete": true,
+                "ui": { "theme": "Ayu" },
+                "general": {
+                    "sessionRetention": { "enabled": true, "warningAcknowledged": true }
+                }
+            })),
+        ),
+        (
+            ".gemini/antigravity-cli/settings.json".to_string(),
+            pretty(json!({
+                "onboardingComplete": true,
+                "consumerOnboardingComplete": true,
+                "enterpriseOnboardingComplete": true,
+                "colorScheme": "tokyo night",
+                "initialColorScheme": "tokyo night",
+                "trustedWorkspaces": paths,
+            })),
+        ),
+        (
+            ".gemini/trustedFolders.json".to_string(),
+            pretty(serde_json::Value::Object(
+                paths.iter().map(|p| (p.clone(), json!("TRUST_FOLDER"))).collect(),
+            )),
+        ),
+        (
+            ".gemini/state.json".to_string(),
+            pretty(json!({ "tipsShown": 10, "focusUiEnabled": false })),
+        ),
+    ]
+}
+
 pub(crate) fn build_claude_config(folders: &[String], api_key: &str) -> String {
     use serde_json::{json, Map, Value};
 
@@ -467,8 +555,10 @@ pub(crate) fn build_cloud_init(
     plan: &MountPlan,
     command: &str,
     env_exports: &str,
-    claude_config: &str,
+    // Read out of the user's home. Named in the status block, because they left it.
     credentials: &[(String, String)],
+    // Built by geli from the workspace alone — same shape in the guest, different provenance.
+    seed: &[(String, String)],
     proxy_port: Option<u16>,
 ) -> String {
     // The breadcrumb goes to the boot console, not stdout. It exists so a command that produces
@@ -484,14 +574,18 @@ pub(crate) fn build_cloud_init(
         command
     );
 
+    // Both end up as the same kind of write_files entry; only their provenance differs, and that
+    // difference is kept in Rust rather than in the guest, which has no use for it.
+    let mut written: Vec<(String, String)> = credentials.to_vec();
+    written.extend(seed.iter().cloned());
+
     recipe(
         include_str!("guest/session.yaml"),
         &[
             ("@ENV@", &indent_block(env_exports, 6)),
             ("@MOUNTS@", &indent_block(&plan.script, 6)),
             ("@SESSION@", &indent_block(&session, 6)),
-            ("@CLAUDE_CONFIG@", &indent_block(claude_config, 6)),
-            ("@CREDENTIALS@", &build_credentials_entry(credentials)),
+            ("@CREDENTIALS@", &build_credentials_entry(&written)),
             ("@EGRESS@", &build_egress_entry(proxy_port)),
         ],
     )

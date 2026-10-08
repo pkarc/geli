@@ -1,15 +1,13 @@
 command = "agy"
 binary = "agy"
 label = "Google account credentials"
+# Copied verbatim out of the user's home, and named in the status block for that reason.
+# Settings, trusted folders and onboarding state are NOT here: geli builds those from this
+# sandbox's own workspace (see `seed_files`), so they carry no host state and are not credentials.
 credentials = [
   ".gemini/antigravity-cli/antigravity-oauth-token",
   ".gemini/antigravity-cli/installation_id",
-  ".gemini/antigravity-cli/jetski_state.pbtxt",
-  ".gemini/antigravity-cli/settings.json",
-  ".gemini/settings.json",
-  ".gemini/state.json",
   ".gemini/google_accounts.json",
-  ".gemini/trustedFolders.json",
   ".gemini/oauth_creds.json",
   ".gemini/installation_id",
 ]

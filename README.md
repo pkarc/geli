@@ -291,6 +291,13 @@ anything that touches the network. `binary` is checked before the layer is publi
 that silently fails to install cannot ship — and since each agent is its own layer, a broken
 recipe costs nothing to anyone not running it.
 
+`credentials` means **copied verbatim out of the user's home**, and the status block names every
+one of them, every run. It is not the place for files geli can build itself: settings, trusted
+folders and "onboarding already answered" state are *seeded* instead — synthesised from the
+mounted workspace, never read from the host — so they carry no host state at all. A test fails if
+a recipe declares a path that geli actually synthesises, because such a recipe misleads whoever
+reads it to audit what leaves their machine.
+
 `credentials` deserves care, both to write and to review: those files are copied out of the
 user's home into a VM that can reach the network. Name the credential, never the directory it
 sits in — agents tend to keep conversation history next to their tokens. geli refuses to be quiet
@@ -363,7 +370,25 @@ Or enable it persistently for a workspace in `.geli.json`:
 }
 ```
 
-Keys are placed in `/home/sandbox/.ssh/` with strict `0600` permissions. geli also configures `StrictHostKeyChecking accept-new` so git commands never hang waiting for manual host verification prompts.
+Keys are placed in `/home/sandbox/.ssh/` with `0600` permissions, and your `known_hosts` goes with
+them. Host-key checking is then **strict**, because there is something to check against; only when
+no `known_hosts` is available does geli fall back to `accept-new`, and it says so when it does.
+Blanket `accept-new` would trust whichever host answers first, and a sandbox is exactly where an
+unexpected answer deserves to be noticed.
+
+**Understand what forwarding a key costs.** Without it, the worst an agent can do is leak the
+repository you gave it. With it, the worst it can do is leak a credential that grants write access
+to *every* repository you have — and unlike the VM, that key outlives the session. The sandbox
+protects your files; it does not protect a key you hand to the thing running inside it. Prefer
+`--ssh-key` with a deploy key scoped to one repository over your everyday identity, and prefer
+passing `--ssh` per run over `"ssh": true` in `.geli.json`, which forwards it to every session in
+that workspace whether or not it needs to push.
+
+**`--restrict-net` blocks SSH outright.** Egress is default-drop except the proxy's port, and git
+over SSH ignores the proxy variables that `npm`, `pip` and `git`-over-HTTPS respect. Pushing or
+fetching over `ssh://` will fail; use an `https://` remote. The keys are still worth forwarding
+under `--restrict-net` for anything local, such as signing commits. geli warns when you combine
+them.
 
 ## Restricting what the sandbox can reach
 
