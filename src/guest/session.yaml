@@ -17,12 +17,6 @@ write_files:
     content: |
 @SESSION@
 
-  - path: /home/sandbox/.claude.json
-    permissions: '0600'
-    owner: sandbox:sandbox
-    content: |
-@CLAUDE_CONFIG@
-
 @CREDENTIALS@@EGRESS@
 runcmd:
   - bash /etc/geli/mounts.sh

@@ -147,6 +147,10 @@ are plainly not agent credentials — `.ssh`, `.aws`, `.gnupg` and friends — a
 names every file that leaves the user's home, every run. Neither is a substitute for reviewing a
 recipe, but a recipe asking for an SSH key should never be able to do it quietly.
 
+**Seeded config is not a credential, and the two must not be mixed.** `credentials` in a recipe means "copied verbatim out of the user's home", and the status block names those files because they left it. `seed_files` builds the other kind: settings, trusted folders and already-answered onboarding, synthesised from the mounted workspace and nothing else. **Nothing in the seed reads the host's copy, deliberately** — an earlier version merged them, which sent Antigravity's `~/.gemini/trustedFolders.json` across whole: 29 absolute paths naming several different clients' projects, into a VM with network access. `recipes_do_not_claim_credentials_that_are_really_seeded` fails if a recipe declares a path geli actually builds, and `seeding_never_reads_the_host` fails if a seed picks up host state. Seeding is also *not* gated on `--no-credentials`: there is nothing of the user's in it, and an agent running on a bare `ANTHROPIC_API_KEY` still needs its onboarding answered.
+
+**`seed_files` is the one place per-agent Rust is justified, so it is one `match` rather than scattered.** Suppressing a first-run flow means knowing that agent's file formats, and a TOML field expressive enough to say "merge these keys into this JSON document" would be a programming language with worse ergonomics. Everything else about an agent stays data in `agents/*.toml`. A `if agent.command == "agy"` branch sitting out in `execute_sandbox` is how this went wrong once already.
+
 **Credentials only, never the directory they sit in.** Antigravity keeps 1.8 KB of OAuth token in
 `~/.gemini/oauth_creds.json` — next to a 1.3 GB index and 317 MB of conversations in the same
 tree. Claude's is the same shape. A test asserts no agent's credential list reaches into history.
@@ -162,6 +166,18 @@ on this.
 
 **Antigravity's `agy` is a statically linked Go binary**, so musl never enters into it — unlike
 every npm-delivered agent, where it does.
+
+### SSH keys (`--ssh`, `--ssh-key`)
+
+Off by default. With the flag the host's `~/.ssh/id_*` — or one named key — is copied in, along with `known_hosts` and a generated `~/.ssh/config`.
+
+**This is a different order of risk from forwarding an agent credential, and the README says so plainly.** An agent credential leaks the account it belongs to; an SSH private key grants write access to every repository the user has, and it outlives the disposable VM that leaked it. `.ssh` is in `NEVER_COPY` precisely so a *recipe* can never ask for this quietly — the flag is a first-party, explicit, per-invocation decision instead, and the copied paths are named in the status block like any other.
+
+**Host-key checking is strict when `known_hosts` came across, `accept-new` only when it did not** — and that case prints a line saying so. Blanket `accept-new` trusts whatever answers first, which is a poor default in the one environment where you least control what is running.
+
+**`--restrict-net` blocks SSH outright, and the warning must say so.** The egress ruleset is default-drop with a single rule for the proxy's port, and git over SSH does not read the proxy variables that curl and npm do. An earlier wording said connections "may be blocked unless connecting via port 443", which sends someone hunting for a configuration that does not exist. The keys remain useful under `--restrict-net` for local work such as commit signing.
+
+Still open: forwarding the *agent socket* rather than the key, so the guest can sign with the key but never read it. geli already has the shape for it — the CONNECT proxy is a host thread the guest reaches at `10.0.2.2:<port>` — plus a relay in the guest to present a Unix socket.
 
 ### Egress policy (`--restrict-net`)
 
