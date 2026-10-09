@@ -1,7 +1,7 @@
 //! What the guest is told to be: recipes, cloud-init, mounts, and the boot it reports back.
 
 #[allow(unused_imports)]
-use crate::{agents::*, net::*, qemu::*, ui::*};
+use crate::{agents::*, net::*, qemu::*, ui::*, Packages};
 use std::path::{Path, PathBuf};
 
 // --- GUEST CONFIGURATION ---
@@ -26,8 +26,9 @@ pub(crate) const BUILD_OK_MARKER: &str = "GELI_BUILD_OK";
 /// on Ubuntu there is no tarball to fetch — apt's Node 18 was the reason that existed.
 pub(crate) const REQUIRED_NODE_MAJOR: u32 = 22;
 
-/// The retry helper, substituted into the base recipe and every agent layer so the two cannot
-/// drift. An agent's `install` field is documented as running with `retry` in scope.
+/// The retry helper, substituted into the base recipe, every agent layer and the mount script of
+/// a session that declared `packages`, so they cannot drift. An agent's `install` field is
+/// documented as running with `retry` in scope.
 pub(crate) const GUEST_RETRY: &str = include_str!("guest/retry.sh");
 
 /// Provisioning run once by `--build-image`: the toolchain, the user, autologin — and no agent.
@@ -180,7 +181,12 @@ pub(crate) fn recipe_hash(recipe: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-pub(crate) fn build_mount_script(dirs: &[PathBuf], current_canonical: &Path, lockdown: &str) -> MountPlan {
+pub(crate) fn build_mount_script(
+    dirs: &[PathBuf],
+    current_canonical: &Path,
+    packages: &str,
+    lockdown: &str,
+) -> MountPlan {
     let mut script = String::from("#!/bin/bash\nset -x\n\nmkdir -p /workspace\n");
     let mut active_folder = String::new();
     let mut folders = Vec::new();
@@ -207,6 +213,21 @@ pub(crate) fn build_mount_script(dirs: &[PathBuf], current_canonical: &Path, loc
         "mount -t 9p -o {MOUNT_OPTS} pipcache /home/sandbox/.cache/pip\n"
     ));
 
+    // apk looks for its cache at /etc/apk/cache, which Alpine ships as nothing at all; the
+    // conventional target is /var/cache/apk, which the base recipe empties on its way out. The
+    // symlink is recreated rather than assumed, so a session never silently downloads twice.
+    script.push_str("mkdir -p /var/cache/apk\n");
+    script.push_str(&format!(
+        "mount -t 9p -o {MOUNT_OPTS} apkcache /var/cache/apk\n"
+    ));
+    script.push_str("rm -rf /etc/apk/cache\nln -s /var/cache/apk /etc/apk/cache\n");
+
+    // Declared tools, installed while there is still a route. The order below is load-bearing:
+    // the lockdown deletes the default route, empties resolv.conf and loads a default-drop
+    // ruleset, so anything fetched after it would fail — and fail quietly, since a missing
+    // package only warns. Mounts, then packages, then egress, then the marker.
+    script.push_str(packages);
+
     // Egress is cut here, after the mounts and before the agent ever runs.
     script.push_str(lockdown);
 
@@ -230,6 +251,68 @@ pub(crate) fn build_mount_script(dirs: &[PathBuf], current_canonical: &Path, loc
         active_folder,
         folders,
     }
+}
+
+/// The shell that installs a project's declared tools, spliced into `build_mount_script` ahead of
+/// the lockdown.
+///
+/// **Declared, not accumulated.** Keeping the root disposable means anything the agent installs by
+/// hand is gone next session; the price of getting it back is one line in `.geli.json`, and what
+/// it buys is a result that survives a layer rebuild, reads in a diff and explains itself. See
+/// `docs/history-management.md` §5 and appendix C.
+///
+/// Three things here are not cosmetic:
+///
+/// - **Each install runs as root but points at the sandbox user's cache.** The npm and pip caches
+///   arrive on 9p under `/home/sandbox/.cache`, and root's own cache is elsewhere — without the
+///   explicit flags every boot would re-download what is already on the host's disk, which is the
+///   whole reason those shares exist.
+/// - **A failure warns and continues.** The contrast is with the egress ruleset, which powers the
+///   VM off: there the status block has already claimed the session is restricted and running on
+///   would make that a lie. Here nothing has been claimed — the agent is short a tool and will
+///   find out when it reaches for it.
+/// - **Names go through `shell_quote` as well as `valid_package_name`.** The validator already
+///   rejects everything that means something to a shell, so the quoting is redundant today; it
+///   stays because the day someone widens that charset, the quoting is what keeps this from
+///   becoming an injection.
+pub(crate) fn build_package_setup(packages: &Packages) -> String {
+    if packages.is_empty() {
+        return String::new();
+    }
+
+    let mut script = String::from("\n");
+    script.push_str(GUEST_RETRY.trim_end());
+    script.push('\n');
+
+    // apk first: the other two are only as reliable as the toolchain underneath them, and a
+    // project that declares a build dependency expects it present before npm reaches for it.
+    for (label, command, names) in [
+        ("apk", "apk add --no-progress", &packages.apk),
+        (
+            "npm",
+            "npm install -g --cache /home/sandbox/.cache/npm --prefer-offline",
+            &packages.npm,
+        ),
+        (
+            "pip",
+            // Alpine marks its python externally managed, so a bare `pip install` refuses.
+            "pip install --break-system-packages --cache-dir /home/sandbox/.cache/pip",
+            &packages.pip,
+        ),
+    ] {
+        if names.is_empty() {
+            continue;
+        }
+        let quoted: Vec<String> = names.iter().map(|n| shell_quote(n)).collect();
+        script.push_str(&format!(
+            "retry {} {} || echo \"geli: {} install failed; the session continues without it\"\n",
+            command,
+            quoted.join(" "),
+            label
+        ));
+    }
+
+    script
 }
 
 /// Claude Code keeps its "already answered that" state in ~/.claude.json. The sandbox is

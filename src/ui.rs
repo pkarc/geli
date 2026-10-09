@@ -4,7 +4,7 @@
 //! places geli speaks, and they belong to the terminal, not to the guest or the network.
 
 #[allow(unused_imports)]
-use crate::{agents::*, guest::*, net::*};
+use crate::{agents::*, guest::*, net::*, Packages};
 
 /// One mounted directory, as the status block shows it.
 pub(crate) struct StatusMount {
@@ -23,6 +23,7 @@ pub(crate) fn render_status(
     copied: &[String],
     image: &str,
     net: &str,
+    tools: &str,
 ) -> String {
     let mut out = format!("geli · workspace {}\n", workspace);
     for m in mounts {
@@ -41,10 +42,41 @@ pub(crate) fn render_status(
         out.push_str(&format!("         ~/{}\n", path));
     }
     out.push_str(&format!("  net    {}\n", net));
+    // Directly under `net` on purpose: under --restrict-net these packages are the one thing the
+    // session fetches from outside the allowlist, and the two lines have to be read together.
+    if !tools.is_empty() {
+        out.push_str(&format!("  tools  {}\n", tools));
+    }
     if !image.is_empty() {
         out.push_str(&format!("  image  {}\n", image));
     }
     out
+}
+
+/// The `tools` line: what `.geli.json` asked to install, named rather than counted.
+///
+/// **Under `--restrict-net` this line is a disclosure, not a convenience.** The packages are
+/// fetched before the lockdown runs, because afterwards there is no route, no resolver and no
+/// rule for a package mirror. So a restricted session does reach `dl-cdn.alpinelinux.org` or the
+/// npm registry, once, before the agent starts — and the rule in this project is that the status
+/// block does not get to leave something like that unsaid.
+pub(crate) fn describe_packages(packages: &Packages, restricted: bool) -> String {
+    if packages.is_empty() {
+        return String::new();
+    }
+
+    let groups: Vec<String> = [("apk", &packages.apk), ("npm", &packages.npm), ("pip", &packages.pip)]
+        .into_iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(manager, names)| format!("{} {}", manager, names.join(" ")))
+        .collect();
+
+    let listed = groups.join(" · ");
+    if restricted {
+        format!("{} · fetched before the egress lockdown", listed)
+    } else {
+        listed
+    }
 }
 
 /// One frame of the loading line. Pure so the colour handling is testable: escape codes in a

