@@ -119,6 +119,27 @@ pub(crate) fn base_verify_script() -> String {
 /// environment, so the agent's commands still get TERM and the API keys.
 pub(crate) const LOGIN_PROFILE: &str = include_str!("guest/profile.sh");
 
+/// Marker the guest writes to the boot console for each package a session added. The host already
+/// polls that log for readiness, so reusing it keeps this to zero extra devices.
+///
+/// **A session can write to that console, so this is a proposal and not a fact.** `/dev/ttyS1` is
+/// made world-writable for the boot breadcrumb, which means an agent can print these lines
+/// itself. That is why the host validates every name it reads and why nothing is written to
+/// `.geli.json` without the user saying yes.
+pub(crate) const INSTALLED_MARKER: &str = "geli:installed";
+
+/// Where the baseline snapshot lives in the guest, taken once the declared packages are in.
+pub(crate) const PACKAGE_BASELINE: &str = "/etc/geli/packages.base";
+
+/// The guest-side helper that takes the snapshot and reports the difference. Baked into the base
+/// image because it is entirely static — the rule that keeps session boots at seconds.
+pub(crate) fn packages_helper() -> String {
+    recipe(
+        include_str!("guest/packages.sh"),
+        &[("@CONSOLE@", BOOT_CONSOLE.split(',').next().unwrap_or("ttyS1"))],
+    )
+}
+
 pub(crate) struct MountPlan {
     /// Body of the shell script that performs every 9p mount inside the guest.
     pub(crate) script: String,
@@ -227,6 +248,14 @@ pub(crate) fn build_mount_script(
     // ruleset, so anything fetched after it would fail — and fail quietly, since a missing
     // package only warns. Mounts, then packages, then egress, then the marker.
     script.push_str(packages);
+
+    // The baseline for "what did this session add", taken *after* the declared packages are in:
+    // otherwise declaring one would make it show up as a discovery on every later run, and the
+    // prompt at the end would never go quiet. Guarded on the helper existing, because a base
+    // image built before it does not carry it.
+    script.push_str(&format!(
+        "\ncommand -v geli-packages >/dev/null && geli-packages snapshot > {PACKAGE_BASELINE}\n"
+    ));
 
     // Egress is cut here, after the mounts and before the agent ever runs.
     script.push_str(lockdown);
@@ -618,6 +647,7 @@ pub(crate) fn build_base_cloud_init(host_uid: u32) -> String {
         include_str!("guest/base.yaml"),
         &[
             ("@AUTOLOGIN@", &indent_block(AUTOLOGIN_HELPER, 6)),
+            ("@PACKAGES@", &indent_block(&packages_helper(), 6)),
             ("@PROFILE@", &indent_block(LOGIN_PROFILE, 6)),
             ("@SETUP@", &indent_block(&base_setup_script(host_uid), 6)),
             ("@VERIFY@", &indent_block(&base_verify_script(), 6)),

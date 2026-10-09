@@ -5,6 +5,11 @@ write_files:
     content: |
 @AUTOLOGIN@
 
+  - path: /usr/local/bin/geli-packages
+    permissions: '0755'
+    content: |
+@PACKAGES@
+
   - path: /etc/geli/bash_profile
     permissions: '0644'
     content: |

@@ -230,6 +230,45 @@ caché de root no es la del usuario `sandbox`.** Sin `--cache` y `--cache-dir` e
 arranque se volvería a bajar lo que ya está en el disco del host, que es justamente lo que esas
 comparticiones existen para evitar.
 
+### Declarar no puede ser trabajo manual
+
+Pedirle a alguien que escriba la lista a mano es pedirle que recuerde, al final de una sesión, qué
+instaló al principio. No lo va a hacer, y entonces §5 se queda en una buena idea sin uso.
+
+Así que el sandbox lo cuenta. Al arrancar, **después** de instalar lo declarado, toma una foto de
+lo que hay explícitamente instalado; al terminar, antes de apagar, emite la diferencia. El host la
+lee y pregunta, una vez por gestor:
+
+```
+geli · this session installed apk packages not in .geli.json:
+    1. ripgrep
+    2. fd
+[?] Keep them for next time? (a)ll / (s)elect / (N)one:
+```
+
+Tres detalles que lo hacen funcionar:
+
+- **La foto se toma después de los paquetes declarados.** Si se tomara antes, lo ya declarado
+  aparecería como hallazgo en cada arranque y la pregunta no se callaría nunca.
+- **Explícito, no presente.** `/etc/apk/world` en vez de `apk info`, `--depth=0` en npm,
+  `--not-required` en pip. Un solo `apk add` arrastra su cierre de dependencias, y una lista de
+  cuarenta paquetes no es una pregunta: es un muro.
+- **Va por la consola de arranque**, que el host ya lee para la marca de preparado. Sin dispositivo
+  nuevo, que es el mismo razonamiento por el que la marca vive ahí.
+
+### Lo que el guest dice es una propuesta, no un hecho
+
+`/dev/ttyS1` es escribible por todos — tiene que serlo, para que la marca de preparado llegue — así
+que **el agente puede escribir esas líneas él mismo**. Un informe es una petición de añadir algo a
+un fichero del host que gobierna un shell de root en los arranques siguientes.
+
+Por eso hay dos filtros y ninguno es opcional: el host **valida cada nombre** antes de enseñarlo, y
+**nada se escribe sin que la persona diga que sí**. La pregunta no es cortesía; es el control.
+
+Fuera de un terminal no se pregunta: se imprime lo que se instaló y se sigue. Preguntar hacia una
+tubería o cuelga o lee la entrada de otro, y un log de CI merece ver igualmente qué añadió la
+sesión.
+
 ### Qué pasa si falla
 
 Un paquete que no instala **avisa y sigue**, no apaga la VM. El contraste es con el cierre de red,
@@ -326,6 +365,11 @@ podar. Con `brain/` creciendo a 1.3 GB en el host, no es teórico.
 - `local_config_without_packages_still_parses` — gemelo del que ya existe para `allow`: los
   `.geli.json` que hay en disco siguen cargando.
 - `no_packages_means_no_install_step` — sin nada declarado, el script es el de antes.
+- `installed_packages_are_read_as_a_proposal_not_a_fact` — una línea inyectada por el agente, con
+  un nombre que no es un nombre o un gestor inventado, no llega a la pregunta.
+- `already_declared_packages_are_not_offered_again` — la mitad del host de la foto diferida.
+- `the_baseline_is_taken_after_the_declared_installs` — y el informe, antes del `poweroff`.
+- `selection_answers_are_all_or_nothing` — `1 4` sobre tres opciones se rechaza entero.
 - `status_block_discloses_packages_fetched_before_the_lockdown` — y la línea va debajo de `net`.
 - `session_cloud_init_parses`, extendido con una lista declarada: las instalaciones entran en el
   mismo bloque literal que los montajes, y ese bloque es donde el documento se rompió una vez.

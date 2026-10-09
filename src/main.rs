@@ -228,6 +228,188 @@ fn save_local_ssh(current_dir: &Path, workspace: &str, enabled: bool) -> io::Res
     Ok(())
 }
 
+/// The packages a session installed, read back out of the boot console log.
+///
+/// **Everything here is a proposal from inside the sandbox, not a fact about it.** `/dev/ttyS1` is
+/// world-writable so the guest can leave its readiness breadcrumb, which means the agent can
+/// print these lines too. So a name that is not a name is dropped here, and nothing reaches
+/// `.geli.json` without the user agreeing to it by hand.
+pub(crate) fn parse_installed_packages(log: &str) -> Packages {
+    let mut found = Packages::default();
+
+    for line in log.lines() {
+        let Some(at) = line.find(INSTALLED_MARKER) else { continue };
+        let mut parts = line[at + INSTALLED_MARKER.len()..].split_whitespace();
+        let (Some(manager), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        if !valid_package_name(name) {
+            continue;
+        }
+
+        let list = match manager {
+            "apk" => &mut found.apk,
+            "npm" => &mut found.npm,
+            "pip" => &mut found.pip,
+            _ => continue,
+        };
+        // The guest already sorts and uniques, but a log can be read twice and a line can repeat.
+        if !list.iter().any(|p| p == name) {
+            list.push(name.to_string());
+        }
+    }
+
+    found
+}
+
+/// What was installed and is not already written down. Declaring a package must not make it
+/// show up as a discovery on every later run.
+fn undeclared_packages(found: &Packages, declared: &Packages) -> Packages {
+    let strip = |found: &Vec<String>, declared: &Vec<String>| -> Vec<String> {
+        found.iter().filter(|p| !declared.contains(p)).cloned().collect()
+    };
+    Packages {
+        apk: strip(&found.apk, &declared.apk),
+        npm: strip(&found.npm, &declared.npm),
+        pip: strip(&found.pip, &declared.pip),
+    }
+}
+
+/// A `select` answer: 1-based indices, separated by commas or spaces.
+///
+/// One bad entry invalidates the whole answer rather than being dropped quietly. Someone typing
+/// `1 4` for a list of three means something by the `4`, and silently persisting only `1` is the
+/// kind of help nobody asked for.
+fn parse_selection(answer: &str, count: usize) -> Option<Vec<usize>> {
+    let mut picked = Vec::new();
+    for token in answer.split([',', ' ']).filter(|t| !t.trim().is_empty()) {
+        let n: usize = token.trim().parse().ok()?;
+        if n == 0 || n > count {
+            return None;
+        }
+        if !picked.contains(&(n - 1)) {
+            picked.push(n - 1);
+        }
+    }
+    (!picked.is_empty()).then_some(picked)
+}
+
+/// Ask once per package manager whether to write what the session installed into `.geli.json`.
+///
+/// On **stderr**, like the rest of what geli says about itself: this runs after the command has
+/// finished, and `geli claude > out.txt` must still capture the command and nothing else.
+fn offer_to_persist_packages(
+    current_dir: &Path,
+    workspace: &str,
+    declared: &Packages,
+    log: &str,
+) -> io::Result<()> {
+    let found = undeclared_packages(&parse_installed_packages(log), declared);
+    if found.is_empty() {
+        return Ok(());
+    }
+
+    let groups = [("apk", &found.apk), ("npm", &found.npm), ("pip", &found.pip)];
+
+    // Not a terminal: say what happened and stop. Prompting into a pipe would either hang or
+    // read someone else's input, and a CI log should still show what the session added.
+    if !io::stdin().is_terminal() {
+        for (manager, names) in groups {
+            if !names.is_empty() {
+                eprintln!(
+                    "geli · this session installed {} {}: {}",
+                    names.len(),
+                    manager,
+                    names.join(" ")
+                );
+            }
+        }
+        eprintln!("geli · add them under \"packages\" in .geli.json to keep them.");
+        return Ok(());
+    }
+
+    let mut keep = declared.clone();
+    let mut changed = false;
+
+    for (manager, names) in groups {
+        if names.is_empty() {
+            continue;
+        }
+
+        eprintln!("\ngeli · this session installed {} packages not in .geli.json:", manager);
+        for (i, name) in names.iter().enumerate() {
+            eprintln!("    {}. {}", i + 1, name);
+        }
+        eprint!("[?] Keep them for next time? (a)ll / (s)elect / (N)one: ");
+        io::stderr().flush()?;
+
+        let mut answer = String::new();
+        io::stdin().lock().read_line(&mut answer)?;
+
+        let chosen: Vec<String> = match answer.trim().to_lowercase().as_str() {
+            "a" | "all" => names.to_vec(),
+            "s" | "select" => {
+                eprint!("[?] Which? (numbers, e.g. 1 3): ");
+                io::stderr().flush()?;
+                let mut picks = String::new();
+                io::stdin().lock().read_line(&mut picks)?;
+                match parse_selection(&picks, names.len()) {
+                    Some(indices) => indices.into_iter().map(|i| names[i].clone()).collect(),
+                    None => {
+                        eprintln!("[!] Not a valid selection; keeping none of the {}.", manager);
+                        Vec::new()
+                    }
+                }
+            }
+            _ => Vec::new(),
+        };
+
+        if chosen.is_empty() {
+            continue;
+        }
+        changed = true;
+        let target = match manager {
+            "apk" => &mut keep.apk,
+            "npm" => &mut keep.npm,
+            _ => &mut keep.pip,
+        };
+        target.extend(chosen);
+    }
+
+    if changed {
+        save_local_packages(current_dir, workspace, &keep)?;
+        eprintln!("[+] Saved to .geli.json. The next session installs them before the agent runs.");
+    }
+
+    Ok(())
+}
+
+/// Merge a package set into the project's `.geli.json`, leaving every other field alone.
+fn save_local_packages(current_dir: &Path, workspace: &str, packages: &Packages) -> io::Result<()> {
+    let local_config_path = current_dir.join(LOCAL_CONFIG_FILE);
+    let mut config: LocalConfig = if local_config_path.exists() {
+        let file = File::open(&local_config_path)?;
+        serde_json::from_reader(file).unwrap_or(LocalConfig {
+            workspace: workspace.to_string(),
+            allow: Vec::new(),
+            ssh: false,
+            packages: Packages::default(),
+        })
+    } else {
+        LocalConfig {
+            workspace: workspace.to_string(),
+            allow: Vec::new(),
+            ssh: false,
+            packages: Packages::default(),
+        }
+    };
+
+    config.packages = packages.clone();
+    let local_file = File::create(&local_config_path)?;
+    serde_json::to_writer_pretty(local_file, &config).map_err(io::Error::other)?;
+    Ok(())
+}
+
 fn prompt_enable_persistent_ssh(current_dir: &Path, workspace: &str) -> io::Result<bool> {
     print!(
         "[?] Enable SSH forwarding permanently for workspace '{}' in .geli.json? (y/N): ",
@@ -1219,6 +1401,17 @@ fn execute_sandbox(
         }
     }
 
+    // Before the cleanup below: the report arrives on the boot console, and that log lives in the
+    // share directory this function is about to delete.
+    if let Err(e) = offer_to_persist_packages(
+        cur,
+        ws,
+        &packages,
+        &fs::read_to_string(&console_log).unwrap_or_default(),
+    ) {
+        eprintln!("[!] Could not save packages to .geli.json: {}", e);
+    }
+
     let elapsed = started.elapsed().as_secs_f32();
     if keep_session {
         eprintln!(
@@ -1788,6 +1981,7 @@ mod tests {
             ("verify.sh", base_verify_script()),
             ("profile.sh", LOGIN_PROFILE.to_string()),
             ("autologin.sh", AUTOLOGIN_HELPER.to_string()),
+            ("packages.sh", packages_helper()),
             ("mounts.sh", plan.script.clone()),
             ("claude.json", seed[0].1.clone()),
             ("lockdown.sh", build_lockdown(Some(45678))),
@@ -2109,6 +2303,89 @@ mod tests {
         let net = out.find("net    ").unwrap();
         let tools = out.find("tools  ").unwrap();
         assert!(net < tools, "the disclosure must sit under the claim it qualifies");
+    }
+
+    /// The console log is written by a VM that the agent runs inside, and `/dev/ttyS1` is
+    /// world-writable so the readiness breadcrumb can be left there. So the report is a proposal:
+    /// anything that is not a package name, or not one of the three managers, is dropped before
+    /// a human is ever asked about it.
+    #[test]
+    fn installed_packages_are_read_as_a_proposal_not_a_fact() {
+        let log = "\
+[    1.2] OpenRC starting\n\
+geli:installed apk ripgrep\n\
+geli:installed npm @scope/tool\n\
+geli:installed pip httpx\n\
+geli:installed apk ripgrep\n\
+geli:installed apk ; rm -rf /\n\
+geli:installed cargo ripgrep\n\
+geli:installed apk\n\
+geli:installed apk one two\n\
+geli:ready\n";
+
+        let found = parse_installed_packages(log);
+        assert_eq!(found.apk, vec!["ripgrep".to_string()], "a repeat, an injection or a malformed line got through");
+        assert_eq!(found.npm, vec!["@scope/tool".to_string()]);
+        assert_eq!(found.pip, vec!["httpx".to_string()]);
+
+        assert!(parse_installed_packages("nothing to see here").is_empty());
+    }
+
+    /// Declaring a package must not make it show up as a discovery on every later run — the
+    /// baseline in the guest is taken after the declared installs for the same reason, and this
+    /// is the host's half of that.
+    #[test]
+    fn already_declared_packages_are_not_offered_again() {
+        let found = Packages {
+            apk: vec!["ripgrep".into(), "jq".into()],
+            npm: vec!["prettier".into()],
+            pip: Vec::new(),
+        };
+        let declared = Packages {
+            apk: vec!["ripgrep".into()],
+            npm: vec!["prettier".into()],
+            pip: Vec::new(),
+        };
+
+        let new = undeclared_packages(&found, &declared);
+        assert_eq!(new.apk, vec!["jq".to_string()]);
+        assert!(new.npm.is_empty(), "an already-declared package was offered again");
+        assert!(undeclared_packages(&declared, &declared).is_empty());
+    }
+
+    #[test]
+    fn selection_answers_are_all_or_nothing() {
+        assert_eq!(parse_selection("1 3", 3), Some(vec![0, 2]));
+        assert_eq!(parse_selection("2,1", 3), Some(vec![1, 0]));
+        assert_eq!(parse_selection(" 1 , 1 ", 3), Some(vec![0]), "a repeat is not an error");
+
+        // Out of range, not a number, or nothing at all: the whole answer is refused rather than
+        // partially honoured. `1 4` of three means something by the 4.
+        for bad in ["1 4", "0", "abc", "", "  ", "-1"] {
+            assert_eq!(parse_selection(bad, 3), None, "{:?} was accepted", bad);
+        }
+    }
+
+    /// The baseline has to be taken after the declared packages are installed, or every run would
+    /// re-offer what `.geli.json` already says.
+    #[test]
+    fn the_baseline_is_taken_after_the_declared_installs() {
+        let plan = build_mount_script(
+            &[PathBuf::from("/home/u/proj")],
+            Path::new("/home/u/proj"),
+            &build_package_setup(&sample_packages()),
+            &build_lockdown(Some(45678)),
+        );
+
+        let install = plan.script.find("apk add").expect("no install");
+        let baseline = plan.script.find("geli-packages snapshot").expect("no baseline");
+        assert!(install < baseline, "the baseline would record the declared packages as absent");
+
+        // And the report is the other half, from the profile that runs after the command.
+        assert!(LOGIN_PROFILE.contains("geli-packages report"));
+        let report = LOGIN_PROFILE.find("geli-packages report").unwrap();
+        let off = LOGIN_PROFILE.find("sudo poweroff -f").unwrap();
+        assert!(report < off, "the VM would be gone before it said what it installed");
     }
 
     #[test]

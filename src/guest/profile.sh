@@ -12,6 +12,11 @@ if [ -z "$GELI_SESSION_ACTIVE" ] && [ ! -e /tmp/.geli-session-active ]; then
 
     if [ -f /etc/geli/session ]; then
         . /etc/geli/session
+        # What the session installed, reported to the host so it can offer to make it permanent.
+        # After the command and before power is cut, because the whole point is to catch what the
+        # agent added while it worked. It writes to the boot console, never to this terminal.
+        command -v geli-packages >/dev/null 2>&1 &&
+            geli-packages report /etc/geli/packages.base
         # The project lives on 9p, so flush before cutting power. `poweroff -f` skips the wall
         # broadcast and the orderly-shutdown log, neither of which belongs on the user's screen.
         sync
