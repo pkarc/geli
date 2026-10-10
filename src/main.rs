@@ -42,7 +42,7 @@ struct Cli {
     agent_args: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 struct LocalConfig {
     workspace: String,
     /// Extra hosts this project may reach when `--restrict-net` is on. Defaulted so the
@@ -134,27 +134,28 @@ fn main() -> io::Result<()> {
     }
 
     let current_dir = std::env::current_dir()?;
-    let workspace_name = get_or_create_workspace(&current_dir)?;
+    let mut local = get_or_create_workspace(&current_dir)?;
+    let workspace_name = local.workspace.clone();
     register_directory_to_workspace(&workspace_name, &current_dir)?;
 
     let mapped_dirs = get_directories_in_workspace(&workspace_name)?;
     let command_to_run = args.agent_args.join(" ");
 
-    let mut local_ssh = read_local_ssh(&current_dir);
     if args.ssh
-        && !local_ssh
+        && !local.ssh
         && io::stdin().is_terminal()
         && prompt_enable_persistent_ssh(&current_dir, &workspace_name)?
     {
-        local_ssh = true;
+        local.ssh = true;
     }
-    let forward_ssh = !args.no_credentials && (args.ssh || local_ssh || args.ssh_key.is_some());
+    let forward_ssh = !args.no_credentials && (args.ssh || local.ssh || args.ssh_key.is_some());
 
     execute_sandbox(
         &workspace_name,
         &current_dir,
         mapped_dirs,
         &command_to_run,
+        &local,
         &SessionPolicy {
             credentials: !args.no_credentials,
             ssh: forward_ssh,
@@ -179,48 +180,66 @@ fn get_config_dir() -> PathBuf {
     path
 }
 
-fn read_local_allowlist(current_dir: &Path) -> Vec<String> {
-    fs::read_to_string(current_dir.join(LOCAL_CONFIG_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<LocalConfig>(&raw).ok())
-        .map(|c| c.allow)
-        .unwrap_or_default()
+/// Workspace names become filenames under `~/.config/geli/workspaces/` and the guest's hostname,
+/// so they are reduced to lowercase alphanumerics plus `-`.
+///
+/// **This runs on the name read back out of `.geli.json` too, not just the one typed at the
+/// prompt.** That file lives in the project directory, which the sandbox mounts with write
+/// access, so its contents are the agent's output as much as the user's input — and an
+/// unsanitized name went straight into `config_dir.join(format!("{}.txt", ws))`, where `../`
+/// escapes the registry.
+pub(crate) fn sanitize_workspace_name(raw: &str) -> String {
+    raw.trim().to_lowercase().replace(|c: char| !c.is_alphanumeric() && c != '-', "")
 }
 
-fn read_local_packages(current_dir: &Path) -> Packages {
-    fs::read_to_string(current_dir.join(LOCAL_CONFIG_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<LocalConfig>(&raw).ok())
-        .map(|c| c.packages)
-        .unwrap_or_default()
-}
+/// Read the project's `.geli.json`, or `None` when the project has none yet.
+///
+/// **Malformed JSON is an error, not an empty config.** The three readers this replaced each
+/// swallowed a parse failure into a default, so a typo silently dropped the project's allowlist
+/// and packages while `get_or_create_workspace` — reading the same file — failed loudly. Worse,
+/// `save_local_ssh` and `save_local_packages` would then overwrite the unparseable file with that
+/// default and take the rest of its contents with them.
+fn read_local_config(current_dir: &Path) -> io::Result<Option<LocalConfig>> {
+    let raw = match fs::read_to_string(current_dir.join(LOCAL_CONFIG_FILE)) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut config: LocalConfig = serde_json::from_str(&raw).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} in {}: {}", LOCAL_CONFIG_FILE, current_dir.display(), e),
+        )
+    })?;
 
-fn read_local_ssh(current_dir: &Path) -> bool {
-    fs::read_to_string(current_dir.join(LOCAL_CONFIG_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<LocalConfig>(&raw).ok())
-        .map(|c| c.ssh)
-        .unwrap_or_default()
+    let clean = sanitize_workspace_name(&config.workspace);
+    if clean != config.workspace {
+        eprintln!(
+            "[!] {} names the workspace '{}', which is not a name geli would write.\n\
+             \x20   Using '{}' instead.",
+            LOCAL_CONFIG_FILE, config.workspace, clean
+        );
+    }
+    if clean.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} in {} has no usable workspace name; it must hold letters, digits or '-'",
+                LOCAL_CONFIG_FILE,
+                current_dir.display()
+            ),
+        ));
+    }
+    config.workspace = clean;
+    Ok(Some(config))
 }
 
 fn save_local_ssh(current_dir: &Path, workspace: &str, enabled: bool) -> io::Result<()> {
     let local_config_path = current_dir.join(LOCAL_CONFIG_FILE);
-    let mut config: LocalConfig = if local_config_path.exists() {
-        let file = File::open(&local_config_path)?;
-        serde_json::from_reader(file).unwrap_or(LocalConfig {
-            workspace: workspace.to_string(),
-            allow: Vec::new(),
-            ssh: false,
-            packages: Packages::default(),
-        })
-    } else {
-        LocalConfig {
-            workspace: workspace.to_string(),
-            allow: Vec::new(),
-            ssh: false,
-            packages: Packages::default(),
-        }
-    };
+    let mut config = read_local_config(current_dir)?.unwrap_or_else(|| LocalConfig {
+        workspace: workspace.to_string(),
+        ..LocalConfig::default()
+    });
 
     config.ssh = enabled;
     let local_file = File::create(&local_config_path)?;
@@ -387,22 +406,10 @@ fn offer_to_persist_packages(
 /// Merge a package set into the project's `.geli.json`, leaving every other field alone.
 fn save_local_packages(current_dir: &Path, workspace: &str, packages: &Packages) -> io::Result<()> {
     let local_config_path = current_dir.join(LOCAL_CONFIG_FILE);
-    let mut config: LocalConfig = if local_config_path.exists() {
-        let file = File::open(&local_config_path)?;
-        serde_json::from_reader(file).unwrap_or(LocalConfig {
-            workspace: workspace.to_string(),
-            allow: Vec::new(),
-            ssh: false,
-            packages: Packages::default(),
-        })
-    } else {
-        LocalConfig {
-            workspace: workspace.to_string(),
-            allow: Vec::new(),
-            ssh: false,
-            packages: Packages::default(),
-        }
-    };
+    let mut config = read_local_config(current_dir)?.unwrap_or_else(|| LocalConfig {
+        workspace: workspace.to_string(),
+        ..LocalConfig::default()
+    });
 
     config.packages = packages.clone();
     let local_file = File::create(&local_config_path)?;
@@ -430,19 +437,20 @@ fn prompt_enable_persistent_ssh(current_dir: &Path, workspace: &str) -> io::Resu
     Ok(false)
 }
 
-fn get_or_create_workspace(current_dir: &Path) -> io::Result<String> {
-    let local_config_path = current_dir.join(LOCAL_CONFIG_FILE);
-
-    if local_config_path.exists() {
-        let file = File::open(local_config_path)?;
-        let config: LocalConfig = serde_json::from_reader(file)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        return Ok(config.workspace);
+/// The project's configuration, read once per invocation — prompting for a workspace and writing
+/// the file when the directory has none yet.
+///
+/// One read rather than the four this replaced: each call site parsed `.geli.json` again, which
+/// is how they came to disagree about what a malformed one means.
+fn get_or_create_workspace(current_dir: &Path) -> io::Result<LocalConfig> {
+    if let Some(config) = read_local_config(current_dir)? {
+        return Ok(config);
     }
 
     println!("[-] No local sandbox configuration found for this directory.");
     println!("[?] How would you like to namespace this folder?");
     println!("------------------------------------------------");
+    let local_config_path = current_dir.join(LOCAL_CONFIG_FILE);
 
     let config_dir = get_config_dir();
     let mut existing_workspaces = Vec::new();
@@ -492,22 +500,22 @@ fn get_or_create_workspace(current_dir: &Path) -> io::Result<String> {
         io::stdout().flush()?;
         let mut new_name = String::new();
         stdin.lock().read_line(&mut new_name)?;
-        ws_name = new_name
-            .trim()
-            .to_lowercase()
-            .replace(|c: char| !c.is_alphanumeric() && c != '-', "");
+        ws_name = sanitize_workspace_name(&new_name);
     }
 
-    let config_payload = LocalConfig {
-        workspace: ws_name.clone(),
-        allow: Vec::new(),
-        ssh: false,
-        packages: Packages::default(),
-    };
+    // A name that sanitizes to nothing would become `.txt` in the registry and an empty hostname.
+    if ws_name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a workspace name must hold letters, digits or '-'",
+        ));
+    }
+
+    let config_payload = LocalConfig { workspace: ws_name.clone(), ..LocalConfig::default() };
     let local_file = File::create(local_config_path)?;
     serde_json::to_writer_pretty(local_file, &config_payload).map_err(io::Error::other)?;
 
-    Ok(ws_name)
+    Ok(config_payload)
 }
 
 fn register_directory_to_workspace(workspace: &str, current_dir: &Path) -> io::Result<()> {
@@ -1045,6 +1053,7 @@ fn execute_sandbox(
     cur: &Path,
     dirs: Vec<PathBuf>,
     cmd: &str,
+    local: &LocalConfig,
     policy: &SessionPolicy,
 ) -> io::Result<()> {
     let SessionPolicy { credentials: forward_credentials, ssh: forward_ssh, ssh_key, restrict_net } =
@@ -1111,8 +1120,8 @@ fn execute_sandbox(
 
     // Read before anything is built: a name that cannot be shown to a shell should stop the run
     // here, with the offending entry on screen, rather than after a VM has booted.
-    let packages = read_local_packages(cur);
-    let rejected = rejected_package_names(&packages);
+    let packages = &local.packages;
+    let rejected = rejected_package_names(packages);
     if !rejected.is_empty() {
         eprintln!(
             "[!] {} in {} contains package names geli will not pass to a shell:\n\
@@ -1134,7 +1143,7 @@ fn execute_sandbox(
     // it boots: the egress ruleset names the one port the guest may reach, and that port is
     // whatever the OS handed the listener. So this comes before `build_mount_script`.
     let proxy = if restrict_net {
-        let allow = session_allowlist(agent, &read_local_allowlist(cur));
+        let allow = session_allowlist(agent, &local.allow);
         let count = allow.len();
         Some((start_proxy(allow, vm_share_dir.join("net.log"))?, count))
     } else {
@@ -1145,7 +1154,7 @@ fn execute_sandbox(
     let plan = build_mount_script(
         &dirs,
         &cur_canon,
-        &build_package_setup(&packages),
+        &build_package_setup(packages),
         &build_lockdown(proxy_port),
     );
 
@@ -1330,7 +1339,7 @@ fn execute_sandbox(
             &credentials.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
             &describe_image(&meta),
             &net,
-            &describe_packages(&packages, restrict_net),
+            &describe_packages(packages, restrict_net),
         )
     );
 
@@ -1406,7 +1415,7 @@ fn execute_sandbox(
     if let Err(e) = offer_to_persist_packages(
         cur,
         ws,
-        &packages,
+        packages,
         &fs::read_to_string(&console_log).unwrap_or_default(),
     ) {
         eprintln!("[!] Could not save packages to .geli.json: {}", e);
@@ -1440,6 +1449,7 @@ fn execute_sandbox(
     _cur: &Path,
     _dirs: Vec<PathBuf>,
     _cmd: &str,
+    _local: &LocalConfig,
     _policy: &SessionPolicy,
 ) -> io::Result<()> {
     eprintln!("macOS backend is not yet implemented.");
@@ -1451,6 +1461,7 @@ fn execute_sandbox(
     _cur: &Path,
     _dirs: Vec<PathBuf>,
     _cmd: &str,
+    _local: &LocalConfig,
     _policy: &SessionPolicy,
 ) -> io::Result<()> {
     eprintln!("Windows backend is not yet implemented.");
@@ -2849,18 +2860,65 @@ geli:ready\n";
         fs::create_dir_all(&temp).unwrap();
 
         // When no config exists yet
-        save_local_ssh(&temp, "test_ws", true).unwrap();
-        assert!(read_local_ssh(&temp));
+        save_local_ssh(&temp, "testws", true).unwrap();
+        assert!(read_local_config(&temp).unwrap().unwrap().ssh);
 
         // When config exists with allowlist
         let config_path = temp.join(LOCAL_CONFIG_FILE);
         let cfg: LocalConfig = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(cfg.workspace, "test_ws");
+        assert_eq!(cfg.workspace, "testws");
         assert!(cfg.ssh);
 
         // Disabling ssh
-        save_local_ssh(&temp, "test_ws", false).unwrap();
-        assert!(!read_local_ssh(&temp));
+        save_local_ssh(&temp, "testws", false).unwrap();
+        assert!(!read_local_config(&temp).unwrap().unwrap().ssh);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    /// The name becomes a path under `~/.config/geli/workspaces/` and the guest's hostname, so
+    /// the separators and the dots that would let it leave that directory have to go.
+    #[test]
+    fn workspace_names_cannot_escape_the_registry() {
+        assert_eq!(sanitize_workspace_name("../../etc/evil"), "etcevil");
+        assert_eq!(sanitize_workspace_name("  My Project  "), "myproject");
+        assert_eq!(sanitize_workspace_name("keeps-dashes"), "keeps-dashes");
+        assert_eq!(sanitize_workspace_name("../.."), "");
+    }
+
+    /// `.geli.json` sits in a directory the sandbox mounts with write access, so the name read
+    /// back out of it is the agent's output as much as the user's input. It gets the same
+    /// treatment as the one typed at the prompt — which it did not, before.
+    #[test]
+    fn a_workspace_name_read_from_the_file_is_sanitized_too() {
+        let temp = std::env::temp_dir().join(format!("geli_ws_escape_{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join(LOCAL_CONFIG_FILE), r#"{"workspace":"../../evil"}"#).unwrap();
+
+        let cfg = read_local_config(&temp).unwrap().unwrap();
+        assert_eq!(cfg.workspace, "evil");
+
+        // And one that survives nothing is an error rather than an empty `.txt` in the registry.
+        fs::write(temp.join(LOCAL_CONFIG_FILE), r#"{"workspace":"../.."}"#).unwrap();
+        assert!(read_local_config(&temp).is_err());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    /// Three readers used to swallow a parse failure into a default while a fourth raised it, and
+    /// the writers then overwrote the unparseable file with that default — taking the project's
+    /// allowlist and packages with it.
+    #[test]
+    fn a_malformed_local_config_is_an_error_and_is_not_overwritten() {
+        let temp = std::env::temp_dir().join(format!("geli_bad_config_{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join(LOCAL_CONFIG_FILE);
+        fs::write(&path, "{ not json").unwrap();
+
+        assert!(read_local_config(&temp).is_err());
+        assert!(save_local_ssh(&temp, "ws", true).is_err());
+        assert!(save_local_packages(&temp, "ws", &Packages::default()).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
 
         let _ = fs::remove_dir_all(&temp);
     }
