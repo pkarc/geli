@@ -152,7 +152,7 @@ workspaces en esta máquina). Se prueba sobre una copia de `~/.config/geli/` ant
 
 ---
 
-## Fase 4 — Decir cuándo la sesión dejó algo que el host va a ejecutar
+## Fase 4 — Decir cuándo la sesión dejó algo que el host va a ejecutar — **hecha**
 
 **Qué está mal.** Es inherente a montar el proyecto con escritura, pero hoy no se dice en ninguna
 parte. El agente puede escribir `.git/hooks/pre-commit`, `core.hooksPath` o `core.fsmonitor` en

