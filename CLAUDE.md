@@ -70,7 +70,7 @@ Running the sandbox requires, on the host: `qemu-system-x86_64`, `qemu-img`, `ge
 ## Architecture
 
 ```
-src/main.rs     CLI, the workspace registry, orchestration, tests
+src/main.rs     CLI, the workspace registry, the local config, orchestration
 src/agents.rs   the agents geli knows, parsed from agents/*.toml
 src/guest.rs    what the guest is told to be: cloud-init, recipes, mounts, boot
 src/net.rs      egress policy: the allowlist and the proxy that enforces it
@@ -79,6 +79,8 @@ src/ui.rs       the status block and the loading line
 agents/*.toml   one recipe per agent
 src/guest/*.sh  the recipes themselves, as real shell and YAML
 ```
+
+**Every module holds its own tests.** They all lived in `main.rs`, which put a proxy failure in a file that does not mention the proxy and grew the file past 3000 lines. A test belongs beside the thing it tests: the YAML and the recipes in `guest.rs`, the allowlist and the lockdown in `net.rs`, the image chain and the boot watch in `qemu.rs`, the recipes-as-data in `agents.rs`, the status block in `ui.rs`. `main.rs` keeps the registry, the local config and the session's own scratch.
 
 Module boundaries are by subject, not convenience. The first split was cut by line ranges and
 put both cloud-init generators in `net.rs` and the whole proxy server in `qemu.rs`; both were

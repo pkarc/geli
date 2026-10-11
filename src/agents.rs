@@ -191,6 +191,7 @@ pub(crate) fn session_warnings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::seed_files;
 
     /// Each of these exists because its absence cost someone real time. The order matters too:
     /// the session-shaping warnings come before the ones about the command itself.
@@ -232,5 +233,159 @@ mod tests {
         assert!(said.iter().any(|w| w.contains(".ssh/id_ed25519")), "{:?}", said);
         assert!(said.iter().any(|w| w.contains("agents/greedy.toml")));
         assert!(said.iter().any(|w| w.contains("--no-credentials")));
+    }
+
+
+    /// Regression: `geli claude` with no key booted fine and then sat silently in the agent's
+    /// first-run login flow, which is indistinguishable from a broken sandbox.
+    #[test]
+    fn warns_before_booting_an_agent_with_no_credentials() {
+        // The warning names the agent and the path it looked in, so the user can act on it.
+        let warning = credential_warning("claude", false).expect("expected a warning");
+        assert!(warning.contains("claude"));
+        assert!(warning.contains("~/.claude/.credentials.json"));
+        assert!(warning.contains("first-run login"));
+
+        let agy = credential_warning("agy", false).unwrap();
+        assert!(agy.contains("~/.gemini/oauth_creds.json"));
+        assert!(!agy.contains(".claude"), "it named another agent's credential");
+
+        assert!(credential_warning("claude", true).is_none());
+
+        // Unrelated commands still get a note, but not the agent-specific explanation.
+        let generic = credential_warning("ls", false).unwrap();
+        assert!(!generic.contains("first-run login"));
+    }
+
+    /// A notice, not a refusal: running a plain shell in the sandbox is a legitimate thing to do.
+    /// A recipe is a file anyone can contribute, and `credentials` copies files out of the
+    /// user's home. Paths that are plainly not agent credentials have to be surfaced.
+    #[test]
+    fn recipes_asking_for_secrets_are_flagged() {
+        for agent in agents() {
+            assert!(
+                sensitive_credentials(agent).is_empty(),
+                "shipped recipe {} asks for something it should not",
+                agent.command
+            );
+        }
+
+        let greedy = Agent {
+            command: "greedy".into(),
+            binary: "greedy".into(),
+            label: "x".into(),
+            credentials: vec![
+                ".config/greedy/auth.json".into(),
+                ".ssh/id_rsa".into(),
+                ".aws/credentials".into(),
+            ],
+            hosts: vec![],
+            install: String::new(),
+            version: None,
+        };
+        let flagged = sensitive_credentials(&greedy);
+        assert_eq!(flagged, vec![".ssh/id_rsa", ".aws/credentials"]);
+        assert!(!flagged.contains(&".config/greedy/auth.json"));
+    }
+
+    #[test]
+    fn non_agent_commands_are_noticed_not_refused() {
+        let notice = non_agent_notice("bash").expect("expected a notice");
+        assert!(notice.contains("bash"));
+        assert!(notice.contains("claude"), "it should list the agents geli does know");
+        assert!(notice.contains("will run"), "it must not read as a refusal");
+
+        // Known agents and an empty command say nothing.
+        for quiet in ["claude", "/usr/local/bin/agy", "opencode", ""] {
+            assert!(non_agent_notice(quiet).is_none(), "{:?} should be silent", quiet);
+        }
+    }
+
+    #[test]
+    fn agent_is_recognised_however_it_is_pathed() {
+        assert_eq!(agent_for_command("claude").map(|a| a.command.as_str()), Some("claude"));
+        assert_eq!(agent_for_command("/usr/local/bin/agy").map(|a| a.command.as_str()), Some("agy"));
+        assert_eq!(agent_for_command("opencode").map(|a| a.command.as_str()), Some("opencode"));
+
+        // Near-misses must not match, or the wrong credentials would travel.
+        for not_an_agent in ["claudette", "", "agyx", "my-opencode"] {
+            assert!(agent_for_command(not_an_agent).is_none(), "{:?} matched", not_an_agent);
+        }
+    }
+
+    /// Each agent carries only its own credential. Running one agent must not put another
+    /// service's token in the guest.
+    #[test]
+    fn agents_declare_only_their_own_credentials() {
+        let claude = agent_for_command("claude").unwrap();
+        assert_eq!(claude.credentials, vec![".claude/.credentials.json".to_string()]);
+
+        let agy = agent_for_command("agy").unwrap();
+        // Tokens live beside 2.3 GB of conversation history and logs.
+        assert!(agy.credentials.iter().all(|p| p.starts_with(".gemini/")));
+        for history in ["brain", "conversations", "history.jsonl", "conversation_summaries.db"] {
+            assert!(
+                !agy.credentials.iter().any(|p| p.contains(history)),
+                "{} would drag history into the guest",
+                history
+            );
+        }
+        assert!(agy.credentials.contains(&".gemini/antigravity-cli/antigravity-oauth-token".to_string()));
+
+        // No agent may claim another's files.
+        for a in agents() {
+            for b in agents() {
+                if a.command != b.command {
+                    assert!(
+                        a.credentials.iter().all(|p| !b.credentials.contains(p)),
+                        "{} and {} share a credential path",
+                        a.command,
+                        b.command
+                    );
+                }
+            }
+        }
+    }
+
+    /// Not a real test: writes the agent table out as TOML so the files that replace it are
+    /// byte-faithful to what the Rust version said.
+    #[ignore]
+    #[test]
+    fn dump_agents_as_toml() {
+        for a in agents() {
+            let mut out = String::new();
+            out.push_str(&format!("command = {:?}\n", a.command));
+            out.push_str(&format!("binary = {:?}\n", a.binary));
+            out.push_str(&format!("label = {:?}\n", a.label));
+            out.push_str(&format!(
+                "credentials = [{}]\n",
+                a.credentials.iter().map(|c| format!("{:?}", c)).collect::<Vec<_>>().join(", ")
+            ));
+            out.push_str(&format!(
+                "hosts = [\n{}\n]\n",
+                a.hosts.iter().map(|h| format!("  {:?},", h)).collect::<Vec<_>>().join("\n")
+            ));
+            out.push_str(&format!("install = '''\n{}'''\n", a.install));
+            std::fs::write(format!("agents/{}.toml", a.command), out).unwrap();
+        }
+    }
+
+    /// `credentials` means "copied out of the user's home", and the status block says so. A path
+    /// that geli synthesises must not be declared there, or the recipe misleads whoever reads it
+    /// to audit what leaves their machine.
+    #[test]
+    fn recipes_do_not_claim_credentials_that_are_really_seeded() {
+        for agent in agents() {
+            let seeded: Vec<String> =
+                seed_files(agent, &["w".to_string()], "").into_iter().map(|(p, _)| p).collect();
+            for declared in &agent.credentials {
+                assert!(
+                    !seeded.contains(declared),
+                    "{} declares {} as a credential, but geli builds it",
+                    agent.command,
+                    declared
+                );
+            }
+        }
     }
 }

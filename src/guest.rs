@@ -724,3 +724,636 @@ pub(crate) fn build_cloud_init(
         ],
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::*;
+    use yaml_rust2::YamlLoader;
+
+    fn session_cloud_init(dirs: &[&str], current: &str, cmd: &str) -> String {
+        session_cloud_init_with(dirs, current, cmd, &Packages::default())
+    }
+
+    fn session_cloud_init_with(
+        dirs: &[&str],
+        current: &str,
+        cmd: &str,
+        packages: &Packages,
+    ) -> String {
+        let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
+        let plan =
+            build_mount_script(&dirs, Path::new(current), &build_package_setup(packages), "");
+        let env = build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]);
+        let seed = vec![(".claude.json".to_string(), build_claude_config(&plan.folders, "sk-ant-test-key-0123456789"))];
+        build_cloud_init(&plan, cmd, &env, &[], &seed, None)
+    }
+
+    /// The bug that made geli never work: a YAML document that does not parse.
+    #[test]
+    fn session_cloud_init_parses() {
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec![], "/home/u/proj"),
+            (vec!["/home/u/proj"], "/home/u/proj"),
+            (vec!["/home/u/proj", "/home/u/other"], "/home/u/proj"),
+        ];
+
+        for (dirs, current) in cases {
+            let yaml = session_cloud_init(&dirs, current, "echo hello");
+            let parsed = YamlLoader::load_from_str(&yaml);
+            assert!(
+                parsed.is_ok(),
+                "cloud-init failed to parse for dirs={:?}: {:?}\n---\n{}",
+                dirs,
+                parsed.err(),
+                yaml
+            );
+        }
+
+        // The declared tools go into the same literal block as the mounts, and that block is
+        // where the document's shape has broken before: the install lines carry quotes, braces
+        // and `|`, and the retry helper brings its own blank lines.
+        let yaml = session_cloud_init_with(
+            &["/home/u/proj"],
+            "/home/u/proj",
+            "echo hello",
+            &Packages {
+                apk: vec!["ripgrep".into()],
+                npm: vec!["@scope/pkg".into()],
+                pip: vec!["httpx".into()],
+            },
+        );
+        let parsed = YamlLoader::load_from_str(&yaml);
+        assert!(parsed.is_ok(), "packages broke the document: {:?}\n---\n{}", parsed.err(), yaml);
+        assert!(yaml.contains("'ripgrep'"), "the install never reached the document");
+    }
+
+    #[test]
+    fn base_cloud_init_parses() {
+        let yaml = build_base_cloud_init(1000);
+        let parsed = YamlLoader::load_from_str(&yaml);
+        assert!(parsed.is_ok(), "{:?}\n---\n{}", parsed.err(), yaml);
+    }
+
+    /// The whole point of the golden image: a session must not install anything.
+    /// A restricted session carries one more `write_files` entry, and the ruleset inside it has
+    /// braces and semicolons of its own. Unparsed cloud-init fails *silently* — the VM boots and
+    /// the command never runs — so the restricted document needs its own case.
+    #[test]
+    fn restricted_session_cloud_init_parses() {
+        let dirs = [PathBuf::from("/home/u/proj")];
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "", &build_lockdown(Some(45678)));
+        let seed = vec![(".claude.json".to_string(), build_claude_config(&plan.folders, "sk-ant-test"))];
+        let creds = vec![(".claude/.credentials.json".to_string(), "{\"t\":1}".to_string())];
+        let yaml = build_cloud_init(&plan, "claude", "", &creds, &seed, Some(45678));
+
+        let parsed = YamlLoader::load_from_str(&yaml);
+        assert!(parsed.is_ok(), "{:?}\n---\n{}", parsed.err(), yaml);
+
+        // And the ruleset has to have actually survived into the document, not just parsed.
+        assert!(yaml.contains("/etc/geli/egress.nft"));
+        assert!(yaml.contains("tcp dport 45678 accept"));
+    }
+
+    #[test]
+    fn session_cloud_init_installs_nothing() {
+        let yaml = session_cloud_init(&["/home/u/proj"], "/home/u/proj", "claude");
+        assert!(!yaml.contains("apt-get"), "session still runs apt:\n{}", yaml);
+        assert!(!yaml.contains("npm install"), "session still runs npm:\n{}", yaml);
+        assert!(!yaml.contains("package_update"));
+    }
+
+    #[test]
+    fn base_cloud_init_bakes_tooling_and_login() {
+        let yaml = build_base_cloud_init(1000);
+        for expected in ["git", "geli-autologin"] {
+            assert!(yaml.contains(expected), "base recipe missing {:?}", expected);
+        }
+        // The marker must be guarded by a real check, not echoed unconditionally. The agents
+        // moved out to their own layers, so what the base proves is the toolchain.
+        assert!(yaml.contains("command -v node"));
+        assert!(yaml.contains(BUILD_OK_MARKER));
+
+        // Alpine ships Node 22, so no tarball — but the version is still checked, because
+        // npm installs onto a too-old runtime with only a warning.
+        assert!(yaml.contains("apk add"));
+        // Every network step must be retried: a single dropped TLS handshake would otherwise
+        // fail the whole build under `set -e`.
+        assert!(yaml.contains("retry apk update"));
+        assert!(yaml.contains("retry apk add"));
+        assert!(!yaml.contains("apt-get"), "apt leaked into the Alpine recipe");
+        assert!(yaml.contains(&format!("-ge {}", REQUIRED_NODE_MAJOR)));
+        // bash is not optional: Alpine defaults to busybox ash and the agent's Bash tool needs bash.
+        assert!(yaml.contains("bash"), "bash missing from the Alpine recipe");
+    }
+
+    #[test]
+    fn cloud_init_has_no_empty_runcmd_entries() {
+        let yaml = session_cloud_init(&["/home/u/proj", "/home/u/other"], "/home/u/proj", "echo hi");
+        for line in yaml.lines() {
+            assert_ne!(line.trim(), "-", "stray empty list entry in:\n{}", yaml);
+        }
+    }
+
+    #[test]
+    fn session_cloud_init_mounts_every_directory() {
+        let yaml = session_cloud_init(&["/home/u/proj", "/home/u/other"], "/home/u/proj", "echo hi");
+        assert!(yaml.contains("projshare1 /workspace/proj"));
+        assert!(yaml.contains("projshare2 /workspace/other"));
+        assert!(yaml.contains("cd /workspace/proj"));
+    }
+
+    /// The command must never land in .bashrc: it runs for every shell, so a nested subshell
+    /// would re-run it and poweroff mid-session.
+    #[test]
+    fn login_profile_waits_for_cloud_init_and_avoids_bashrc() {
+        assert!(LOGIN_PROFILE.contains("cloud-init status --wait"));
+        assert!(LOGIN_PROFILE.contains("/etc/geli/session"));
+        // Sourcing ~/.bashrc is fine; appending the command to it is not.
+        assert!(!LOGIN_PROFILE.contains(">> ~/.bashrc"));
+    }
+
+    /// Regression: Claude Code's Bash tool spawns login shells, which read .bash_profile. Without
+    /// a guard, every command the agent ran re-entered the session and hit `sudo poweroff`,
+    /// shutting the VM down mid-task.
+    /// Regression: Alpine's default user takes uid 1000, pushing `sandbox` to 1001. Files
+    /// arrive over 9p owned by the host user, so the agent could read the project but not
+    /// write to it.
+    #[test]
+    fn base_user_takes_the_host_uid() {
+        let yaml = build_base_cloud_init(1000);
+        assert!(yaml.contains("adduser -D -u 1000"));
+        // Alpine's own default user holds uid 1000 and has to go, or sandbox lands on 1001.
+        assert!(yaml.contains("deluser alpine"));
+        // The stock image waits 10s at a boot menu nobody is there to answer.
+        assert!(yaml.contains("TIMEOUT 1"), "boot menu timeout not disabled");
+
+        let other = build_base_cloud_init(1234);
+        assert!(other.contains("adduser -D -u 1234"));
+        // A different uid must produce a different image, or stale images go undetected.
+        assert_ne!(recipe_hash(&yaml), recipe_hash(&other));
+    }
+
+    #[test]
+    fn login_profile_runs_the_session_only_once() {
+        assert!(LOGIN_PROFILE.contains("GELI_SESSION_ACTIVE"));
+        assert!(LOGIN_PROFILE.contains("/tmp/.geli-session-active"));
+
+        // The poweroff must sit inside the guard, never at top level.
+        let guard = LOGIN_PROFILE
+            .find("GELI_SESSION_ACTIVE")
+            .expect("guard missing");
+        let poweroff = LOGIN_PROFILE.find("sudo poweroff").expect("poweroff missing");
+        assert!(poweroff > guard, "poweroff runs before the guard");
+
+        // Both branches source the environment, or the agent's commands lose TERM and keys.
+        assert_eq!(LOGIN_PROFILE.matches(". /etc/geli/env").count(), 2);
+    }
+
+    #[test]
+    fn indent_block_pads_content_but_not_blank_lines() {
+        let out = indent_block("a\n\nb", 4);
+        assert_eq!(out, "    a\n\n    b");
+        assert!(!out.ends_with('\n'), "trailing newline breaks block scalars");
+    }
+
+    #[test]
+    fn build_mount_script_marks_current_directory_as_active() {
+        let tmp = std::env::temp_dir().canonicalize().unwrap();
+        let dirs = vec![tmp.clone()];
+        let plan = build_mount_script(&dirs, &tmp, "", "");
+        assert_eq!(plan.active_folder, folder_name(&tmp));
+    }
+
+    #[test]
+    fn build_mount_script_falls_back_when_no_directory_matches() {
+        // Nothing canonicalizes to this path, so the fallback in build_mount_script applies.
+        let plan = build_mount_script(&[], Path::new("/home/u/myproject"), "", "");
+        assert_eq!(plan.active_folder, "myproject");
+        assert!(!plan.script.contains("cd /workspace/\n"));
+    }
+
+    #[test]
+    fn recipe_hash_tracks_recipe_changes() {
+        let host_uid = host_uid();
+    let recipe = build_base_cloud_init(host_uid);
+        assert_eq!(recipe_hash(&recipe), recipe_hash(&recipe));
+        assert_ne!(recipe_hash(&recipe), recipe_hash(&format!("{}\n# extra", recipe)));
+    }
+
+    /// `geli claude -p "explain this module"` used to reach the guest as four arguments, because
+    /// the line was joined with spaces and the guest's shell split it again.
+    #[test]
+    fn arguments_keep_their_quoting() {
+        let argv: Vec<String> =
+            ["claude", "-p", "explain this module"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(build_guest_command(&argv).line, r"'claude' '-p' 'explain this module'");
+
+        let awkward: Vec<String> =
+            ["sh", "-c", "echo $HOME && it's fine"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(build_guest_command(&awkward).line, r"'sh' '-c' 'echo $HOME && it'\''s fine'");
+
+        assert_eq!(build_guest_command(&[]).line, "");
+    }
+
+    /// The quoted line and the matched program are deliberately two fields. Matching a recipe
+    /// against `'claude'` finds nothing — and that failure is silent in the worst direction: the
+    /// session runs, with no credentials, saying only that the command is not an agent.
+    #[test]
+    fn the_agent_is_matched_before_the_command_is_quoted() {
+        let argv: Vec<String> =
+            ["/usr/local/bin/claude", "--resume"].iter().map(|s| s.to_string()).collect();
+        let cmd = build_guest_command(&argv);
+
+        assert_eq!(agent_for_command(&cmd.program).map(|a| a.command.as_str()), Some("claude"));
+        assert!(agent_for_command(&cmd.line).is_none(), "the quoted line must never be matched");
+        assert!(non_agent_notice(&cmd.program).is_none());
+    }
+
+    /// The breadcrumb must stay out of stdout: that stream belongs to the user's command.
+    #[test]
+    fn session_breadcrumb_goes_to_the_boot_console_not_stdout() {
+        let yaml = session_cloud_init(&["/home/u/proj"], "/home/u/proj", "claude");
+        assert!(yaml.contains("[geli] running:"));
+        assert!(yaml.contains("> /dev/ttyS1"), "breadcrumb would land on the user's terminal");
+    }
+
+    /// Regression: the guest inherited TERM=vt220 and a fixed 80x24 from the serial console, so
+    /// agent TUIs rendered in eight colours in a cramped window.
+    #[test]
+    fn terminal_setup_forwards_identity_and_size() {
+        let setup = build_terminal_setup("xterm-256color", "truecolor", Some((50, 200)));
+        assert!(setup.contains("export TERM='xterm-256color'"));
+        assert!(setup.contains("export COLORTERM='truecolor'"));
+        assert!(setup.contains("stty rows 50 cols 200"));
+
+        // No terminal to copy from (piped, cron): fall back rather than emitting a broken stty.
+        let headless = build_terminal_setup("", "", None);
+        assert!(headless.contains("export TERM='xterm-256color'"));
+        assert!(!headless.contains("stty"));
+        assert!(!headless.contains("COLORTERM"));
+    }
+
+    #[test]
+    fn terminal_setup_survives_cloud_init() {
+        let dirs = [PathBuf::from("/home/u/proj")];
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "", "");
+        let env = format!(
+            "{}\n{}",
+            build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]),
+            build_terminal_setup("screen-256color", "truecolor", Some((24, 100)))
+        );
+        let yaml = build_cloud_init(&plan, "claude", &env, &[], &[], None);
+
+        assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
+        assert!(yaml.contains("screen-256color"));
+        assert!(yaml.contains("stty rows 24 cols 100"));
+    }
+
+    /// Regression: the sandbox is disposable, so without seeded state the agent re-ran
+    /// onboarding every session — approve the API key, then trust the folder, every time.
+    #[test]
+    fn claude_config_preapproves_key_and_trusts_every_workspace() {
+        let folders = vec!["proj".to_string(), "other".to_string()];
+        let config = build_claude_config(&folders, "sk-ant-api03-ABCDEFGHIJKLMNOPQRST");
+        let parsed: serde_json::Value = serde_json::from_str(&config).expect("valid JSON");
+
+        assert_eq!(parsed["hasCompletedOnboarding"], true);
+        assert_eq!(parsed["projects"]["/workspace/proj"]["hasTrustDialogAccepted"], true);
+        assert_eq!(parsed["projects"]["/workspace/other"]["hasTrustDialogAccepted"], true);
+
+        // Only the last 20 characters are recorded, never the whole key.
+        let approved = parsed["customApiKeyResponses"]["approved"][0].as_str().unwrap();
+        assert_eq!(approved, "ABCDEFGHIJKLMNOPQRST");
+        assert_eq!(approved.len(), 20);
+        assert!(!config.contains("sk-ant-api03"));
+    }
+
+    #[test]
+    fn claude_config_without_a_key_approves_nothing() {
+        let config = build_claude_config(&["proj".to_string()], "");
+        let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(
+            parsed["customApiKeyResponses"]["approved"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(parsed["hasCompletedOnboarding"], true);
+    }
+
+    #[test]
+    fn claude_config_survives_cloud_init() {
+        let yaml = session_cloud_init(&["/home/u/proj"], "/home/u/proj", "claude");
+        assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
+        assert!(yaml.contains("/home/sandbox/.claude.json"));
+        assert!(yaml.contains("hasTrustDialogAccepted"));
+    }
+
+    /// The guest config holds exactly what suppresses the first-run prompts, and nothing else.
+    ///
+    /// Verified on a real sandbox: with credentials present but this file absent, the agent still
+    /// runs its onboarding. Seeding anything further from the host — machine/user ids, the cached
+    /// account profile — was tried and reverted: it changed no prompt and no measurable startup
+    /// time, so it only put more of the user's data in the guest.
+    #[test]
+    fn claude_config_holds_only_what_suppresses_the_prompts() {
+        let config = build_claude_config(&["proj".to_string()], "");
+        let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+        let keys: Vec<&String> = parsed.as_object().unwrap().keys().collect();
+
+        assert_eq!(
+            keys,
+            vec!["customApiKeyResponses", "hasCompletedOnboarding", "projects"],
+            "guest config grew beyond the keys that suppress prompts"
+        );
+    }
+
+    #[test]
+    fn forwarded_credentials_land_in_cloud_init() {
+        let dirs = [PathBuf::from("/home/u/proj")];
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "", "");
+        let creds = vec![(
+            ".claude/.credentials.json".to_string(),
+            r#"{"claudeAiOauth":{"accessToken":"tok","refreshToken":"ref"}}"#.to_string(),
+        )];
+        let yaml = build_cloud_init(&plan, "claude", "", &creds, &[], None);
+
+        assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
+        assert!(yaml.contains("/home/sandbox/.claude/.credentials.json"));
+        assert!(yaml.contains("accessToken"));
+        // Must not be world-readable inside the guest.
+        let block = yaml.split("/home/sandbox/.claude/.credentials.json").nth(1).unwrap();
+        assert!(block.contains("permissions: '0600'"));
+    }
+
+    #[test]
+    fn omitting_credentials_leaves_the_document_valid() {
+        let yaml = session_cloud_init(&["/home/u/proj"], "/home/u/proj", "claude");
+        assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
+        assert!(!yaml.contains(".credentials.json"));
+    }
+
+    /// A blank ANTHROPIC_API_KEY would shadow forwarded OAuth credentials, because Claude Code
+    /// treats the variable's presence as taking precedence over a claude.ai login.
+    #[test]
+    fn empty_env_vars_are_not_exported() {
+        let exports = build_env_exports(&[
+            ("ANTHROPIC_API_KEY", String::new()),
+            ("OPENAI_API_KEY", "   ".to_string()),
+        ]);
+        assert_eq!(exports, "");
+
+        let exports = build_env_exports(&[
+            ("ANTHROPIC_API_KEY", "sk-real".to_string()),
+            ("OPENAI_API_KEY", String::new()),
+        ]);
+        assert_eq!(exports, "export ANTHROPIC_API_KEY='sk-real'");
+    }
+
+    #[test]
+    fn forwarded_credentials_count_as_credentials() {
+        // No API key, but credentials were copied in: nothing to warn about.
+        assert!(credential_warning("claude", true).is_none());
+    }
+
+    /// Not a real test: writes every generated guest document to /tmp so a refactor can be
+    /// proven byte-identical. Run with `cargo test dump_generated -- --ignored`.
+    #[ignore]
+    #[test]
+    fn dump_generated_documents() {
+        let dir = std::path::PathBuf::from("/tmp/geli-baseline");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let dirs = [PathBuf::from("/home/u/proj"), PathBuf::from("/home/u/api")];
+        let packages = Packages {
+            apk: vec!["ripgrep".into(), "jq".into()],
+            npm: vec!["@scope/pkg".into()],
+            pip: vec!["httpx".into()],
+        };
+        let plan = build_mount_script(
+            &dirs,
+            Path::new("/home/u/proj"),
+            &build_package_setup(&packages),
+            &build_lockdown(Some(45678)),
+        );
+        let env = format!(
+            "{}\n{}\n{}",
+            build_env_exports(&[("ANTHROPIC_API_KEY", "sk-fixed".to_string())]),
+            build_proxy_env(Some(45678)),
+            build_terminal_setup("xterm-256color", "truecolor", Some((46, 190)))
+        );
+        let seed = vec![(".claude.json".to_string(), build_claude_config(&plan.folders, "sk-ant-fixed-0123456789"))];
+        let creds = vec![(".claude/.credentials.json".to_string(), "{\"t\":1}".to_string())];
+
+        let files: Vec<(&str, String)> = vec![
+            ("base.cloud-init.yaml", build_base_cloud_init(1000)),
+            ("session.cloud-init.yaml", build_cloud_init(&plan, "claude", &env, &creds, &seed, Some(45678))),
+            ("setup.sh", base_setup_script(1000)),
+            ("verify.sh", base_verify_script()),
+            ("profile.sh", LOGIN_PROFILE.to_string()),
+            ("autologin.sh", AUTOLOGIN_HELPER.to_string()),
+            ("packages.sh", packages_helper()),
+            ("mounts.sh", plan.script.clone()),
+            ("claude.json", seed[0].1.clone()),
+            ("lockdown.sh", build_lockdown(Some(45678))),
+            ("egress.nft", build_egress_ruleset(45678)),
+        ];
+        // One per agent: a layer recipe is the only place an agent's install reaches the guest.
+        let mut files = files;
+        for agent in agents() {
+            files.push((
+                // Leaked into the loop's lifetime on purpose — this is a dump, not a test.
+                Box::leak(format!("layer.{}.cloud-init.yaml", agent.command).into_boxed_str()),
+                build_layer_cloud_init(agent, 1000),
+            ));
+        }
+        for (name, body) in files {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+    }
+
+    fn sample_packages() -> Packages {
+        Packages {
+            apk: vec!["ripgrep".into(), "jq".into()],
+            npm: vec!["prettier".into()],
+            pip: Vec::new(),
+        }
+    }
+
+    /// The order is the whole correctness of this feature. The lockdown deletes the default
+    /// route, empties `/etc/resolv.conf` and loads a default-drop ruleset, so a package fetched
+    /// after it cannot succeed — and because a failed install only warns, it would not succeed
+    /// *quietly*: the session would start without its tools and the reason would be one line in a
+    /// console log nobody reads.
+    #[test]
+    fn packages_install_before_egress_is_cut() {
+        let plan = build_mount_script(
+            &[PathBuf::from("/home/u/proj")],
+            Path::new("/home/u/proj"),
+            &build_package_setup(&sample_packages()),
+            &build_lockdown(Some(45678)),
+        );
+
+        let apk = plan.script.find("apk add").expect("no apk install");
+        let cut = plan.script.find("ip route del default").expect("no lockdown");
+        let ready = plan.script.find(READY_MARKER).expect("no ready marker");
+        assert!(apk < cut, "packages are fetched after egress was cut, so they cannot be fetched");
+        assert!(cut < ready, "the lockdown must still precede the marker");
+
+        // The caches only help if the install actually points at them: these run as root, whose
+        // own npm and pip caches are somewhere else entirely.
+        assert!(plan.script.contains("mount -t 9p"), "no 9p mounts at all");
+        assert!(plan.script.contains("apkcache /var/cache/apk"));
+        assert!(plan.script.contains("--cache /home/sandbox/.cache/npm"));
+
+        // A missing tool is not a broken promise, unlike a ruleset that failed to load — so the
+        // install block warns where the lockdown powers off. Asserted on the block alone: the
+        // lockdown's own `poweroff` lives further down the same script.
+        let block = build_package_setup(&sample_packages());
+        assert!(block.contains("install failed"), "a failed install says nothing");
+        assert!(!block.contains("poweroff"), "a failed install must not kill the session");
+    }
+
+    /// Nothing declared, nothing emitted: a session that asked for no tools must generate the
+    /// same script it did before this existed.
+    #[test]
+    fn no_packages_means_no_install_step() {
+        assert_eq!(build_package_setup(&Packages::default()), "");
+    }
+
+    /// The baseline has to be taken after the declared packages are installed, or every run would
+    /// re-offer what `.geli.json` already says.
+    #[test]
+    fn the_baseline_is_taken_after_the_declared_installs() {
+        let plan = build_mount_script(
+            &[PathBuf::from("/home/u/proj")],
+            Path::new("/home/u/proj"),
+            &build_package_setup(&sample_packages()),
+            &build_lockdown(Some(45678)),
+        );
+
+        let install = plan.script.find("apk add").expect("no install");
+        let baseline = plan.script.find("geli-packages snapshot").expect("no baseline");
+        assert!(install < baseline, "the baseline would record the declared packages as absent");
+
+        // And the report is the other half, from the profile that runs after the command.
+        assert!(LOGIN_PROFILE.contains("geli-packages report"));
+        let report = LOGIN_PROFILE.find("geli-packages report").unwrap();
+        let off = LOGIN_PROFILE.find("sudo poweroff -f").unwrap();
+        assert!(report < off, "the VM would be gone before it said what it installed");
+    }
+
+    /// Regression guard for the point of this change: the session must leave the guest's console
+    /// somewhere other than the terminal, and signal readiness through it.
+    #[test]
+    fn mount_script_ends_with_the_ready_marker() {
+        let plan = build_mount_script(&[PathBuf::from("/home/u/proj")], Path::new("/home/u/proj"), "", "");
+        assert_eq!(
+            plan.script.trim_end().lines().last().unwrap().trim(),
+            format!("echo {}", READY_MARKER)
+        );
+        // The session writes its breadcrumb there, and /dev is rebuilt every boot.
+        assert!(plan.script.contains("chmod 0666 /dev/ttyS1"));
+    }
+
+    #[test]
+    fn base_recipe_silences_the_guest_and_hands_out_the_kernel() {
+        let yaml = build_base_cloud_init(1000);
+        // Nothing of the distro's own chatter should reach a clean session.
+        assert!(yaml.contains("rm -f /etc/motd"));
+        assert!(yaml.contains("/etc/issue"));
+        // `getty -n` writes a CRLF before handing over, a blank line on the user's stdout.
+        assert!(yaml.contains("ttyS0::respawn:/usr/local/bin/geli-autologin"));
+        assert!(!yaml.contains("/sbin/getty"), "autologin went back through getty");
+        // Direct boot needs these out of the image.
+        assert!(yaml.contains(KERNEL_NAME));
+        assert!(yaml.contains(INITRD_NAME));
+        assert!(yaml.contains(BASE_META_NAME));
+        assert!(yaml.contains("/proc/cmdline"), "the cmdline must be captured, not invented");
+    }
+
+    #[test]
+    fn login_profile_flushes_before_cutting_power() {
+        // The project lives on 9p; a forced poweroff without sync can lose writes.
+        // Match the commands, not the comment that mentions them.
+        let sync = LOGIN_PROFILE.find("\n        sync\n").expect("no sync before poweroff");
+        let off = LOGIN_PROFILE.find("sudo poweroff -f").expect("not a forced poweroff");
+        assert!(sync < off, "sync must run before power is cut");
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("abc"), "'abc'");
+        assert_eq!(shell_quote("a'b"), r"'a'\''b'");
+    }
+
+    /// Antigravity asks four onboarding questions, a theme, a retention warning and a trust
+    /// prompt per folder, each in a different file. A disposable VM gets asked all of it again
+    /// every session unless these are seeded.
+    #[test]
+    fn antigravity_seed_answers_every_first_run_prompt() {
+        let agent = agent_for_command("agy").unwrap();
+        let seed = seed_files(agent, &["my-repo".to_string()], "");
+        let file = |p: &str| {
+            seed.iter().find(|(path, _)| path == p).map(|(_, c)| c.clone())
+                .unwrap_or_else(|| panic!("{} missing from the seed", p))
+        };
+
+        let jetski = file(".gemini/antigravity-cli/jetski_state.pbtxt");
+        assert!(jetski.contains("AGENT_ONBOARDING_STATE_COMPLETED"));
+        assert!(jetski.contains("POST_ONBOARDING_STEP_TYPE_"));
+
+        let settings = file(".gemini/settings.json");
+        assert!(settings.contains("\"theme\": \"Ayu\""));
+        assert!(settings.contains("\"warningAcknowledged\": true"));
+        assert!(settings.contains("\"onboardingComplete\": true"));
+
+        let cli = file(".gemini/antigravity-cli/settings.json");
+        assert!(cli.contains("/workspace/my-repo"));
+        assert!(cli.contains("tokyo night"));
+
+        let trusted = file(".gemini/trustedFolders.json");
+        assert!(trusted.contains("/workspace/my-repo"));
+        assert!(trusted.contains("TRUST_FOLDER"));
+
+        // Every seeded document must be valid on its own; a malformed one is a first-run prompt
+        // that comes back, which looks like geli not working rather than a broken file.
+        for (path, body) in &seed {
+            if path.ends_with(".json") {
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(body).is_ok(),
+                    "{} is not valid JSON:\n{}",
+                    path,
+                    body
+                );
+            }
+        }
+    }
+
+    /// The seed is built from the mounted workspace and nothing else. An earlier version merged
+    /// the host's own copies, which carried `~/.gemini/trustedFolders.json` whole — 29 absolute
+    /// paths naming other clients' projects, on the machine where this was found — into a VM with
+    /// network access. The sandbox has no business learning what else exists on the host.
+    #[test]
+    fn seeding_never_reads_the_host() {
+        let home = std::env::temp_dir().join(format!("geli-seed-host-{}", std::process::id()));
+        fs::create_dir_all(home.join(".gemini")).unwrap();
+        fs::write(
+            home.join(".gemini/trustedFolders.json"),
+            r#"{"/home/u/other-client/secret-project": "TRUST_FOLDER"}"#,
+        )
+        .unwrap();
+
+        for agent in agents() {
+            for (path, body) in seed_files(agent, &["mine".to_string()], "sk-ant-key") {
+                assert!(
+                    !body.contains("other-client") && !body.contains("secret-project"),
+                    "{} for {} leaked a host path",
+                    path,
+                    agent.command
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(&home);
+    }
+}

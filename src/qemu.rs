@@ -540,6 +540,9 @@ pub(crate) fn share_args(dirs: &[PathBuf], caches: &[(&str, PathBuf)]) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layer_hash;
+    use crate::agents;
+    use crate::agent_for_command;
 
     /// One `-fsdev`/`-device` pair per directory, tagged by position, and the caches after them.
     #[test]
@@ -559,5 +562,272 @@ mod tests {
         assert!(args[9].contains("npmcache"));
 
         assert!(share_args(&[], &[]).is_empty());
+    }
+
+
+    /// Phases must come from the guest's own output. A loader that advances on a timer is
+    /// confidently wrong exactly when the boot is stuck, which is the only time anyone reads it.
+    #[test]
+    fn boot_phase_tracks_the_guest_not_a_clock() {
+        assert_eq!(boot_phase(""), "starting");
+        assert_eq!(boot_phase("   OpenRC 0.62.6 is starting up"), "boot");
+        assert_eq!(boot_phase("OpenRC\n * Starting networking ... [ ok ]"), "network");
+        assert_eq!(
+            boot_phase("OpenRC\nStarting networking\nCloud-init v. 24.3.1 running 'init' at"),
+            "cloud-init"
+        );
+        assert_eq!(
+            boot_phase("OpenRC\nStarting networking\nrunning 'init'\n+ mount -t 9p -o trans=virtio"),
+            "mounts"
+        );
+    }
+
+    /// `running 'init-local'` is an earlier stage and must not be mistaken for `running 'init'`.
+    #[test]
+    fn boot_phase_does_not_confuse_init_local_with_init() {
+        let early = "OpenRC\nCloud-init v. 24.3.1 running 'init-local' at Sun";
+        assert_eq!(boot_phase(early), "boot");
+    }
+
+    /// The guest's console must never land on the user's terminal, and `root=` must survive:
+    /// hardcoding it is how a boot breaks silently on a differently-labelled image.
+    #[test]
+    fn boot_cmdline_moves_the_console_and_keeps_root() {
+        let original = "BOOT_IMAGE=vmlinuz-virt root=LABEL=/ modules=sd-mod,usb-storage,ext4 \
+                        console=ttyS0,115200n8 console=ttyAMA0,115200n8 initrd=initramfs-virt";
+        let out = boot_cmdline(original);
+
+        assert!(out.contains("root=LABEL=/"));
+        assert!(out.contains("modules=sd-mod,usb-storage,ext4"));
+        assert!(out.contains(&format!("console={}", BOOT_CONSOLE)));
+        assert!(out.contains("quiet"));
+
+        // Nothing may route the guest console back to ttyS0, and the bootloader's own keys are
+        // meaningless without a bootloader.
+        assert!(!out.contains("ttyS0"));
+        assert!(!out.contains("BOOT_IMAGE="));
+        assert!(!out.contains("initrd="));
+    }
+
+    #[test]
+    fn boot_cmdline_is_idempotent() {
+        let once = boot_cmdline("root=LABEL=/ console=ttyS0,115200n8");
+        assert_eq!(once, boot_cmdline(&once), "re-deriving must not stack flags");
+        assert_eq!(once.matches("quiet").count(), 1);
+    }
+
+    #[test]
+    fn image_meta_round_trips() {
+        let meta = parse_image_meta("cmdline=root=LABEL=/ console=ttyS0\nalpine=3.22.2\nnode=22.23.2\n");
+        assert_eq!(meta.alpine, "3.22.2");
+        assert_eq!(meta.node, "22.23.2");
+        assert!(meta.cmdline.starts_with("root=LABEL=/"));
+        assert!(meta.agents.is_empty(), "the base image carries no agent");
+        assert_eq!(describe_image(&meta), "alpine 3.22.2");
+    }
+
+    /// The base image's metadata plus one file per layer is what the status block describes, so
+    /// the merge has to accumulate agents rather than replace them.
+    #[test]
+    fn image_meta_accumulates_one_entry_per_layer() {
+        let mut meta = parse_image_meta("alpine=3.22.2\nnode=22.23.2\n");
+        merge_image_meta(&mut meta, "agent.claude=2.1.289\n");
+        merge_image_meta(&mut meta, "agent.opencode=0.4.2\n");
+
+        assert_eq!(
+            meta.agents,
+            vec![
+                ("claude".to_string(), "2.1.289".to_string()),
+                ("opencode".to_string(), "0.4.2".to_string())
+            ]
+        );
+        assert_eq!(describe_image(&meta), "alpine 3.22.2 · claude 2.1.289 · opencode 0.4.2");
+    }
+
+    #[test]
+    fn image_meta_tolerates_a_missing_or_partial_file() {
+        assert_eq!(parse_image_meta(""), ImageMeta::default());
+        let partial = parse_image_meta("node=22.23.2\nagent.agy=1.2.16\ngarbage line\n");
+        assert_eq!(partial.node, "22.23.2");
+        // An image line with holes in it should not print empty fields.
+        assert_eq!(describe_image(&partial), "agy 1.2.16");
+    }
+
+    /// A layer's recorded hash covers its parent's, so editing one agent's recipe invalidates
+    /// that layer and everything stacked above it — and leaves its siblings alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn layer_hash_follows_the_parent() {
+        let base = recipe_hash("base");
+        let claude = layer_hash(&base, "install claude");
+        let stacked = layer_hash(&claude, "install opencode");
+
+        assert_ne!(claude, layer_hash(&base, "install claude v2"));
+        assert_ne!(
+            stacked,
+            layer_hash(&layer_hash(&base, "install claude v2"), "install opencode"),
+            "a changed parent must invalidate what sits on it"
+        );
+        assert_ne!(claude, layer_hash(&recipe_hash("other base"), "install claude"));
+    }
+
+    /// The layer recipe is the one place an agent's `install` reaches the guest now, and the
+    /// sentinel has to sit behind the binary existing: cloud-init does not abort runcmd on
+    /// failure, so a layer whose install died would otherwise be published as working.
+    #[test]
+    fn layer_recipe_installs_one_agent_and_proves_it() {
+        let agent = agent_for_command("claude").expect("claude is a shipped recipe");
+        let doc = build_layer_cloud_init(agent, 1000);
+
+        let parsed = yaml_rust2::YamlLoader::load_from_str(&doc);
+        assert!(parsed.is_ok(), "layer cloud-init must parse: {:?}\n---\n{}", parsed.err(), doc);
+        assert!(doc.contains("@anthropic-ai/claude-code"), "it must install the agent");
+        assert!(doc.contains("retry()"), "an install is documented as having retry in scope");
+        assert!(doc.contains("command -v claude >/dev/null || exit 0"));
+        assert!(doc.contains("fstrim"), "a layer that does not trim keeps every deleted block");
+
+        let marker = doc.find(BUILD_OK_MARKER).expect("the sentinel must be there");
+        let check = doc.find("command -v claude").unwrap();
+        assert!(check < marker, "the sentinel must come after the check, not before");
+
+        // Only this agent. A layer carrying two could not be reused by a session wanting one.
+        for other in agents().iter().filter(|a| a.command != "claude") {
+            assert!(!doc.contains(&other.install), "{} leaked into claude's layer", other.command);
+        }
+    }
+
+    /// The base image is the layers' backing file: if it carried an agent too, the split would
+    /// save nothing for whoever does not use that one.
+    #[test]
+    fn base_image_carries_no_agent() {
+        let doc = build_base_cloud_init(1000);
+        for agent in agents() {
+            assert!(
+                !doc.contains(&agent.install),
+                "{} is installed in the base image, which is what layers are for",
+                agent.command
+            );
+        }
+    }
+
+    /// The login profile drops this flag before waiting on cloud-init, so it exists while a
+    /// layer is being built. Baked into the layer, it would send every real session down the
+    /// nested-shell branch: the command never runs and the VM sits there until the timeout.
+    #[test]
+    fn layer_recipe_clears_the_session_flag_it_inherits() {
+        assert!(LOGIN_PROFILE.contains("/tmp/.geli-session-active"));
+        let agent = agent_for_command("claude").unwrap();
+        assert!(agent_layer_script(agent, 1000).contains("rm -f /tmp/.geli-session-active"));
+    }
+
+    /// Layers are built on first use, so two shells starting the same agent race for the same
+    /// files. Measured before the lock existed: two `geli agy` a second apart, and the second
+    /// deleted the first's half-built overlay and died with a bare `Error: Os { code: 2 }`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_one_process_may_build_an_image() {
+        let lock = std::env::temp_dir().join(format!("geli-lock-test-{}", std::process::id()));
+        let _ = fs::remove_file(&lock);
+
+        let first = try_build_lock(&lock).unwrap();
+        assert!(first.is_some(), "the first caller must get the lock");
+        assert!(
+            try_build_lock(&lock).unwrap().is_none(),
+            "a second caller must be told to wait, not handed the same lock"
+        );
+        assert!(lock_holder_alive(&lock), "this process holds it and is plainly alive");
+
+        // Dropping is what releases it, which is what covers every early return in ensure_layer.
+        drop(first);
+        assert!(!lock.exists(), "the lock must not outlive its guard");
+        assert!(try_build_lock(&lock).unwrap().is_some(), "and must be retakeable afterwards");
+        let _ = fs::remove_file(&lock);
+    }
+
+    /// A build killed mid-flight cannot leave a lock that blocks every later run: `process::exit`
+    /// skips the guard's `Drop`, so the holder's pid in the file is the only way to tell "still
+    /// building" from "died holding this".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lock_whose_holder_died_is_not_held() {
+        let lock = std::env::temp_dir().join(format!("geli-stale-test-{}", std::process::id()));
+
+        // pid 1 is always alive; a pid this high is not in use on Linux.
+        fs::write(&lock, "1\n").unwrap();
+        assert!(lock_holder_alive(&lock));
+
+        fs::write(&lock, "4294967290\n").unwrap();
+        assert!(!lock_holder_alive(&lock), "a dead holder must not hold the lock forever");
+
+        // An unreadable lock is treated as held rather than stolen — the cautious direction.
+        fs::write(&lock, "written by something older\n").unwrap();
+        assert!(lock_holder_alive(&lock));
+
+        // And waiting on a lock whose holder is gone clears it and returns, rather than timing out.
+        fs::write(&lock, "4294967290\n").unwrap();
+        assert!(wait_for_builder(&lock, "test", std::time::Duration::from_secs(5)));
+        assert!(!lock.exists(), "the stale lock must be cleared, not merely stepped over");
+
+        let _ = fs::remove_file(&lock);
+    }
+
+    /// Every image gets its own console log. They shared one, and since each build truncates the
+    /// file it writes, `--build-image --agents a,b` ended holding only `b`'s console — CI then
+    /// uploaded that remainder as the run's only evidence.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_image_logs_to_its_own_file() {
+        let names = [
+            BASE_LOG_NAME.to_string(),
+            layer_log_name("claude"),
+            layer_log_name("opencode"),
+            layer_log_name("agy"),
+        ];
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "two builds would overwrite each other: {:?}", names);
+
+        // `discard_layers` sweeps `geli-layer-*`, so a layer's log has to be caught by it too —
+        // otherwise rebuilding the base leaves logs describing images that are gone.
+        for name in names.iter().filter(|n| *n != BASE_LOG_NAME) {
+            assert!(name.starts_with("geli-layer-"), "{} escapes discard_layers", name);
+        }
+        assert!(!BASE_LOG_NAME.starts_with("geli-layer-"), "the base log must survive that sweep");
+    }
+
+    /// `-cpu host` is a KVM-only model, so the accelerator and the CPU model have to move
+    /// together: emitting `host` without `-enable-kvm` is not a slow sandbox but one QEMU refuses
+    /// to start. Measured on this host: ~10s accelerated against 99s emulated, so the fallback is
+    /// worth having and worth warning about.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_model_follows_the_accelerator() {
+        let accelerated = accel_args(true);
+        assert!(accelerated.contains(&"-enable-kvm".to_string()));
+        assert_eq!(accelerated.windows(2).find(|w| w[0] == "-cpu").map(|w| &w[1]), Some(&"host".to_string()));
+
+        let emulated = accel_args(false);
+        assert!(
+            !emulated.contains(&"-enable-kvm".to_string()),
+            "asking for KVM on a host without it fails at launch"
+        );
+        assert_eq!(emulated.windows(2).find(|w| w[0] == "-cpu").map(|w| &w[1]), Some(&"max".to_string()));
+        assert!(
+            !emulated.contains(&"host".to_string()),
+            "`-cpu host` under emulation is refused by QEMU, so this must never pair with TCG"
+        );
+    }
+
+    /// A ceiling, not a reservation — but a Linux guest fills whatever it is given with page
+    /// cache that QEMU's RSS never gives back, which is why it came down from 4 GiB at all.
+    /// Measured peak RSS with an agent reading a file: 728 MB at 4 GiB, 635 at 2, 588 at 1.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_memory_leaves_room_over_the_measured_peak() {
+        let mem = guest_memory();
+        // Only meaningful if the environment has not overridden it for this run.
+        if std::env::var_os("GELI_MEMORY").is_none() {
+            assert_eq!(mem, "2G", "1G worked but left a trivial task at 57% of the ceiling");
+        }
+        assert!(mem.ends_with('G') || mem.ends_with('M'), "QEMU needs a unit: {}", mem);
     }
 }

@@ -362,3 +362,218 @@ pub(crate) fn tunnel(client: TcpStream, upstream: TcpStream) {
     let _ = client_write.shutdown(std::net::Shutdown::Write);
     let _ = up.join();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::*;
+
+
+    #[test]
+    fn allowlist_opens_only_the_invoked_agents_hosts() {
+        let for_claude = session_allowlist(agent_for_command("claude"), &[]);
+        assert!(for_claude.contains(&"api.anthropic.com".to_string()));
+        assert!(!for_claude.iter().any(|h| h.contains("googleapis")));
+
+        let for_agy = session_allowlist(agent_for_command("agy"), &[]);
+        assert!(for_agy.iter().any(|h| h.contains("googleapis")));
+        assert!(!for_agy.contains(&"api.anthropic.com".to_string()));
+
+        // Registries are common ground: every agent needs to install things.
+        for list in [&for_claude, &for_agy] {
+            assert!(list.contains(&"registry.npmjs.org".to_string()));
+        }
+    }
+
+    // --- egress policy ---
+
+    /// The proxy must survive being used more than once. A blocked host is enough to exercise
+    /// accept → parse → refuse without touching the real network.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proxy_serves_more_than_one_connection() {
+        use std::io::{Read, Write};
+
+        let log = std::env::temp_dir().join(format!("geli-proxy-{}.log", std::process::id()));
+        let proxy = net::start_proxy(vec!["allowed.example".to_string()], log.clone())
+            .expect("proxy failed to start");
+
+        for attempt in 1..=3 {
+            let mut c = std::net::TcpStream::connect(("127.0.0.1", proxy.port))
+                .unwrap_or_else(|e| panic!("connection {} refused: {}", attempt, e));
+            c.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            c.write_all(b"CONNECT blocked.example:443 HTTP/1.1\r\n\r\n").unwrap();
+
+            let mut buf = [0u8; 64];
+            let n = c.read(&mut buf).unwrap_or(0);
+            let reply = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(reply.contains("403"), "connection {} got {:?}", attempt, reply);
+        }
+
+        let _ = std::fs::remove_file(&log);
+    }
+
+    fn allow() -> Vec<String> {
+        session_allowlist(
+            agent_for_command("claude"),
+            &["*.internal.example".to_string(), ".corp.test".to_string()],
+        )
+    }
+
+    #[test]
+    fn allowlist_matches_exactly_and_by_suffix() {
+        let a = allow();
+        assert!(host_allowed("api.anthropic.com", &a));
+        assert!(host_allowed("API.Anthropic.COM", &a), "hosts are case-insensitive");
+        assert!(host_allowed("api.anthropic.com.", &a), "a trailing dot is the same host");
+
+        // Suffix rules cover the base and its subdomains, and nothing else.
+        assert!(host_allowed("registry.internal.example", &a));
+        assert!(host_allowed("internal.example", &a));
+        assert!(host_allowed("deep.nested.corp.test", &a));
+    }
+
+    /// The failure that matters: something not on the list must not slip through. A suffix rule
+    /// must not match a host that merely *ends with the same text*.
+    #[test]
+    fn allowlist_rejects_everything_else() {
+        let a = allow();
+        for host in [
+            "example.com",
+            "evil.com",
+            "",
+            "anthropic.com",                 // the rule is api.anthropic.com, not the apex
+            "api.anthropic.com.evil.com",    // suffix-appending attack
+            "notinternal.example",           // `.internal.example` must need the dot
+            "fake-corp.test",
+        ] {
+            assert!(!host_allowed(host, &a), "{:?} should not be allowed", host);
+        }
+    }
+
+    #[test]
+    fn proxy_only_accepts_connect() {
+        assert_eq!(
+            parse_proxy_request("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: x\r\n\r\n"),
+            ProxyRequest::Connect { host: "api.anthropic.com".into(), port: 443 }
+        );
+        // busybox wget proxies plain HTTP as an absolute-form GET; it must be refused, visibly.
+        match parse_proxy_request("GET http://example.com/ HTTP/1.1\r\n\r\n") {
+            ProxyRequest::Unsupported(line) => assert!(line.contains("GET")),
+            other => panic!("absolute-form GET was accepted: {:?}", other),
+        }
+        assert!(matches!(parse_proxy_request(""), ProxyRequest::Unsupported(_)));
+        assert!(matches!(parse_proxy_request("CONNECT\r\n"), ProxyRequest::Unsupported(_)));
+    }
+
+    /// A port other than 443 turns the proxy into a general tunnel, so the parse must surface it
+    /// for the caller to reject.
+    #[test]
+    fn proxy_surfaces_the_requested_port() {
+        assert_eq!(
+            parse_proxy_request("CONNECT github.com:22 HTTP/1.1\r\n\r\n"),
+            ProxyRequest::Connect { host: "github.com".into(), port: 22 }
+        );
+        assert_ne!(22, ALLOWED_PORT);
+    }
+
+    #[test]
+    fn proxy_env_points_at_the_host_gateway() {
+        assert_eq!(build_proxy_env(None), "");
+        let env = build_proxy_env(Some(45678));
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY"] {
+            assert!(env.contains(key), "{} missing: some tools read only one form", key);
+        }
+        // Measured: a guestfwd forwards one connection and then dies, so the proxy is reached
+        // through slirp's host alias instead.
+        assert!(env.contains("10.0.2.2:45678"));
+        assert!(!env.contains("10.0.2.100"));
+    }
+
+    /// All three parts of the lockdown are load-bearing. Dropping the route cuts what is off-link;
+    /// the ruleset cuts what is still on-link, DNS above all; narrowing sudo is what stops the
+    /// agent — root in the guest by default — from undoing either.
+    #[test]
+    fn lockdown_cuts_the_route_the_resolver_and_root() {
+        assert_eq!(build_lockdown(None), "", "an open session must not be touched");
+
+        let locked = build_lockdown(Some(45678));
+        assert!(locked.contains("ip route del default"));
+        assert!(locked.contains("nft -f /etc/geli/egress.nft"));
+        assert!(locked.contains("NOPASSWD: /sbin/poweroff"));
+        assert!(
+            !locked.contains("NOPASSWD: ALL"),
+            "leaving blanket sudo would let the agent undo the route"
+        );
+
+        // The status block has already told the user egress is restricted by the time this runs.
+        // Carrying on with an unapplied ruleset would make that a lie, so it has to be fatal.
+        let fail = locked.find("if ! nft -f").expect("the ruleset must be applied conditionally");
+        let off = locked.find("poweroff -f").expect("a failed ruleset must stop the session");
+        assert!(fail < off);
+    }
+
+    /// Sudo is narrowed *after* the route and the ruleset, because the agent is root until then.
+    /// Narrowing first would leave the two steps that matter running with less privilege than
+    /// they need; narrowing last is what makes them stick.
+    #[test]
+    fn lockdown_takes_privilege_away_last() {
+        let locked = build_lockdown(Some(45678));
+        let route = locked.find("ip route del default").unwrap();
+        let nft = locked.find("nft -f").unwrap();
+        let sudo = locked.find("NOPASSWD: /sbin/poweroff").unwrap();
+        assert!(route < sudo && nft < sudo);
+    }
+
+    /// The ruleset's whole allowance is one TCP port on the host alias. A rule naming the host
+    /// without the port would be a tunnel out through anything else listening there.
+    #[test]
+    fn egress_ruleset_opens_only_the_proxy_port() {
+        let rules = build_egress_ruleset(45678);
+        assert!(rules.contains("policy drop"));
+        assert!(rules.contains("ip daddr 10.0.2.2 tcp dport 45678 accept"));
+        assert!(rules.contains(r#"oifname "lo" accept"#), "the agent's own loopback must survive");
+
+        // The resolver is the reason this file exists; it must not appear as an accept rule.
+        for line in rules.lines().filter(|l| l.trim_start().starts_with("ip daddr")) {
+            assert!(!line.contains(GUEST_DNS), "the resolver must not be reachable: {}", line);
+        }
+        // `inet`, not `ip`: a v4-only table would leave IPv6 egress wide open.
+        assert!(rules.contains("table inet geli"));
+
+        assert_eq!(build_egress_entry(None), "", "an open session gets no policy file at all");
+        assert!(build_egress_entry(Some(45678)).contains("/etc/geli/egress.nft"));
+    }
+
+    /// The lockdown has to be in place before the agent runs, and the readiness marker is what
+    /// tells the host the guest is ready — so the lockdown must come first.
+    #[test]
+    fn lockdown_runs_before_the_session_is_declared_ready() {
+        let plan = build_mount_script(
+            &[PathBuf::from("/home/u/proj")],
+            Path::new("/home/u/proj"),
+            "",
+            &build_lockdown(Some(45678)),
+        );
+        let ready = plan.script.find(READY_MARKER).expect("no ready marker");
+        for step in ["ip route del default", "nft -f /etc/geli/egress.nft", "/sbin/poweroff"] {
+            let at = plan.script.find(step).unwrap_or_else(|| panic!("no {} in the script", step));
+            assert!(at < ready, "the agent could run before `{}`", step);
+        }
+    }
+
+    #[test]
+    fn session_allowlist_adds_without_duplicating() {
+        let claude = agent_for_command("claude");
+        let base = session_allowlist(claude, &[]);
+        assert!(base.contains(&"api.anthropic.com".to_string()));
+
+        let extended = session_allowlist(claude, &[
+            "API.ANTHROPIC.COM".to_string(),
+            "extra.example".to_string(),
+            "   ".to_string(),
+        ]);
+        assert_eq!(extended.len(), base.len() + 1, "case-folded duplicate or blank crept in");
+        assert!(extended.contains(&"extra.example".to_string()));
+    }
+}

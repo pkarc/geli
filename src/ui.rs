@@ -140,4 +140,66 @@ mod tests {
         let mounts = status_mounts(std::slice::from_ref(&gone), &gone);
         assert!(!mounts[0].active);
     }
+
+
+    fn sample_packages() -> Packages {
+        Packages {
+            apk: vec!["ripgrep".into(), "jq".into()],
+            npm: vec!["prettier".into()],
+            pip: Vec::new(),
+        }
+    }
+
+    /// Under `--restrict-net` these fetches are the one thing a session does outside its
+    /// allowlist, and they happen before the lockdown by necessity. The status block says so
+    /// rather than letting `net restricted` imply otherwise.
+    #[test]
+    fn status_block_discloses_packages_fetched_before_the_lockdown() {
+        let open = describe_packages(&sample_packages(), false);
+        assert_eq!(open, "apk ripgrep jq · npm prettier");
+
+        let restricted = describe_packages(&sample_packages(), true);
+        assert!(restricted.contains("fetched before the egress lockdown"));
+
+        assert_eq!(describe_packages(&Packages::default(), true), "", "no tools, no line");
+
+        let out = render_status("acme", &[], "none", &[], "alpine", "restricted", &restricted);
+        assert!(out.contains("tools  apk ripgrep jq"));
+        let net = out.find("net    ").unwrap();
+        let tools = out.find("tools  ").unwrap();
+        assert!(net < tools, "the disclosure must sit under the claim it qualifies");
+    }
+
+    #[test]
+    fn spinner_line_honours_no_color() {
+        let plain = render_spinner_line('⠹', "cloud-init", 2.44, false);
+        assert_eq!(plain, "  ⠹ booting · cloud-init · 2.4s");
+        assert!(!plain.contains('\x1b'), "escape codes in a piped log are noise");
+
+        let colored = render_spinner_line('⠹', "mounts", 7.0, true);
+        assert!(colored.contains('\x1b'));
+        assert!(colored.contains("mounts"));
+        assert!(colored.contains("7.0s"));
+    }
+
+    #[test]
+    fn status_block_shows_mounts_auth_and_image() {
+        let mounts = vec![
+            StatusMount { host: "/home/u/proj".into(), guest: "/workspace/proj".into(), active: true },
+            StatusMount { host: "/home/u/api".into(), guest: "/workspace/api".into(), active: false },
+        ];
+        let copied = vec![".claude/.credentials.json".to_string()];
+        let out =
+            render_status("acme", &mounts, "claude.ai credentials", &copied, "alpine 3.22", "open", "");
+
+        assert!(out.starts_with("geli · workspace acme\n"));
+        assert!(out.contains("/home/u/proj → /workspace/proj  (active)"));
+        assert!(out.contains("/home/u/api → /workspace/api\n"));
+        assert!(out.contains("auth   claude.ai credentials"));
+        assert!(out.contains("image  alpine 3.22"));
+        // The network posture is a security property that changes per run: always shown.
+        assert!(out.contains("net    open"));
+        // The files that leave the user's home are named, not summarised.
+        assert!(out.contains("~/.claude/.credentials.json"));
+    }
 }

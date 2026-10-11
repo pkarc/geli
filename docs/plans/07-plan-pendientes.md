@@ -214,7 +214,7 @@ sobre ficheros temporales, lo tira y comprueba que no quedan.
 
 ---
 
-## Fase 6 — Los tests se van con su tema
+## Fase 6 — Los tests se van con su tema — **hecha**
 
 **Qué está mal.** `main.rs` pasa de 2900 líneas y concentra los 86 tests. `agents.rs`,
 `guest.rs`, `net.rs`, `qemu.rs` y `ui.rs` no tienen ninguno. Va contra la regla de «módulos por
