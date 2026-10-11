@@ -1,5 +1,7 @@
 # Pendiente — lo que encontró una revisión del proyecto (2026-10-09)
 
+> El plan de implementación de lo que queda abierto está en `07-plan-pendientes.md`.
+
 Una lectura de conjunto de la rama `persistent-history-disk`, en `b413ce1`. Ordenado por gravedad.
 Cada punto dice dónde está y qué haría; los que ya se hicieron lo dicen.
 
