@@ -139,3 +139,98 @@ pub(crate) fn sensitive_credentials(agent: &Agent) -> Vec<&str> {
         .map(String::as_str)
         .collect()
 }
+
+/// Everything geli says about this session before the VM boots, in the order it says it.
+///
+/// **Gathered into one pure function so what gets said is testable without booting anything.**
+/// These were four `eprintln!`s spread through `execute_sandbox`, which meant the only way to
+/// check that a `--restrict-net --ssh` run warns about SSH was to do it and watch. Each of them
+/// exists because its absence cost someone real time, so they are worth a test apiece.
+pub(crate) fn session_warnings(
+    agent: Option<&Agent>,
+    program: &str,
+    has_credentials: bool,
+    forward_ssh: bool,
+    restrict_net: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+
+    // Not "may be blocked": the egress ruleset is default-drop with a single rule for the proxy's
+    // port, so nothing reaches port 22, and git over SSH does not read the proxy variables the way
+    // curl and npm do. Saying "may" would send someone hunting for a configuration that does not
+    // exist. The keys are still worth forwarding here — SSH commit signing is entirely local.
+    if forward_ssh && restrict_net {
+        out.push(
+            "[!] --restrict-net blocks SSH outright: egress is default-drop except the proxy's\n\
+             \x20   port, and git over SSH ignores the proxy variables. Pushing and fetching over\n\
+             \x20   ssh:// will fail. The forwarded keys still work for local use, such as\n\
+             \x20   signing commits. Use an https:// remote to push under --restrict-net.\n"
+                .to_string(),
+        );
+    }
+
+    if let Some(agent) = agent {
+        let risky = sensitive_credentials(agent);
+        if !risky.is_empty() {
+            out.push(format!(
+                "\n[!] The `{}` recipe asks to copy {} out of your home.\n\
+                 \x20   Those are not agent credentials. Check agents/{}.toml before trusting it,\n\
+                 \x20   or run with --no-credentials.\n",
+                agent.command,
+                risky.join(", "),
+                agent.command
+            ));
+        }
+    }
+
+    out.extend(non_agent_notice(program));
+    out.extend(credential_warning(program, has_credentials).map(|w| format!("\n{}\n", w)));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each of these exists because its absence cost someone real time. The order matters too:
+    /// the session-shaping warnings come before the ones about the command itself.
+    #[test]
+    fn a_session_says_what_is_unusual_about_it() {
+        let claude = agent_for_command("claude");
+
+        // The ordinary case is silent. Anything geli prints every run is noise.
+        assert!(session_warnings(claude, "claude", true, false, false).is_empty());
+
+        // --ssh under --restrict-net: the keys go in and SSH still cannot reach anything.
+        let both = session_warnings(claude, "claude", true, true, true);
+        assert_eq!(both.len(), 1);
+        assert!(both[0].contains("blocks SSH outright"));
+        assert!(both[0].contains("https://"), "it must name the way out, not just the problem");
+        assert!(session_warnings(claude, "claude", true, true, false).is_empty());
+
+        // An unknown command and no credentials: both said, notice before the warning.
+        let bare = session_warnings(None, "bash", false, false, false);
+        assert_eq!(bare.len(), 2);
+        assert!(bare[0].contains("not one of geli's agents"));
+        assert!(bare[1].contains("No API credentials"));
+    }
+
+    /// The warning has to name the agent and the paths, or it is a reason to ignore it.
+    #[test]
+    fn a_recipe_reaching_outside_its_own_credentials_is_named() {
+        let reaching = Agent {
+            command: "greedy".to_string(),
+            binary: "greedy".to_string(),
+            label: "greedy".to_string(),
+            credentials: vec![".ssh/id_ed25519".to_string()],
+            hosts: Vec::new(),
+            install: String::new(),
+            version: None,
+        };
+
+        let said = session_warnings(Some(&reaching), "greedy", true, false, false);
+        assert!(said.iter().any(|w| w.contains(".ssh/id_ed25519")), "{:?}", said);
+        assert!(said.iter().any(|w| w.contains("agents/greedy.toml")));
+        assert!(said.iter().any(|w| w.contains("--no-credentials")));
+    }
+}

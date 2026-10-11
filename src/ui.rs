@@ -90,3 +90,54 @@ pub(crate) fn render_spinner_line(frame: char, phase: &str, elapsed: f32, color:
         format!("  {frame} booting · {phase} · {elapsed:.1}s")
     }
 }
+
+/// Which host directory lands where in the guest, and which one the command starts in.
+///
+/// Pure, so the status block's contents are testable without a VM — it is the only place the
+/// user is told what the sandbox can see, and a wrong line there is a wrong belief about what the
+/// agent was given.
+pub(crate) fn status_mounts(dirs: &[std::path::PathBuf], current: &std::path::Path) -> Vec<StatusMount> {
+    dirs.iter()
+        .map(|dir| StatusMount {
+            host: dir.display().to_string(),
+            guest: format!("/workspace/{}", crate::guest::folder_name(dir)),
+            active: crate::guest::is_active_dir(dir, current),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Exactly one directory is active — the one the command `cd`s into — and the guest path is
+    /// derived from the folder name, not the full host path.
+    #[test]
+    fn mounts_name_the_guest_path_and_mark_the_active_one() {
+        let temp = std::env::temp_dir().join(format!("geli_mounts_{}", std::process::id()));
+        let a = temp.join("alpha");
+        let b = temp.join("beta");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let current = b.canonicalize().unwrap();
+        let mounts = status_mounts(&[a.clone(), b.clone()], &current);
+
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].guest, "/workspace/alpha");
+        assert_eq!(mounts[1].guest, "/workspace/beta");
+        assert!(!mounts[0].active);
+        assert!(mounts[1].active, "the directory geli was invoked from must be the active one");
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// A directory that no longer exists cannot be canonicalized, and must not be guessed at.
+    #[test]
+    fn a_missing_directory_is_never_the_active_one() {
+        let gone = PathBuf::from("/tmp/geli-does-not-exist");
+        let mounts = status_mounts(std::slice::from_ref(&gone), &gone);
+        assert!(!mounts[0].active);
+    }
+}

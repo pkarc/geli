@@ -510,3 +510,54 @@ pub(crate) fn host_uid() -> u32 {
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(1000)
 }
+
+/// The `-fsdev`/`-device` pairs that map the host's directories into the guest over 9p.
+///
+/// Pure, and that is the point: what the guest ends up seeing is decided entirely here, and this
+/// used to be thirty lines in the middle of `execute_sandbox` that could only be checked by
+/// booting a VM and looking.
+///
+/// Tags are positional (`projshare1`, `projshare2`, …) and the guest mounts each at
+/// `/workspace/<folder-name>`, so the order of `dirs` is part of the contract.
+pub(crate) fn share_args(dirs: &[PathBuf], caches: &[(&str, PathBuf)]) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut add = |tag: &str, path: &Path| {
+        args.push("-fsdev".to_string());
+        args.push(format!("local,path={},id={},security_model=none", path.display(), tag));
+        args.push("-device".to_string());
+        args.push(format!("virtio-9p-pci,fsdev={},mount_tag={}", tag, tag));
+    };
+
+    for (i, dir) in dirs.iter().enumerate() {
+        add(&share_tag(i), dir);
+    }
+    for (tag, path) in caches {
+        add(tag, path);
+    }
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One `-fsdev`/`-device` pair per directory, tagged by position, and the caches after them.
+    #[test]
+    fn every_directory_gets_its_own_share() {
+        let dirs = vec![PathBuf::from("/home/u/a"), PathBuf::from("/home/u/b")];
+        let caches = vec![("npmcache", PathBuf::from("/home/u/.cache/npm"))];
+        let args = share_args(&dirs, &caches);
+
+        assert_eq!(args.len(), 12, "four arguments per share, three shares");
+        assert!(args.contains(&"local,path=/home/u/a,id=projshare1,security_model=none".to_string()));
+        assert!(args.contains(&"local,path=/home/u/b,id=projshare2,security_model=none".to_string()));
+        assert!(args.contains(&"virtio-9p-pci,fsdev=projshare2,mount_tag=projshare2".to_string()));
+        assert!(args.contains(&"virtio-9p-pci,fsdev=npmcache,mount_tag=npmcache".to_string()));
+
+        // The caches come last, so a directory's tag never depends on how many caches there are.
+        assert_eq!(args[8], "-fsdev");
+        assert!(args[9].contains("npmcache"));
+
+        assert!(share_args(&[], &[]).is_empty());
+    }
+}

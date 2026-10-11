@@ -184,7 +184,7 @@ cada sesión que persista un paquete se acusará a sí misma.
 
 ---
 
-## Fase 5 — `execute_sandbox` se parte, y la limpieza deja de depender de llegar al final
+## Fase 5 — `execute_sandbox` se parte, y la limpieza deja de depender de llegar al final — **hecha**
 
 Dos cambios que se tocan, así que van juntos.
 

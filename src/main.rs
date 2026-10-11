@@ -1384,42 +1384,11 @@ fn execute_sandbox(
         &build_lockdown(proxy_port),
     );
 
-    let mut qemu_args: Vec<String> = Vec::new();
-    let mut status_mounts: Vec<StatusMount> = Vec::new();
-    for (i, dir) in dirs.iter().enumerate() {
-        let tag = share_tag(i);
-        let name = folder_name(dir);
-
-        status_mounts.push(StatusMount {
-            host: dir.display().to_string(),
-            guest: format!("/workspace/{}", name),
-            active: is_active_dir(dir, &cur_canon),
-        });
-
-        qemu_args.push("-fsdev".to_string());
-        qemu_args.push(format!(
-            "local,path={},id={},security_model=none",
-            dir.display(),
-            tag
-        ));
-        qemu_args.push("-device".to_string());
-        qemu_args.push(format!("virtio-9p-pci,fsdev={},mount_tag={}", tag, tag));
-    }
-
-    qemu_args.extend(vec![
-        "-fsdev".to_string(),
-        format!("local,path={},id=npmcache,security_model=none", npm_cache.display()),
-        "-device".to_string(),
-        "virtio-9p-pci,fsdev=npmcache,mount_tag=npmcache".to_string(),
-        "-fsdev".to_string(),
-        format!("local,path={},id=pipcache,security_model=none", pip_cache.display()),
-        "-device".to_string(),
-        "virtio-9p-pci,fsdev=pipcache,mount_tag=pipcache".to_string(),
-        "-fsdev".to_string(),
-        format!("local,path={},id=apkcache,security_model=none", apk_cache.display()),
-        "-device".to_string(),
-        "virtio-9p-pci,fsdev=apkcache,mount_tag=apkcache".to_string(),
-    ]);
+    let qemu_args = share_args(
+        &dirs,
+        &[("npmcache", npm_cache), ("pipcache", pip_cache), ("apkcache", apk_cache)],
+    );
+    let status_mounts = status_mounts(&dirs, &cur_canon);
 
     // `agent` and the image chain were resolved above, before anything was overlaid.
     let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
@@ -1447,19 +1416,6 @@ fn execute_sandbox(
         Vec::new()
     };
 
-    // Not "may be blocked": the egress ruleset is default-drop with a single rule for the proxy's
-    // port, so nothing reaches port 22, and git over SSH does not read the proxy variables the way
-    // curl and npm do. Saying "may" would send someone hunting for a configuration that does not
-    // exist. The keys are still worth forwarding here — SSH commit signing is entirely local.
-    if forward_ssh && restrict_net {
-        eprintln!(
-            "[!] --restrict-net blocks SSH outright: egress is default-drop except the proxy's\n\
-             \x20   port, and git over SSH ignores the proxy variables. Pushing and fetching over\n\
-             \x20   ssh:// will fail. The forwarded keys still work for local use, such as\n\
-             \x20   signing commits. Use an https:// remote to push under --restrict-net.\n"
-        );
-    }
-
     let mut credentials = agent_credentials.clone();
     credentials.extend(ssh_credentials.clone());
 
@@ -1467,25 +1423,10 @@ fn execute_sandbox(
         || !openai_key.trim().is_empty()
         || !agent_credentials.is_empty();
 
-    if let Some(agent) = agent {
-        let risky = sensitive_credentials(agent);
-        if !risky.is_empty() {
-            eprintln!(
-                "\n[!] The `{}` recipe asks to copy {} out of your home.\n\
-                 \x20   Those are not agent credentials. Check agents/{}.toml before trusting it,\n\
-                 \x20   or run with --no-credentials.\n",
-                agent.command,
-                risky.join(", "),
-                agent.command
-            );
-        }
-    }
-
-    if let Some(notice) = non_agent_notice(&cmd.program) {
-        eprintln!("{}", notice);
-    }
-    if let Some(warning) = credential_warning(&cmd.program, has_credentials) {
-        eprintln!("\n{}\n", warning);
+    for warning in
+        session_warnings(agent, &cmd.program, has_credentials, forward_ssh, restrict_net)
+    {
+        eprintln!("{}", warning);
     }
 
     let api_key_for_config = anthropic_key.clone();
