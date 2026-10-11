@@ -1,6 +1,7 @@
-# Pendiente — lo que encontró una revisión del proyecto (2026-10-09)
+# Cerrado — lo que encontró una revisión del proyecto (2026-10-09)
 
-> El plan de implementación de lo que queda abierto está en `07-plan-pendientes.md`.
+> Todo lo de aquí está hecho. El plan que lo cerró, con el porqué de cada decisión, está
+> en `07-plan-pendientes.md`; los commits van de `3c0dc66` a `be637a7`.
 
 Una lectura de conjunto de la rama `persistent-history-disk`, en `b413ce1`. Ordenado por gravedad.
 Cada punto dice dónde está y qué haría; los que ya se hicieron lo dicen.
@@ -22,7 +23,7 @@ Lo que el agente escriba ahí lo lee el host en la siguiente sesión, sin pregun
 Qué haría: separar la configuración en dos.
 
 - Lo que da privilegios (`ssh`, `allow`, el vínculo con el workspace) pasa al host, en
-  `~/.config/geli/`, fuera del alcance del agente. **Pendiente.**
+  `~/.config/geli/`, fuera del alcance del agente. **Hecho** — fase 3 del plan 07.
 - En el proyecto queda solo lo inofensivo, como `packages`, que ya se trata como no confiable y se
   valida.
 
@@ -77,4 +78,6 @@ una función pura, así que se prueba sin VM.
 
 - CLAUDE.md es excelente como historia, pero se carga entero en cada sesión. La narrativa de cómo
   se llegó a cada decisión puede vivir en `docs/` y dejar en CLAUDE.md la regla y un enlace.
-- `display_active_workspaces` imprime «BINBOX», un nombre antiguo.
+  **Sin hacer, a propósito**: es una decisión sobre cómo se documenta el proyecto, no un pendiente
+  de código, y mezclarla con las seis fases la habría enterrado.
+- `display_active_workspaces` imprimía «BINBOX», un nombre antiguo. **Hecho.**
