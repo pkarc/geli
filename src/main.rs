@@ -148,7 +148,18 @@ fn rejected_package_names(packages: &Packages) -> Vec<String> {
         .collect()
 }
 
-fn main() -> io::Result<()> {
+/// Prints the error itself rather than letting `Result`'s `Debug` do it: the default renders an
+/// `io::Error` as `Custom { kind: Other, error: "..." }`, which buries the sentence someone has to
+/// read. Exiting here is safe — every session guard has already been dropped by the time `run`
+/// returns.
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("[!] {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> io::Result<()> {
     let args = Cli::parse();
 
     if args.list {
@@ -1227,6 +1238,32 @@ pub(crate) struct SessionPolicy<'a> {
     pub(crate) allow: &'a [String],
 }
 
+/// Owns the session's scratch files, so they go away however the session leaves — an error on
+/// any of the two dozen `?`s between here and the end, or a panic.
+///
+/// **`Drop` does not run on `process::exit`, so the guard is only half of this.** The other half
+/// is that nothing between creating these files and the end of the session exits the process; the
+/// one call that did now returns an error. A guard with an `exit` still live underneath it is
+/// worse than no guard, because it reads as if the cleanup were handled.
+///
+/// Before this, a failure anywhere past the overlay left a qcow2 and a share directory in `/tmp`
+/// for nobody to notice — and failures are exactly when the files are large.
+struct SessionScratch {
+    image: PathBuf,
+    share: PathBuf,
+    keep: bool,
+}
+
+impl Drop for SessionScratch {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        let _ = fs::remove_file(&self.image);
+        let _ = fs::remove_dir_all(&self.share);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn execute_sandbox(
     ws: &str,
@@ -1320,6 +1357,11 @@ fn execute_sandbox(
 
     let vm_share_dir = staging_dir(&format!("sandbox-share-{}", pid))?;
     let sandbox_img = PathBuf::from(format!("/tmp/sandbox-session-{}.qcow2", pid));
+    let scratch = SessionScratch {
+        image: sandbox_img.clone(),
+        share: vm_share_dir.clone(),
+        keep: keep_session,
+    };
 
     let cur_canon = cur.canonicalize()?;
 
@@ -1396,14 +1438,11 @@ fn execute_sandbox(
         _ => Vec::new(),
     };
 
+    // Returns rather than exits: `SessionScratch` is live by now, and `Drop` does not run on
+    // `process::exit`.
     let ssh_credentials = if forward_ssh {
-        match collect_ssh_credentials(&home, ssh_key) {
-            Ok(creds) => creds,
-            Err(e) => {
-                eprintln!("[!] Error reading SSH credentials: {}", e);
-                std::process::exit(1);
-            }
-        }
+        collect_ssh_credentials(&home, ssh_key)
+            .map_err(|e| io::Error::other(format!("reading SSH credentials: {}", e)))?
     } else {
         Vec::new()
     };
@@ -1618,16 +1657,13 @@ fn execute_sandbox(
     }
 
     let elapsed = started.elapsed().as_secs_f32();
+    let (image, share) = (sandbox_img.display().to_string(), vm_share_dir.display().to_string());
+    // Dropped before the line that reports it, so the message follows the act rather than
+    // predicting it.
+    drop(scratch);
     if keep_session {
-        eprintln!(
-            "geli · done in {:.1}s · kept {} and {}",
-            elapsed,
-            sandbox_img.display(),
-            vm_share_dir.display()
-        );
+        eprintln!("geli · done in {:.1}s · kept {} and {}", elapsed, image, share);
     } else {
-        let _ = fs::remove_file(&sandbox_img);
-        let _ = fs::remove_dir_all(&vm_share_dir);
         eprintln!("geli · done in {:.1}s · sandbox destroyed", elapsed);
     }
     Ok(())
@@ -3146,6 +3182,31 @@ geli:ready\n";
         assert_eq!(sanitize_workspace_name("  My Project  "), "myproject");
         assert_eq!(sanitize_workspace_name("keeps-dashes"), "keeps-dashes");
         assert_eq!(sanitize_workspace_name("../.."), "");
+    }
+
+    /// A session that fails anywhere past the overlay used to leave a qcow2 and a share
+    /// directory in `/tmp`, which is exactly when the files are largest.
+    #[test]
+    fn the_session_leaves_nothing_behind() {
+        let base = std::env::temp_dir().join(format!("geli_scratch_{}", std::process::id()));
+        let image = base.with_extension("qcow2");
+        let share = base.join("share");
+        fs::create_dir_all(&share).unwrap();
+        fs::write(&image, b"overlay").unwrap();
+        fs::write(share.join("console.log"), b"boot").unwrap();
+
+        drop(SessionScratch { image: image.clone(), share: share.clone(), keep: false });
+        assert!(!image.exists(), "the overlay survived");
+        assert!(!share.exists(), "the share directory survived");
+
+        // GELI_KEEP is the whole debugging story for a failed boot, so the guard honours it.
+        fs::create_dir_all(&share).unwrap();
+        fs::write(&image, b"overlay").unwrap();
+        drop(SessionScratch { image: image.clone(), share: share.clone(), keep: true });
+        assert!(image.exists() && share.exists(), "GELI_KEEP was ignored");
+
+        let _ = fs::remove_file(&image);
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// The sandbox cannot stop the agent writing a git hook — the project is mounted for writing
