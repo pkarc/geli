@@ -190,6 +190,27 @@ pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+/// The user's command, in the two forms geli needs it.
+///
+/// **They are not the same string, and conflating them is a silent failure.** `line` is quoted,
+/// because the guest's shell re-splits whatever it is handed and `geli claude -p "explain this"`
+/// used to arrive as four arguments. `program` is the raw first word, because that is what
+/// `agent_for_command` matches against a recipe — and a quoted `'claude'` matches nothing, which
+/// would not break the session, it would run it with no credentials and say nothing.
+pub(crate) struct GuestCommand {
+    /// The invoked program as the user typed it, however it is pathed. Never quoted.
+    pub(crate) program: String,
+    /// Every argument quoted and joined: what the guest's shell is given to run.
+    pub(crate) line: String,
+}
+
+pub(crate) fn build_guest_command(argv: &[String]) -> GuestCommand {
+    GuestCommand {
+        program: argv.first().cloned().unwrap_or_default(),
+        line: argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "),
+    }
+}
+
 /// Identifies the recipe a golden image was built from, so a stale image can be spotted. Derived
 /// from the recipe text itself rather than a hand-maintained constant, which nobody remembers to
 /// bump.

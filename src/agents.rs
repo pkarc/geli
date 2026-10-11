@@ -62,10 +62,15 @@ pub(crate) fn agents() -> &'static [Agent] {
     })
 }
 
-/// The agent a command invokes, if geli knows it. Matches the first word however it is pathed.
-pub(crate) fn agent_for_command(command: &str) -> Option<&'static Agent> {
-    let first = command.split_whitespace().next()?;
-    let name = first.rsplit('/').next().unwrap_or(first);
+/// The agent a command invokes, if geli knows it. Matches the invoked program however it is
+/// pathed.
+///
+/// **Takes the program, not the whole command line.** It used to take the line and split off the
+/// first word, which stopped working the moment the line started being shell-quoted: `'claude'`
+/// matches no recipe, and the session would have run with no credentials and no complaint.
+/// `GuestCommand` keeps the two forms apart so the quoted one cannot arrive here.
+pub(crate) fn agent_for_command(program: &str) -> Option<&'static Agent> {
+    let name = program.rsplit('/').next().unwrap_or(program);
     agents().iter().find(|a| a.command == name)
 }
 
@@ -74,15 +79,14 @@ pub(crate) fn agent_for_command(command: &str) -> Option<&'static Agent> {
 /// Not a refusal: opening a shell in the sandbox to try something is legitimate and useful. But
 /// the consequences are worth stating, because they are invisible otherwise — no credentials
 /// travel, and `--restrict-net` has no agent hosts to open.
-pub(crate) fn non_agent_notice(command: &str) -> Option<String> {
-    if command.trim().is_empty() || agent_for_command(command).is_some() {
+pub(crate) fn non_agent_notice(program: &str) -> Option<String> {
+    if program.trim().is_empty() || agent_for_command(program).is_some() {
         return None;
     }
-    let first = command.split_whitespace().next().unwrap_or(command);
     Some(format!(
         "[·] `{}` is not one of geli's agents ({}). It will run, but no credentials travel\n\
          \x20   into the sandbox and --restrict-net opens no agent hosts.",
-        first.rsplit('/').next().unwrap_or(first),
+        program.rsplit('/').next().unwrap_or(program),
         agents().iter().map(|a| a.command.as_str()).collect::<Vec<_>>().join(", ")
     ))
 }
@@ -93,12 +97,12 @@ pub(crate) fn non_agent_notice(command: &str) -> Option<String> {
 /// geli deliberately does not forward the host's `~/.claude` OAuth credentials into the sandbox,
 /// so an agent with no API key reaches its first-run login flow and waits for input that never
 /// arrives — which looks exactly like a hang.
-pub(crate) fn credential_warning(command: &str, has_credentials: bool) -> Option<String> {
+pub(crate) fn credential_warning(program: &str, has_credentials: bool) -> Option<String> {
     if has_credentials {
         return None;
     }
 
-    match agent_for_command(command) {
+    match agent_for_command(program) {
         Some(agent) => Some(format!(
             "[!] No credentials found for `{}`.\n\
              \x20   geli looked for {} and an API key in the environment, and found neither.\n\

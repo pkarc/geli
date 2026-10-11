@@ -139,7 +139,7 @@ fn main() -> io::Result<()> {
     register_directory_to_workspace(&workspace_name, &current_dir)?;
 
     let mapped_dirs = get_directories_in_workspace(&workspace_name)?;
-    let command_to_run = args.agent_args.join(" ");
+    let command_to_run = build_guest_command(&args.agent_args);
 
     if args.ssh
         && !local.ssh
@@ -1052,7 +1052,7 @@ fn execute_sandbox(
     ws: &str,
     cur: &Path,
     dirs: Vec<PathBuf>,
-    cmd: &str,
+    cmd: &GuestCommand,
     local: &LocalConfig,
     policy: &SessionPolicy,
 ) -> io::Result<()> {
@@ -1103,7 +1103,7 @@ fn execute_sandbox(
         eprintln!("    Rebuild when convenient:  geli --build-image");
     }
 
-    let agent = agent_for_command(cmd);
+    let agent = agent_for_command(&cmd.program);
 
     // The base image carries no agent, so the invoked one's layer has to exist before the
     // session can overlay anything. Missing means first use: build it now, once, and say so —
@@ -1258,10 +1258,10 @@ fn execute_sandbox(
         }
     }
 
-    if let Some(notice) = non_agent_notice(cmd) {
+    if let Some(notice) = non_agent_notice(&cmd.program) {
         eprintln!("{}", notice);
     }
-    if let Some(warning) = credential_warning(cmd, has_credentials) {
+    if let Some(warning) = credential_warning(&cmd.program, has_credentials) {
         eprintln!("\n{}\n", warning);
     }
 
@@ -1293,7 +1293,7 @@ fn execute_sandbox(
 
     let user_data = build_cloud_init(
         &plan,
-        cmd,
+        &cmd.line,
         &env_exports,
         &credentials,
         &seed,
@@ -1448,7 +1448,7 @@ fn execute_sandbox(
     _ws: &str,
     _cur: &Path,
     _dirs: Vec<PathBuf>,
-    _cmd: &str,
+    _cmd: &GuestCommand,
     _local: &LocalConfig,
     _policy: &SessionPolicy,
 ) -> io::Result<()> {
@@ -1460,7 +1460,7 @@ fn execute_sandbox(
     _ws: &str,
     _cur: &Path,
     _dirs: Vec<PathBuf>,
-    _cmd: &str,
+    _cmd: &GuestCommand,
     _local: &LocalConfig,
     _policy: &SessionPolicy,
 ) -> io::Result<()> {
@@ -1693,14 +1693,14 @@ mod tests {
         assert!(warning.contains("~/.claude/.credentials.json"));
         assert!(warning.contains("first-run login"));
 
-        let agy = credential_warning("agy -p hi", false).unwrap();
+        let agy = credential_warning("agy", false).unwrap();
         assert!(agy.contains("~/.gemini/oauth_creds.json"));
         assert!(!agy.contains(".claude"), "it named another agent's credential");
 
         assert!(credential_warning("claude", true).is_none());
 
         // Unrelated commands still get a note, but not the agent-specific explanation.
-        let generic = credential_warning("ls -la", false).unwrap();
+        let generic = credential_warning("ls", false).unwrap();
         assert!(!generic.contains("first-run login"));
     }
 
@@ -1737,13 +1737,13 @@ mod tests {
 
     #[test]
     fn non_agent_commands_are_noticed_not_refused() {
-        let notice = non_agent_notice("bash -lc make").expect("expected a notice");
+        let notice = non_agent_notice("bash").expect("expected a notice");
         assert!(notice.contains("bash"));
         assert!(notice.contains("claude"), "it should list the agents geli does know");
         assert!(notice.contains("will run"), "it must not read as a refusal");
 
         // Known agents and an empty command say nothing.
-        for quiet in ["claude", "/usr/local/bin/agy --version", "opencode", ""] {
+        for quiet in ["claude", "/usr/local/bin/agy", "opencode", ""] {
             assert!(non_agent_notice(quiet).is_none(), "{:?} should be silent", quiet);
         }
     }
@@ -1751,14 +1751,42 @@ mod tests {
     #[test]
     fn agent_is_recognised_however_it_is_pathed() {
         assert_eq!(agent_for_command("claude").map(|a| a.command.as_str()), Some("claude"));
-        assert_eq!(agent_for_command("claude --resume").map(|a| a.command.as_str()), Some("claude"));
-        assert_eq!(agent_for_command("/usr/local/bin/agy -p hi").map(|a| a.command.as_str()), Some("agy"));
+        assert_eq!(agent_for_command("/usr/local/bin/agy").map(|a| a.command.as_str()), Some("agy"));
         assert_eq!(agent_for_command("opencode").map(|a| a.command.as_str()), Some("opencode"));
 
         // Near-misses must not match, or the wrong credentials would travel.
-        for not_an_agent in ["claudette", "echo claude", "", "agyx", "my-opencode"] {
+        for not_an_agent in ["claudette", "", "agyx", "my-opencode"] {
             assert!(agent_for_command(not_an_agent).is_none(), "{:?} matched", not_an_agent);
         }
+    }
+
+    /// `geli claude -p "explain this module"` used to reach the guest as four arguments, because
+    /// the line was joined with spaces and the guest's shell split it again.
+    #[test]
+    fn arguments_keep_their_quoting() {
+        let argv: Vec<String> =
+            ["claude", "-p", "explain this module"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(build_guest_command(&argv).line, r"'claude' '-p' 'explain this module'");
+
+        let awkward: Vec<String> =
+            ["sh", "-c", "echo $HOME && it's fine"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(build_guest_command(&awkward).line, r"'sh' '-c' 'echo $HOME && it'\''s fine'");
+
+        assert_eq!(build_guest_command(&[]).line, "");
+    }
+
+    /// The quoted line and the matched program are deliberately two fields. Matching a recipe
+    /// against `'claude'` finds nothing — and that failure is silent in the worst direction: the
+    /// session runs, with no credentials, saying only that the command is not an agent.
+    #[test]
+    fn the_agent_is_matched_before_the_command_is_quoted() {
+        let argv: Vec<String> =
+            ["/usr/local/bin/claude", "--resume"].iter().map(|s| s.to_string()).collect();
+        let cmd = build_guest_command(&argv);
+
+        assert_eq!(agent_for_command(&cmd.program).map(|a| a.command.as_str()), Some("claude"));
+        assert!(agent_for_command(&cmd.line).is_none(), "the quoted line must never be matched");
+        assert!(non_agent_notice(&cmd.program).is_none());
     }
 
     /// Each agent carries only its own credential. Running one agent must not put another
