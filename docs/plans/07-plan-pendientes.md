@@ -103,19 +103,19 @@ Consecuencia que hay que aceptar y decir: **un repositorio clonado ya no trae su
 vuelve a preguntar una vez. Es el precio correcto.
 
 **Formato del registro: de `.txt` a `.json`, sin compatibilidad hacia atrás.** Un fichero por
-workspace. El lector entiende `.json` y nada más; los `.txt` que haya se ignoran, y geli lo dice
-una vez nombrándolos, porque borrar ficheros del usuario en silencio no es cosa suya.
+workspace. El lector entiende `.json` y nada más, y el formato viejo no se menciona en ninguna
+parte: ni se lee, ni se avisa de que haya quedado alguno.
 
-Deprecar el formato entero en vez de leer los dos es una decisión de etapa: geli no tiene más
-usuario que su autor, así que el único registro `.txt` del mundo está en esta máquina. El lector
-con doble formato serían treinta líneas de transición escritas para nadie, y el tipo de código que
-sobrevive años porque nunca llega el momento evidente de quitarlo.
+Deprecar el formato entero es una decisión de etapa: geli no tenía más usuario que su autor
+cuando cambió, así que todos los `.txt` del mundo estaban en una máquina y se borraron a mano.
+Cualquier otra cosa —un lector doble, o una línea diciendo que hay que limpiar— sería código de
+transición escrito para nadie, que es como un proyecto acaba cargando una década de migraciones
+ajenas.
 
 Y el coste real es casi nulo, porque se solapa con la migración de abajo: cada directorio con un
 `.geli.json` lleva dentro el nombre de su workspace, así que la primera vez que entres en él el
 registro se reconstruye solo. Lo único que se pierde es la pertenencia de los directorios que no
-visites: un workspace de tres carpetas monta solo las que hayas vuelto a pisar, hasta que las
-pises todas. En once workspaces de una máquina eso es un rato de uso normal, no una tarea.
+visites: un workspace de tres carpetas monta solo las que hayas vuelto a pisar.
 
 **Migración.** En el primer arranque sobre un `.geli.json` con campos viejos:
 

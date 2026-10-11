@@ -213,10 +213,10 @@ fn get_config_dir() -> PathBuf {
 /// Workspace names become filenames under `~/.config/geli/workspaces/` and the guest's hostname,
 /// so they are reduced to lowercase alphanumerics plus `-`.
 ///
-/// **This runs on the name read back out of `.geli.json` too, not just the one typed at the
+/// **This runs on a name migrated out of `.geli.json` too, not just the one typed at the
 /// prompt.** That file lives in the project directory, which the sandbox mounts with write
 /// access, so its contents are the agent's output as much as the user's input — and an
-/// unsanitized name went straight into `config_dir.join(format!("{}.txt", ws))`, where `../`
+/// unsanitized name went straight into the path the registry file is written to, where `../`
 /// escapes the registry.
 pub(crate) fn sanitize_workspace_name(raw: &str) -> String {
     raw.trim().to_lowercase().replace(|c: char| !c.is_alphanumeric() && c != '-', "")
@@ -617,11 +617,12 @@ fn write_workspace(name: &str, config: &WorkspaceConfig) -> io::Result<()> {
 /// Every workspace the registry knows, sorted so the prompt's numbering does not depend on the
 /// filesystem's directory order.
 ///
-/// **The old one-path-per-line `.txt` format is not read.** geli has one user, so the only such
-/// registry in existence is on that machine, and a dual-format reader would be transition code
-/// written for nobody — the kind that survives for years because the moment to delete it never
-/// arrives. Any `.txt` left behind is named once and ignored; deleting the user's files is not
-/// geli's call to make.
+/// **`<name>.json` is the only format there has ever been, as far as this code is concerned.**
+/// The one-path-per-line `.txt` registry it replaced is not read and not mentioned: geli had one
+/// user when the format changed, so every such file was on one machine and was deleted by hand.
+/// Anything else — a reader, or a line telling the user to clean up — would be transition code
+/// written for nobody, which is how a codebase ends up carrying a decade of other people's
+/// migrations.
 fn workspace_names() -> io::Result<Vec<String>> {
     let config_dir = get_config_dir();
     if !config_dir.exists() {
@@ -629,26 +630,14 @@ fn workspace_names() -> io::Result<Vec<String>> {
     }
 
     let mut names = Vec::new();
-    let mut legacy = Vec::new();
     for entry in fs::read_dir(&config_dir)? {
         let path = entry?.path();
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        match path.extension().and_then(|s| s.to_str()) {
-            Some("json") => names.push(stem.to_string()),
-            Some("txt") => legacy.push(stem.to_string()),
-            _ => {}
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
         }
-    }
-    if !legacy.is_empty() {
-        legacy.sort();
-        eprintln!(
-            "[*] Ignoring {} workspace file(s) in the old format ({}).\n\
-             \x20   Entering each directory re-registers it; delete them from\n\
-             \x20   {} when you are done.",
-            legacy.len(),
-            legacy.join(", "),
-            config_dir.display()
-        );
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            names.push(stem.to_string());
+        }
     }
     names.sort();
     Ok(names)
