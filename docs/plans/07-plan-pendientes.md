@@ -10,7 +10,7 @@ grande —sacar la configuración con privilegios del alcance del agente— se e
 
 ---
 
-## Fase 1 — Los argumentos conservan sus comillas
+## Fase 1 — Los argumentos conservan sus comillas — **hecha**
 
 **Qué está mal.** `args.agent_args.join(" ")` (`src/main.rs:141`) convierte
 `geli claude -p "explica este módulo"` en `claude -p explica este módulo`: el guest vuelve a
@@ -38,7 +38,7 @@ en el guest deja de verlo expandido. Es lo correcto, pero va en el mensaje del c
 
 ---
 
-## Fase 2 — stdout es del comando, también en los prompts
+## Fase 2 — stdout es del comando, también en los prompts — **hecha**
 
 **Qué está mal.** `get_or_create_workspace` y `prompt_enable_persistent_ssh` usan `println!`/
 `print!`. Con `geli claude > out.txt` el prompt acaba en el fichero y el usuario mira una terminal
@@ -59,7 +59,7 @@ directorio sin `.geli.json`.
 
 ---
 
-## Fase 3 — La configuración con privilegios sale del alcance del agente
+## Fase 3 — La configuración con privilegios sale del alcance del agente — **hecha**
 
 La fase que importa. Las otras cinco son higiene.
 
