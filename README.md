@@ -505,8 +505,10 @@ If you send a recipe, note that `image` runs its `install` as root in a VM on a 
 workflow uses `pull_request`, never `pull_request_target`, so a fork's job has a read-only token
 and no secrets.
 
-[CLAUDE.md](CLAUDE.md) has the architecture and the hard-won details. [docs/plans/](docs/plans/)
-holds the plans and measurements behind the bigger decisions — why Alpine, why not Debian, what
+[CLAUDE.md](CLAUDE.md) has the architecture and the rules. [docs/why/](docs/why/) has how each rule
+was arrived at — the measurements, and the sequence of failures that produced them; most of them
+look arbitrary until you know what they cost. [docs/plans/](docs/plans/) holds the plans behind the
+bigger decisions, including the ones that were rejected — why Alpine, why not Debian, what
 Antigravity's credential actually weighs.
 
 ## Roadmap
