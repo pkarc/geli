@@ -417,12 +417,14 @@ fn save_local_packages(current_dir: &Path, workspace: &str, packages: &Packages)
     Ok(())
 }
 
+/// **Asks on stderr, like every other prompt.** stdout belongs to the command, so a question
+/// written there lands in the file under `geli claude > out.txt` and the user watches a terminal
+/// that looks hung, waiting to answer something they cannot see.
 fn prompt_enable_persistent_ssh(current_dir: &Path, workspace: &str) -> io::Result<bool> {
-    print!(
+    eprint!(
         "[?] Enable SSH forwarding permanently for workspace '{}' in .geli.json? (y/N): ",
         workspace
     );
-    io::stdout().flush()?;
 
     let mut choice = String::new();
     io::stdin().lock().read_line(&mut choice)?;
@@ -430,7 +432,7 @@ fn prompt_enable_persistent_ssh(current_dir: &Path, workspace: &str) -> io::Resu
 
     if trimmed == "y" || trimmed == "yes" {
         save_local_ssh(current_dir, workspace, true)?;
-        println!("[+] Saved: SSH is now enabled permanently for this workspace.\n");
+        eprintln!("[+] Saved: SSH is now enabled permanently for this workspace.\n");
         return Ok(true);
     }
 
@@ -447,9 +449,9 @@ fn get_or_create_workspace(current_dir: &Path) -> io::Result<LocalConfig> {
         return Ok(config);
     }
 
-    println!("[-] No local sandbox configuration found for this directory.");
-    println!("[?] How would you like to namespace this folder?");
-    println!("------------------------------------------------");
+    eprintln!("[-] No local sandbox configuration found for this directory.");
+    eprintln!("[?] How would you like to namespace this folder?");
+    eprintln!("------------------------------------------------");
     let local_config_path = current_dir.join(LOCAL_CONFIG_FILE);
 
     let config_dir = get_config_dir();
@@ -472,13 +474,12 @@ fn get_or_create_workspace(current_dir: &Path) -> io::Result<LocalConfig> {
 
     if !existing_workspaces.is_empty() {
         for (i, ws) in existing_workspaces.iter().enumerate() {
-            println!("  {}) Add to existing workspace: [{}]", i + 1, ws);
+            eprintln!("  {}) Add to existing workspace: [{}]", i + 1, ws);
         }
-        println!("  n) Create a BRAND NEW workspace");
-        println!("------------------------------------------------");
+        eprintln!("  n) Create a BRAND NEW workspace");
+        eprintln!("------------------------------------------------");
 
-        print!("Select an option (1-{} or n): ", existing_workspaces.len());
-        io::stdout().flush()?;
+        eprint!("Select an option (1-{} or n): ", existing_workspaces.len());
 
         let mut choice = String::new();
         stdin.lock().read_line(&mut choice)?;
@@ -490,14 +491,13 @@ fn get_or_create_workspace(current_dir: &Path) -> io::Result<LocalConfig> {
             }
         }
     } else {
-        println!("  (No existing workspaces found. Let's create your first one!)");
-        println!("------------------------------------------------");
+        eprintln!("  (No existing workspaces found. Let's create your first one!)");
+        eprintln!("------------------------------------------------");
     }
 
     // If it's a new workspace (or they typed 'n'), prompt for the name
     if ws_name.is_empty() {
-        print!("Enter a name for this workspace: ");
-        io::stdout().flush()?;
+        eprint!("Enter a name for this workspace: ");
         let mut new_name = String::new();
         stdin.lock().read_line(&mut new_name)?;
         ws_name = sanitize_workspace_name(&new_name);
@@ -561,7 +561,7 @@ fn display_active_workspaces() -> io::Result<()> {
         return Ok(());
     }
     println!("=============================================");
-    println!("       ACTIVE BINBOX WORKSPACE REGISTRY       ");
+    println!("          ACTIVE WORKSPACE REGISTRY           ");
     println!("=============================================");
     for entry in fs::read_dir(config_dir)? {
         let entry = entry?;
