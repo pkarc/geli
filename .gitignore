@@ -1,5 +1,6 @@
 /target
 
-# Per-directory workspace binding. Local to each machine: it names a workspace
-# from ~/.config/geli/workspaces/, which differs per developer.
-.geli.json
+# `.geli.json` is deliberately *not* ignored. It used to name a workspace from
+# ~/.config/geli/workspaces/, which differs per machine; now it declares only the
+# packages this project needs inside the sandbox, which is a fact about the
+# repository and worth sharing with whoever clones it.
