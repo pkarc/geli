@@ -206,8 +206,10 @@ nothing is wrong hides the one that matters.
 time. A copied key is readable inside the VM and outlives it.
 
 **It is still not safe, and the wording must not claim otherwise**: while the session runs the
-guest can ask for a signature over anything it can reach. Permanent exposure becomes exposure
-bounded by the session. `.ssh` stays in `NEVER_COPY` so a recipe can never ask; the standing grant
+guest can ask for a signature over anything it can reach — **a network identity has no mount set**,
+so the session reaches repositories it was never given. Permanent exposure becomes exposure bounded
+by the session. The notice that says so fires when `--restrict-net` is *absent*, because that is
+the one lever that closes it and the combination warning only ever named it the other way round. `.ssh` stays in `NEVER_COPY` so a recipe can never ask; the standing grant
 lives in the registry, never in the project; host-key checking is strict when `known_hosts` came
 across and `accept-new` only when it did not; and **`--restrict-net` still blocks SSH outright** —
 the agent remains useful there for local signing, and gets its own nft rule rather than a widened

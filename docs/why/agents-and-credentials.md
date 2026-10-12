@@ -133,6 +133,31 @@ cannot steal the key, but it can act as you. This is the classic weakness of age
 the recommendation has always been not to forward an agent to a machine you do not trust — which
 is literally geli's use case.
 
+**The sharp edge is that a network identity has no mount set.** geli's threat model bounds what the
+agent can touch by what was mounted, and that bound is exact for files. It does not apply here at
+all: measured from inside a session mounting one directory, `git ls-remote` against a repository
+that was *not* mounted answered with its HEAD, as `pkarc`. The sandbox decided which files the
+agent could see; it did not decide who the agent gets to be.
+
+That is why the notice fires when `--restrict-net` is **absent** rather than present. Forwarding an
+agent reads as "the key does not leave, so I am safe", and the step that does not follow is the one
+above. `--restrict-net` is the lever that closes it — egress is default-drop, so `ssh` cannot even
+resolve — and before this it was only ever named in the warning for using the two *together*.
+
+Ranked by how much they close, the mitigations that exist today: `--restrict-net` (shuts it
+outright, and the agent still signs commits); `--ssh-key` with a deploy key scoped to one
+repository (the blast radius becomes the repository being worked on); `ssh-add -c` (your agent asks
+before each signature, at the cost of unattended runs).
+
+**The structural fix is not obvious, which is why it is not here.** geli's relay sees every
+`SIGN_REQUEST` and could stop to ask — better than `ssh-add -c`, since it needs no askpass. Two
+things block it. There is no channel to ask on: `ttyS0` is `mon:stdio` with inherited stdio, so the
+terminal belongs to the agent for the length of the session, and writing a prompt there corrupts
+its TUI while reading steals its keystrokes. And even with a channel, **an SSH authentication
+signs the session identifier and a challenge, not the hostname** — geli could say "the sandbox
+wants to sign something" and no more. A prompt that cannot name the destination is one people learn
+to accept by reflex, which is worse than none.
+
 So the claim is not "now it is safe". It is:
 
 > *the key stays yours forever* instead of *the key may end up someone else's*

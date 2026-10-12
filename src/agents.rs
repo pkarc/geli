@@ -167,6 +167,20 @@ pub(crate) fn session_warnings(
         );
     }
 
+    // **Said when the combination is absent, not when it is present.** The forwarded agent is
+    // easy to read as "the key does not leave, so I am safe", and the part that does not follow
+    // is that a network identity has no mount set: the session can reach repositories it was
+    // never given. `--restrict-net` is the one lever that closes it, and it was only ever
+    // mentioned in the warning for using the two *together*.
+    if forward_ssh && !copied_key && !restrict_net {
+        out.push(
+            "[·] The forwarded agent signs for any host this session can reach, including\n\
+             \x20   repositories that are not mounted. It ends when the VM does. --restrict-net\n\
+             \x20   closes it off, and the agent still signs commits locally."
+                .to_string(),
+        );
+    }
+
     // Not "may be blocked": the egress ruleset is default-drop with a single rule for the proxy's
     // port, so nothing reaches port 22, and git over SSH does not read the proxy variables the way
     // curl and npm do. Saying "may" would send someone hunting for a configuration that does not
@@ -214,12 +228,17 @@ mod tests {
         // The ordinary case is silent. Anything geli prints every run is noise.
         assert!(session_warnings(claude, "claude", true, false, false, false).is_empty());
 
-        // --ssh under --restrict-net: the keys go in and SSH still cannot reach anything.
+        // --ssh under --restrict-net: the agent goes in and SSH still cannot reach anything.
         let both = session_warnings(claude, "claude", true, true, false, true);
-        assert_eq!(both.len(), 1);
+        assert_eq!(both.len(), 1, "the unrestricted notice must not also fire: {:?}", both);
         assert!(both[0].contains("blocks SSH outright"));
         assert!(both[0].contains("https://"), "it must name the way out, not just the problem");
-        assert!(session_warnings(claude, "claude", true, true, false, false).is_empty());
+
+        // --ssh *without* it: the bound is the session, and the lever that shortens it is named.
+        let open = session_warnings(claude, "claude", true, true, false, false);
+        assert_eq!(open.len(), 1);
+        assert!(open[0].contains("not mounted"), "the surprise is reach beyond the mount set");
+        assert!(open[0].contains("--restrict-net"), "a notice with no lever is noise");
 
         // An unknown command and no credentials: both said, notice before the warning.
         let bare = session_warnings(None, "bash", false, false, false, false);
@@ -240,8 +259,8 @@ mod tests {
         assert!(copied[0].contains("stays valid long after the VM is destroyed"));
         assert!(copied[0].contains("--ssh forwards the agent"), "it must name the better option");
 
-        // The forwarded-agent path is the default and says nothing extra.
-        assert!(session_warnings(claude, "claude", true, true, false, false).is_empty());
+        // Copying the key is its own warning; the agent notice does not pile on top of it.
+        assert!(!copied.iter().any(|w| w.contains("not mounted")));
     }
 
     /// The warning has to name the agent and the paths, or it is a reason to ignore it.
