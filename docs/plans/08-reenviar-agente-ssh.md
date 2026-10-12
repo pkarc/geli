@@ -1,7 +1,8 @@
-# Plan — reenviar el agente SSH en vez de la clave (2026-10-11)
+# Hecho — reenviar el agente SSH en vez de la clave (2026-10-11)
 
-Lo único que quedó abierto de la revisión de `06`/`07`. No está implementado; esto es el diseño,
-lo que se midió para sostenerlo, y las decisiones que hay que tomar antes de escribir código.
+Lo único que quedó abierto de la revisión de `06`/`07`. **Implementado**: el diseño de abajo es el
+que se construyó, con una corrección que solo apareció al probarlo de verdad (ver el final). Las
+reglas resultantes están en `CLAUDE.md`; el porqué, en `docs/why/agents-and-credentials.md`.
 
 ## El problema
 
@@ -68,8 +69,27 @@ tendría que proveerlo. Y es exactamente la clase de dispositivo que existe pero
 que una regla de udev te mete en el grupo — el mismo error que ya se cometió con `/dev/kvm` y que
 obligó a detectarlo abriéndolo en vez de con `stat`.
 
-**Inclinación**: slirp, por no añadir un requisito de host para la primera versión. Pero medir
-vsock antes de decidir, porque si funciona sin fricción es mejor forma.
+**Decidido: slirp.** Medido en esta máquina, un Ubuntu de escritorio corriente:
+
+```
+crw-rw----+ 1 root kvm 10, 232  /dev/kvm           <- ACL de udev para el usuario de la sesión
+crw-rw----  1 root kvm 10, 241  /dev/vhost-vsock   <- sin ACL
+$ id -nG   # pkarc adm cdrom sudo dip video plugdev users lpadmin ollama docker input
+```
+
+El usuario **no está en el grupo `kvm`**; KVM le funciona porque udev le pone una ACL a `/dev/kvm`
+al iniciar sesión, y `/dev/vhost-vsock` no recibe ese trato. Abrirlo da `EACCES`. QEMU trae
+`vhost-vsock-pci` y el módulo del kernel está ahí, así que lo único que falta son permisos — pero
+eso significa que una instalación normal necesitaría una regla de udev nueva, añadida por
+`setup.sh`, para una función que está apagada por defecto.
+
+Es el mismo tropiezo que `/dev/kvm` ya enseñó: el dispositivo existe y no sirve. La diferencia es
+que ahí la respuesta fue detectarlo abriéndolo y degradar a emulación; aquí no hay degradación
+posible —o hay canal o no lo hay—, así que el fallo caería en el arranque de cada sesión con
+`--ssh`.
+
+La forma de vsock sigue siendo mejor y vale la pena volver a ella si algún día el canal necesita ser
+invisible a la política de egress. No para la primera versión.
 
 ### ¿Relay tonto o filtro?
 
@@ -131,8 +151,7 @@ aviso que hoy sale con `--ssh` debería nombrarla.
 
 ## Fases
 
-1. **Medir vsock.** Una sesión que abra un canal host↔guest por vsock y mueva bytes. Si funciona sin
-   fricción en esta máquina y en un runner de CI, decide el transporte; si no, slirp.
+1. ~~**Medir vsock.**~~ Hecho: descartado por permisos, ver arriba. El transporte es slirp.
 2. **El lado del host.** Un hilo como el del proxy: acepta conexiones, habla el protocolo del
    agente, deja pasar solo `SIGN_REQUEST` para la clave concedida, reenvía al `$SSH_AUTH_SOCK` del
    host. Es la parte con lógica, es pura salvo el socket, y lleva los tests.
@@ -152,3 +171,37 @@ aviso que hoy sale con `--ssh` debería nombrarla.
   clave dentro de la VM. Eso es la prueba, no que el socket aparezca.
 - Y la comprobación negativa, que es la que de verdad importa: `find / -name 'id_*'` dentro de la
   sesión no encuentra nada.
+
+---
+
+## Lo que cambió al construirlo
+
+Casi nada del diseño, y una cosa que ninguna prueba unitaria habría encontrado.
+
+**Rechazar y avisar no son lo mismo.** La primera sesión real imprimía un aviso de rechazo en
+*cada* conexión ssh normal. No era un fallo del filtro: `ssh` abre toda conexión a un agente
+reenviado con una petición de extensión (`session-bind@openssh.com`) y sigue tan contento cuando el
+agente dice que no. Pero un aviso que salta cuando no pasa nada es un aviso que la gente aprende a
+saltarse — y el que taparía es el del guest intentando reescribir tu agente. Así que `Screen` tiene
+ahora tres casos y no dos: reenviar, rechazar en voz alta, y rechazar en silencio.
+
+## Lo verificado, contra VMs reales
+
+- `--ssh`: `ssh -T git@github.com` responde `Hi pkarc! You've successfully authenticated` y
+  `find / -name 'id_*'` dentro de la sesión no encuentra nada. Esa es la prueba, no que el socket
+  aparezca.
+- El filtro: `ssh-add -D` y `ssh-add <clave nueva>` desde dentro fallan, y el agente del host sigue
+  con sus tres claves.
+- `--ssh-key`: el guest ve **una** identidad en vez de tres.
+- `--restrict-net --ssh`: `ssh-add -l` funciona, `ssh git@github.com` ni siquiera resuelve, y
+  `ssh-keygen -Y sign` llega a firmar. Que es exactamente la forma que se quería.
+- Sin agente: falla con la orden que lo arregla, y no cae al modo débil.
+- `--ssh-copy-key`: sigue funcionando y lo dice en el bloque de estado con palabras que no se
+  pueden confundir.
+
+## Lo que sigue abierto
+
+Nada de esto cambia el límite de fondo, y la documentación lo dice con esas palabras: mientras la
+sesión corre, el guest puede pedir una firma sobre lo que alcance. `ssh-add -c` es la mitigación y
+la nombra el aviso, pero no está integrada — sería una bandera que hiciera que geli arrancara su
+propio agente con confirmación en vez de usar el del usuario, y eso es otro diseño.

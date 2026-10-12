@@ -63,8 +63,8 @@ a minute or two. Every run after that starts in seconds.
 
 ```bash
 geli <command> [args...]    # run a command inside the sandbox
-geli --ssh <cmd>            # forward host SSH keys for git operations
-geli --ssh-key <path> <cmd> # forward a specific SSH private key
+geli --ssh <cmd>            # let the sandbox sign with your ssh-agent; the key stays home
+geli --ssh-key <path> <cmd> # restrict that to one identity
 geli --restrict-net <cmd>   # let the sandbox reach only an allowlist of hosts
 geli --list                 # show the workspace registry
 geli --build-image          # build the base image if it is missing or stale
@@ -352,43 +352,69 @@ One caveat: the copy is one-way. If the token is refreshed inside the sandbox, t
 with the VM. Should a refresh ever invalidate the host's copy, re-run `claude` on the host to log
 back in.
 
-### SSH keys and Git operations
+### SSH and Git operations
 
-By default geli copies no SSH keys into the sandbox. If an agent needs to push, pull, or fetch dependencies over SSH (`git@github.com:...`), pass `--ssh` or `--ssh-key`:
+By default the sandbox has no access to your SSH keys at all. If an agent needs to push, pull or
+fetch dependencies over SSH (`git@github.com:...`), pass `--ssh`:
 
 ```bash
-geli --ssh claude                      # copies default keys (~/.ssh/id_{ed25519,ecdsa,rsa}) and known_hosts
-geli --ssh-key ~/.ssh/deploy_key agy   # copies a specific key
+geli --ssh claude                      # the guest signs through your ssh-agent
+geli --ssh-key ~/.ssh/deploy_key agy   # ...using only that identity
 ```
 
-Or enable it persistently for a workspace in `.geli.json`:
+**The private key does not enter the VM.** geli runs a relay on the host, the guest gets a socket
+at `/tmp/geli-agent.sock` with `SSH_AUTH_SOCK` pointing at it, and your `ssh-agent` does the
+signing. Inside a session, `find / -name 'id_*'` turns up nothing.
 
-```json
-{
-  "workspace": "my-project",
-  "ssh": true
-}
+The relay is a filter rather than a pipe. Only "list your keys" and "sign this" reach your agent;
+anything that would *change* it — adding a key, removing one, locking the agent — is refused
+without your agent ever hearing it. `ssh-add -D` from inside a sandbox reports a failure and your
+keys are still there. With `--ssh-key`, the listing is rewritten so the guest is offered that key
+and no other.
+
+This needs an agent running on your side. If `SSH_AUTH_SOCK` is unset, geli says so and tells you
+what to run rather than quietly doing something weaker:
+
+```
+eval "$(ssh-agent -s)" && ssh-add
 ```
 
-Keys are placed in `/home/sandbox/.ssh/` with `0600` permissions, and your `known_hosts` goes with
-them. Host-key checking is then **strict**, because there is something to check against; only when
-no `known_hosts` is available does geli fall back to `accept-new`, and it says so when it does.
-Blanket `accept-new` would trust whichever host answers first, and a sandbox is exactly where an
-unexpected answer deserves to be noticed.
+**Understand what this still costs.** For as long as the session runs, whatever is inside it can
+ask your agent to sign anything it can reach — it cannot steal the key, but it can act as you.
+This is the known weakness of agent forwarding. The honest summary is not "now it is safe", it is:
 
-**Understand what forwarding a key costs.** Without it, the worst an agent can do is leak the
-repository you gave it. With it, the worst it can do is leak a credential that grants write access
-to *every* repository you have — and unlike the VM, that key outlives the session. The sandbox
-protects your files; it does not protect a key you hand to the thing running inside it. Prefer
-`--ssh-key` with a deploy key scoped to one repository over your everyday identity, and prefer
-passing `--ssh` per run over `"ssh": true` in `.geli.json`, which forwards it to every session in
-that workspace whether or not it needs to push.
+> the key stays yours forever, instead of possibly ending up someone else's
+
+Permanent exposure becomes exposure bounded by the session. If that is not enough, `ssh-add -c`
+makes your agent ask before every signature, at the cost of any unattended run. And prefer
+`--ssh-key` with a deploy key scoped to one repository over your everyday identity.
+
+Your `known_hosts` still goes in, along with a generated `~/.ssh/config`: those describe the hosts
+being talked to, not you. Host-key checking is then **strict**, because there is something to check
+against; only when no `known_hosts` is available does geli fall back to `accept-new`, and it says
+so when it does. Blanket `accept-new` would trust whichever host answers first, and a sandbox is
+exactly where an unexpected answer deserves to be noticed.
+
+To enable it for every session in a workspace, answer `y` when `--ssh` offers to remember it. That
+goes to `~/.config/geli/workspaces/<name>.json`, on your side of the fence — deliberately not to
+the project's `.geli.json`, which the sandbox can write.
+
+#### The old behaviour, if you need it
+
+`--ssh-copy-key` copies the private key file in, as geli used to. It warns every time, because a
+key that has been inside a VM is a key that outlives it. The status block distinguishes the two so
+you can never be unsure which you got:
+
+```
+auth   ssh-agent forwarded · key stays on the host
+auth   SSH private key COPIED into the VM
+```
 
 **`--restrict-net` blocks SSH outright.** Egress is default-drop except the proxy's port, and git
 over SSH ignores the proxy variables that `npm`, `pip` and `git`-over-HTTPS respect. Pushing or
-fetching over `ssh://` will fail; use an `https://` remote. The keys are still worth forwarding
-under `--restrict-net` for anything local, such as signing commits. geli warns when you combine
-them.
+fetching over `ssh://` will fail; use an `https://` remote. The agent is still worth forwarding
+under `--restrict-net` for anything local, such as signing commits — it gets its own rule in the
+ruleset rather than a widened one. geli warns when you combine them.
 
 ## Restricting what the sandbox can reach
 
@@ -528,15 +554,13 @@ Done:
     resolver went from answering to failing
 11. ~~Optional KVM~~ — detected by opening `/dev/kvm`, with an emulated fallback: 10 s against 99 s
 12. ~~Trim the RAM ceiling~~ — 4 GB → 2 GB, and the premise was wrong: it was never being spent
+13. ~~[Forward the SSH agent, not the key](docs/plans/08-reenviar-agente-ssh.md)~~ — `--ssh` now
+    forwards the agent through a filtering relay; no private key enters the VM. It does not make
+    forwarding safe — a forwarded agent still signs whatever the session asks, while it runs — but
+    it turns permanent exposure into exposure bounded by the session.
 
 Next:
 
-13. **[Forward the SSH agent, not the key](docs/plans/08-reenviar-agente-ssh.md).** Today `--ssh`
-    copies the private key file into the VM, where the agent can read it and where it stays valid
-    long after the VM is destroyed. Forwarding the agent socket lets the guest *sign* without ever
-    reading the key. Designed and the transport measured; not implemented. It does not make
-    forwarding safe — a forwarded agent still signs whatever the session asks, while it runs — but
-    it turns permanent exposure into exposure bounded by the session.
 14. **macOS and Windows.** `execute_sandbox` is `#[cfg]`-gated and only the Linux implementation
     exists; the others print "not yet implemented". This is the largest limitation geli has left.
 15. **`geli --prune`.** Cleaning up images no live chain references is manual today. geli says

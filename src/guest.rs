@@ -223,10 +223,39 @@ pub(crate) fn recipe_hash(recipe: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Where the guest's ssh clients look for the agent.
+pub(crate) const AGENT_SOCKET: &str = "/tmp/geli-agent.sock";
+
+/// The guest half of the agent relay: a Unix socket that forwards to geli's listener on the host.
+///
+/// **A relay is needed because 9p cannot carry a Unix socket.** Measured: the guest can `bind()`
+/// one on a 9p share and the host does see the inode — `srwxr-xr-x` — but connecting to it from
+/// the host gives `ECONNREFUSED`. The inode crosses, the connection does not. So the socket is
+/// local to the guest and `socat` carries each connection to `10.0.2.2:<port>`, the same slirp
+/// host alias the egress proxy uses.
+///
+/// Owned by `sandbox`, mode 0600: the agent runs as that user, and nothing else in the guest has
+/// any business asking the host to sign.
+pub(crate) fn build_agent_relay(agent_port: Option<u16>) -> String {
+    let Some(port) = agent_port else {
+        return String::new();
+    };
+    format!(
+        "\n# --- ssh agent relay ---\n\
+         rm -f {socket}\n\
+         setsid socat UNIX-LISTEN:{socket},fork,mode=0600,user=sandbox \\\n\
+         \x20   TCP:{host}:{port} >/dev/null 2>&1 &\n",
+        socket = AGENT_SOCKET,
+        host = crate::net::GUEST_PROXY_HOST,
+        port = port,
+    )
+}
+
 pub(crate) fn build_mount_script(
     dirs: &[PathBuf],
     current_canonical: &Path,
     packages: &str,
+    agent_relay: &str,
     lockdown: &str,
 ) -> MountPlan {
     let mut script = String::from("#!/bin/bash\nset -x\n\nmkdir -p /workspace\n");
@@ -277,6 +306,10 @@ pub(crate) fn build_mount_script(
     script.push_str(&format!(
         "\ncommand -v geli-packages >/dev/null && geli-packages snapshot > {PACKAGE_BASELINE}\n"
     ));
+
+    // Before the lockdown, like the packages: the relay has to be listening before the agent
+    // could possibly ask it for a signature, and the ruleset that comes next names its port.
+    script.push_str(agent_relay);
 
     // Egress is cut here, after the mounts and before the agent ever runs.
     script.push_str(lockdown);
@@ -694,6 +727,7 @@ pub(crate) fn build_cloud_init(
     // Built by geli from the workspace alone — same shape in the guest, different provenance.
     seed: &[(String, String)],
     proxy_port: Option<u16>,
+    agent_port: Option<u16>,
 ) -> String {
     // The breadcrumb goes to the boot console, not stdout. It exists so a command that produces
     // no output is still distinguishable from a sandbox that never ran it — but the user's stdout
@@ -720,7 +754,7 @@ pub(crate) fn build_cloud_init(
             ("@MOUNTS@", &indent_block(&plan.script, 6)),
             ("@SESSION@", &indent_block(&session, 6)),
             ("@CREDENTIALS@", &build_credentials_entry(&written)),
-            ("@EGRESS@", &build_egress_entry(proxy_port)),
+            ("@EGRESS@", &build_egress_entry(proxy_port, agent_port)),
         ],
     )
 }
@@ -743,10 +777,10 @@ mod tests {
     ) -> String {
         let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
         let plan =
-            build_mount_script(&dirs, Path::new(current), &build_package_setup(packages), "");
+            build_mount_script(&dirs, Path::new(current), &build_package_setup(packages), "", "");
         let env = build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]);
         let seed = vec![(".claude.json".to_string(), build_claude_config(&plan.folders, "sk-ant-test-key-0123456789"))];
-        build_cloud_init(&plan, cmd, &env, &[], &seed, None)
+        build_cloud_init(&plan, cmd, &env, &[], &seed, None, None)
     }
 
     /// The bug that made geli never work: a YAML document that does not parse.
@@ -802,10 +836,10 @@ mod tests {
     #[test]
     fn restricted_session_cloud_init_parses() {
         let dirs = [PathBuf::from("/home/u/proj")];
-        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "", &build_lockdown(Some(45678)));
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "", "", &build_lockdown(Some(45678)));
         let seed = vec![(".claude.json".to_string(), build_claude_config(&plan.folders, "sk-ant-test"))];
         let creds = vec![(".claude/.credentials.json".to_string(), "{\"t\":1}".to_string())];
-        let yaml = build_cloud_init(&plan, "claude", "", &creds, &seed, Some(45678));
+        let yaml = build_cloud_init(&plan, "claude", "", &creds, &seed, Some(45678), None);
 
         let parsed = YamlLoader::load_from_str(&yaml);
         assert!(parsed.is_ok(), "{:?}\n---\n{}", parsed.err(), yaml);
@@ -917,18 +951,57 @@ mod tests {
         assert!(!out.ends_with('\n'), "trailing newline breaks block scalars");
     }
 
+    /// The relay has to be listening before the agent could ask it for a signature, and before
+    /// the lockdown, whose ruleset names its port.
+    #[test]
+    fn the_agent_relay_starts_before_egress_is_cut() {
+        let plan = build_mount_script(
+            &[PathBuf::from("/home/u/proj")],
+            Path::new("/home/u/proj"),
+            "",
+            &build_agent_relay(Some(4242)),
+            &crate::net::build_lockdown(Some(45678)),
+        );
+
+        let relay = plan.script.find("socat").expect("no relay in the script");
+        let cut = plan.script.find("ip route del default").expect("no lockdown");
+        let ready = plan.script.find(READY_MARKER).expect("no ready marker");
+        assert!(relay < cut, "the relay must be up before the route goes");
+        assert!(cut < ready, "the session must not be declared ready before the lockdown");
+
+        // Owned by the user the agent runs as, and reachable at the slirp host alias.
+        assert!(plan.script.contains("user=sandbox"));
+        assert!(plan.script.contains("mode=0600"));
+        assert!(plan.script.contains("TCP:10.0.2.2:4242"));
+    }
+
+    /// A session without `--ssh` must not have a relay, a socket, or a line about one.
+    #[test]
+    fn no_agent_means_no_relay_at_all() {
+        assert_eq!(build_agent_relay(None), "");
+        let plan = build_mount_script(
+            &[PathBuf::from("/home/u/proj")],
+            Path::new("/home/u/proj"),
+            "",
+            &build_agent_relay(None),
+            "",
+        );
+        assert!(!plan.script.contains("socat"));
+        assert!(!plan.script.contains(AGENT_SOCKET));
+    }
+
     #[test]
     fn build_mount_script_marks_current_directory_as_active() {
         let tmp = std::env::temp_dir().canonicalize().unwrap();
         let dirs = vec![tmp.clone()];
-        let plan = build_mount_script(&dirs, &tmp, "", "");
+        let plan = build_mount_script(&dirs, &tmp, "", "", "");
         assert_eq!(plan.active_folder, folder_name(&tmp));
     }
 
     #[test]
     fn build_mount_script_falls_back_when_no_directory_matches() {
         // Nothing canonicalizes to this path, so the fallback in build_mount_script applies.
-        let plan = build_mount_script(&[], Path::new("/home/u/myproject"), "", "");
+        let plan = build_mount_script(&[], Path::new("/home/u/myproject"), "", "", "");
         assert_eq!(plan.active_folder, "myproject");
         assert!(!plan.script.contains("cd /workspace/\n"));
     }
@@ -997,13 +1070,13 @@ mod tests {
     #[test]
     fn terminal_setup_survives_cloud_init() {
         let dirs = [PathBuf::from("/home/u/proj")];
-        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "", "");
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "", "", "");
         let env = format!(
             "{}\n{}",
             build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]),
             build_terminal_setup("screen-256color", "truecolor", Some((24, 100)))
         );
-        let yaml = build_cloud_init(&plan, "claude", &env, &[], &[], None);
+        let yaml = build_cloud_init(&plan, "claude", &env, &[], &[], None, None);
 
         assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
         assert!(yaml.contains("screen-256color"));
@@ -1070,12 +1143,12 @@ mod tests {
     #[test]
     fn forwarded_credentials_land_in_cloud_init() {
         let dirs = [PathBuf::from("/home/u/proj")];
-        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "", "");
+        let plan = build_mount_script(&dirs, Path::new("/home/u/proj"), "", "", "");
         let creds = vec![(
             ".claude/.credentials.json".to_string(),
             r#"{"claudeAiOauth":{"accessToken":"tok","refreshToken":"ref"}}"#.to_string(),
         )];
-        let yaml = build_cloud_init(&plan, "claude", "", &creds, &[], None);
+        let yaml = build_cloud_init(&plan, "claude", "", &creds, &[], None, None);
 
         assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
         assert!(yaml.contains("/home/sandbox/.claude/.credentials.json"));
@@ -1133,6 +1206,7 @@ mod tests {
             &dirs,
             Path::new("/home/u/proj"),
             &build_package_setup(&packages),
+            "",
             &build_lockdown(Some(45678)),
         );
         let env = format!(
@@ -1146,7 +1220,7 @@ mod tests {
 
         let files: Vec<(&str, String)> = vec![
             ("base.cloud-init.yaml", build_base_cloud_init(1000)),
-            ("session.cloud-init.yaml", build_cloud_init(&plan, "claude", &env, &creds, &seed, Some(45678))),
+            ("session.cloud-init.yaml", build_cloud_init(&plan, "claude", &env, &creds, &seed, Some(45678), None)),
             ("setup.sh", base_setup_script(1000)),
             ("verify.sh", base_verify_script()),
             ("profile.sh", LOGIN_PROFILE.to_string()),
@@ -1155,7 +1229,7 @@ mod tests {
             ("mounts.sh", plan.script.clone()),
             ("claude.json", seed[0].1.clone()),
             ("lockdown.sh", build_lockdown(Some(45678))),
-            ("egress.nft", build_egress_ruleset(45678)),
+            ("egress.nft", build_egress_ruleset(45678, None)),
         ];
         // One per agent: a layer recipe is the only place an agent's install reaches the guest.
         let mut files = files;
@@ -1190,6 +1264,7 @@ mod tests {
             &[PathBuf::from("/home/u/proj")],
             Path::new("/home/u/proj"),
             &build_package_setup(&sample_packages()),
+            "",
             &build_lockdown(Some(45678)),
         );
 
@@ -1228,6 +1303,7 @@ mod tests {
             &[PathBuf::from("/home/u/proj")],
             Path::new("/home/u/proj"),
             &build_package_setup(&sample_packages()),
+            "",
             &build_lockdown(Some(45678)),
         );
 
@@ -1246,7 +1322,7 @@ mod tests {
     /// somewhere other than the terminal, and signal readiness through it.
     #[test]
     fn mount_script_ends_with_the_ready_marker() {
-        let plan = build_mount_script(&[PathBuf::from("/home/u/proj")], Path::new("/home/u/proj"), "", "");
+        let plan = build_mount_script(&[PathBuf::from("/home/u/proj")], Path::new("/home/u/proj"), "", "", "");
         assert_eq!(
             plan.script.trim_end().lines().last().unwrap().trim(),
             format!("echo {}", READY_MARKER)

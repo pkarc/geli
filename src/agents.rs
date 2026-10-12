@@ -151,9 +151,21 @@ pub(crate) fn session_warnings(
     program: &str,
     has_credentials: bool,
     forward_ssh: bool,
+    copied_key: bool,
     restrict_net: bool,
 ) -> Vec<String> {
     let mut out = Vec::new();
+
+    // Said every time, because the whole point of `--ssh` defaulting to the agent is that this
+    // mode is the exception. A private key in a VM outlives the VM.
+    if copied_key {
+        out.push(
+            "[!] --ssh-copy-key puts the private key itself inside the sandbox, where the agent\n\
+             \x20   can read it and where it stays valid long after the VM is destroyed. Plain\n\
+             \x20   --ssh forwards the agent instead: the guest signs, the key never leaves.\n"
+                .to_string(),
+        );
+    }
 
     // Not "may be blocked": the egress ruleset is default-drop with a single rule for the proxy's
     // port, so nothing reaches port 22, and git over SSH does not read the proxy variables the way
@@ -200,20 +212,36 @@ mod tests {
         let claude = agent_for_command("claude");
 
         // The ordinary case is silent. Anything geli prints every run is noise.
-        assert!(session_warnings(claude, "claude", true, false, false).is_empty());
+        assert!(session_warnings(claude, "claude", true, false, false, false).is_empty());
 
         // --ssh under --restrict-net: the keys go in and SSH still cannot reach anything.
-        let both = session_warnings(claude, "claude", true, true, true);
+        let both = session_warnings(claude, "claude", true, true, false, true);
         assert_eq!(both.len(), 1);
         assert!(both[0].contains("blocks SSH outright"));
         assert!(both[0].contains("https://"), "it must name the way out, not just the problem");
-        assert!(session_warnings(claude, "claude", true, true, false).is_empty());
+        assert!(session_warnings(claude, "claude", true, true, false, false).is_empty());
 
         // An unknown command and no credentials: both said, notice before the warning.
-        let bare = session_warnings(None, "bash", false, false, false);
+        let bare = session_warnings(None, "bash", false, false, false, false);
         assert_eq!(bare.len(), 2);
         assert!(bare[0].contains("not one of geli's agents"));
         assert!(bare[1].contains("No API credentials"));
+    }
+
+    /// The two SSH modes must not read alike: one of them copies a private key out of the user's
+    /// home and the other does not.
+    #[test]
+    fn copying_the_key_is_said_every_time() {
+        let claude = agent_for_command("claude");
+
+        let copied = session_warnings(claude, "claude", true, true, true, false);
+        assert_eq!(copied.len(), 1);
+        assert!(copied[0].contains("--ssh-copy-key"));
+        assert!(copied[0].contains("stays valid long after the VM is destroyed"));
+        assert!(copied[0].contains("--ssh forwards the agent"), "it must name the better option");
+
+        // The forwarded-agent path is the default and says nothing extra.
+        assert!(session_warnings(claude, "claude", true, true, false, false).is_empty());
     }
 
     /// The warning has to name the agent and the paths, or it is a reason to ignore it.
@@ -229,7 +257,7 @@ mod tests {
             version: None,
         };
 
-        let said = session_warnings(Some(&reaching), "greedy", true, false, false);
+        let said = session_warnings(Some(&reaching), "greedy", true, false, false, false);
         assert!(said.iter().any(|w| w.contains(".ssh/id_ed25519")), "{:?}", said);
         assert!(said.iter().any(|w| w.contains("agents/greedy.toml")));
         assert!(said.iter().any(|w| w.contains("--no-credentials")));

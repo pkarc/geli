@@ -189,17 +189,29 @@ export silently sends the session to API billing. `build_env_exports` filters em
 `build_claude_config` seeds exactly three keys — `claude_config_holds_only_what_suppresses_the_prompts`
 fails if the set grows. → [`docs/why/agents-and-credentials.md`](docs/why/agents-and-credentials.md)
 
-### SSH keys (`--ssh`, `--ssh-key`)
+### SSH (`--ssh`, `--ssh-key`, `--ssh-copy-key`)
 
-Off by default. With the flag the host's `~/.ssh/id_*` — or one named key — is copied in, along with
-`known_hosts` and a generated `~/.ssh/config`.
+Off by default. **`--ssh` forwards the host's `ssh-agent`; the private key never crosses.** geli
+runs a relay thread, the guest reaches it at `10.0.2.2:<port>` through `socat` on
+`/tmp/geli-agent.sock`, and `SSH_AUTH_SOCK` points there. `known_hosts` and a generated
+`~/.ssh/config` still cross — those are about the hosts being talked to, not about the user.
 
-**This is a different order of risk from forwarding an agent credential.** A private key grants
-write access to every repository the user has and outlives the VM that leaked it. `.ssh` is in
-`NEVER_COPY` so a recipe can never ask for it; **the standing grant lives in the registry, never in
-the project**; host-key checking is strict when `known_hosts` came across and `accept-new` only when
-it did not; and **`--restrict-net` blocks SSH outright**, which the warning must say plainly.
-→ [`docs/why/agents-and-credentials.md`](docs/why/agents-and-credentials.md)
+**The relay is a filter, not a pipe.** Only `REQUEST_IDENTITIES` and `SIGN_REQUEST` reach the
+host's agent; adding, removing and locking are refused, and `--ssh-key` rewrites the identities
+answer so only that key is offered. **Refusing and reporting are separate**: an extension request
+is denied silently because `ssh` negotiates one on every connection, and a warning that fires when
+nothing is wrong hides the one that matters.
+
+**`--ssh-copy-key` is the old behaviour under a name that says what it does**, and it warns every
+time. A copied key is readable inside the VM and outlives it.
+
+**It is still not safe, and the wording must not claim otherwise**: while the session runs the
+guest can ask for a signature over anything it can reach. Permanent exposure becomes exposure
+bounded by the session. `.ssh` stays in `NEVER_COPY` so a recipe can never ask; the standing grant
+lives in the registry, never in the project; host-key checking is strict when `known_hosts` came
+across and `accept-new` only when it did not; and **`--restrict-net` still blocks SSH outright** —
+the agent remains useful there for local signing, and gets its own nft rule rather than a widened
+one. → [`docs/why/agents-and-credentials.md`](docs/why/agents-and-credentials.md)
 
 ### Egress policy (`--restrict-net`)
 

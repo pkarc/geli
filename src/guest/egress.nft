@@ -23,5 +23,5 @@ table inet geli {
         # The CONNECT proxy inside geli, and nothing else. Not the whole host alias: a port left
         # open on @PROXY_HOST@ is a tunnel out through whatever happens to be listening there.
         ip daddr @PROXY_HOST@ tcp dport @PROXY_PORT@ accept
-    }
+@AGENT_RULE@    }
 }

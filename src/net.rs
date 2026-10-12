@@ -148,13 +148,30 @@ pub(crate) fn build_lockdown(proxy_port: Option<u16>) -> String {
 }
 
 /// The nftables ruleset for a restricted session, as a guest file rather than a Rust string.
-pub(crate) fn build_egress_ruleset(port: u16) -> String {
+///
+/// **The agent relay gets its own rule, not a widened one.** Under `--restrict-net` the guest
+/// reaches no SSH server at all, so a forwarded agent buys it nothing it could use against a
+/// remote — it is there for the local half, signing commits. The port is still named explicitly
+/// rather than opening the host alias, for the same reason the proxy's is: a port left open on
+/// `@PROXY_HOST@` is a tunnel out through whatever happens to be listening there.
+pub(crate) fn build_egress_ruleset(port: u16, agent_port: Option<u16>) -> String {
+    let agent_rule = match agent_port {
+        Some(p) => format!(
+            "\n        # The ssh-agent relay inside geli. Signing only: the relay refuses every\n\
+             \x20       # request that is not a listing or a signature, so this port is not a\n\
+             \x20       # second way to reach the host.\n\
+             \x20       ip daddr {} tcp dport {} accept\n",
+            GUEST_PROXY_HOST, p
+        ),
+        None => String::new(),
+    };
     recipe(
         include_str!("guest/egress.nft"),
         &[
             ("@PROXY_HOST@", GUEST_PROXY_HOST),
             ("@PROXY_PORT@", &port.to_string()),
             ("@DNS@", GUEST_DNS),
+            ("@AGENT_RULE@", &agent_rule),
         ],
     )
 }
@@ -163,7 +180,7 @@ pub(crate) fn build_egress_ruleset(port: u16) -> String {
 ///
 /// Optional in the same way the credentials entry is: an unrestricted session should not have a
 /// policy file sitting in it at all, so there is nothing to wonder about when reading the guest.
-pub(crate) fn build_egress_entry(proxy_port: Option<u16>) -> String {
+pub(crate) fn build_egress_entry(proxy_port: Option<u16>, agent_port: Option<u16>) -> String {
     let Some(port) = proxy_port else {
         return String::new();
     };
@@ -171,7 +188,7 @@ pub(crate) fn build_egress_entry(proxy_port: Option<u16>) -> String {
         "  - path: /etc/geli/egress.nft\n    \
          permissions: '0600'\n    \
          content: |\n{}\n",
-        indent_block(&build_egress_ruleset(port), 6)
+        indent_block(&build_egress_ruleset(port, agent_port), 6)
     )
 }
 
@@ -527,9 +544,24 @@ mod tests {
 
     /// The ruleset's whole allowance is one TCP port on the host alias. A rule naming the host
     /// without the port would be a tunnel out through anything else listening there.
+    /// The relay gets a rule of its own, named explicitly, and only when there is a relay.
+    #[test]
+    fn the_agent_relay_gets_its_own_rule_or_none() {
+        let without = build_egress_ruleset(45678, None);
+        assert_eq!(without.matches("accept").count(), 2, "loopback and the proxy, nothing else");
+
+        let with = build_egress_ruleset(45678, Some(4242));
+        assert!(with.contains("tcp dport 4242 accept"));
+        assert!(with.contains("tcp dport 45678 accept"));
+        assert_eq!(with.matches("accept").count(), 3);
+        // Named, not widened: the host alias must never be opened as a whole.
+        assert!(!with.contains("ip daddr 10.0.2.2 accept"));
+        assert!(!with.contains("@AGENT_RULE@"), "the placeholder survived into the ruleset");
+    }
+
     #[test]
     fn egress_ruleset_opens_only_the_proxy_port() {
-        let rules = build_egress_ruleset(45678);
+        let rules = build_egress_ruleset(45678, None);
         assert!(rules.contains("policy drop"));
         assert!(rules.contains("ip daddr 10.0.2.2 tcp dport 45678 accept"));
         assert!(rules.contains(r#"oifname "lo" accept"#), "the agent's own loopback must survive");
@@ -541,8 +573,8 @@ mod tests {
         // `inet`, not `ip`: a v4-only table would leave IPv6 egress wide open.
         assert!(rules.contains("table inet geli"));
 
-        assert_eq!(build_egress_entry(None), "", "an open session gets no policy file at all");
-        assert!(build_egress_entry(Some(45678)).contains("/etc/geli/egress.nft"));
+        assert_eq!(build_egress_entry(None, None), "", "an open session gets no policy file at all");
+        assert!(build_egress_entry(Some(45678), None).contains("/etc/geli/egress.nft"));
     }
 
     /// The lockdown has to be in place before the agent runs, and the readiness marker is what
@@ -552,6 +584,7 @@ mod tests {
         let plan = build_mount_script(
             &[PathBuf::from("/home/u/proj")],
             Path::new("/home/u/proj"),
+            "",
             "",
             &build_lockdown(Some(45678)),
         );

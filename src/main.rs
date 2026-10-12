@@ -26,13 +26,20 @@ struct Cli {
     #[arg(long)]
     no_credentials: bool,
 
-    /// Forward host SSH keys into the sandbox for git operations
+    /// Let the sandbox sign with the host's SSH agent, without the private key crossing
     #[arg(long)]
     ssh: bool,
 
-    /// Forward a specific SSH private key into the sandbox
+    /// Restrict SSH forwarding to one key, by its path on the host
     #[arg(long, value_name = "PATH")]
     ssh_key: Option<PathBuf>,
+
+    /// Copy the SSH private key file into the sandbox instead of forwarding the agent
+    ///
+    /// The old behaviour of `--ssh`, kept under a name that says what it does. The key is
+    /// readable inside the VM and stays valid long after the VM is gone; prefer `--ssh`.
+    #[arg(long)]
+    ssh_copy_key: bool,
 
     /// Allow the sandbox to reach only an allowlist of hosts, instead of the whole internet
     #[arg(long)]
@@ -190,6 +197,13 @@ fn run() -> io::Result<()> {
         prompt_enable_persistent_ssh(&workspace_name, &mut workspace)?;
     }
     let forward_ssh = !args.no_credentials && (args.ssh || workspace.ssh || args.ssh_key.is_some());
+    let ssh_mode = if !forward_ssh {
+        SshMode::Off
+    } else if args.ssh_copy_key {
+        SshMode::CopyKey
+    } else {
+        SshMode::Agent
+    };
 
     execute_sandbox(
         &workspace_name,
@@ -199,7 +213,7 @@ fn run() -> io::Result<()> {
         &local.packages,
         &SessionPolicy {
             credentials: !args.no_credentials,
-            ssh: forward_ssh,
+            ssh: ssh_mode,
             ssh_key: args.ssh_key.as_deref(),
             restrict_net: args.restrict_net,
             allow: &workspace.allow,
@@ -769,12 +783,16 @@ fn display_active_workspaces() -> io::Result<()> {
 mod agents;
 mod guest;
 mod net;
+#[cfg(target_os = "linux")]
+mod ssh_agent;
 mod ui;
 #[cfg(target_os = "linux")]
 mod qemu;
 
 use agents::*;
 use guest::*;
+#[cfg(target_os = "linux")]
+use ssh_agent::start_agent_relay;
 use net::*;
 use ui::*;
 #[cfg(target_os = "linux")]
@@ -1092,9 +1110,64 @@ fn build_images(selected: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+/// The host's `ssh-agent` socket, or a refusal that says what to do about it.
+///
+/// **Never falls back to copying the key.** Falling quietly to the less safe mode is the exact
+/// shape of failure the rest of this project exists to avoid: the user asked for `--ssh`, got
+/// something, and has no way to tell which one they got. `--ssh-copy-key` is there for anyone who
+/// genuinely wants the old behaviour, and it says so in its name.
+#[cfg(target_os = "linux")]
+fn host_agent_socket() -> io::Result<PathBuf> {
+    let sock = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from).filter(|p| p.exists());
+    sock.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "--ssh forwards the host's ssh-agent, and no agent is running (SSH_AUTH_SOCK is \
+             unset or stale).\n    Start one and load a key:  eval \"$(ssh-agent -s)\" && \
+             ssh-add\n    Or copy the private key into the VM instead, which is weaker: \
+             --ssh-copy-key",
+        )
+    })
+}
+
+/// Which identity the session may sign with.
+///
+/// `--ssh-key` names one, and the blob that identifies it to the agent is the one in its `.pub`
+/// file. Without that file there is nothing to match against, so the restriction cannot be
+/// honoured — and a flag that silently restricts nothing is worse than one that says it could not.
+#[cfg(target_os = "linux")]
+fn granted_key(ssh_key: Option<&Path>) -> io::Result<ssh_agent::Granted> {
+    let Some(key) = ssh_key else { return Ok(ssh_agent::Granted::All) };
+
+    let base = key.to_string_lossy();
+    let base = base.strip_suffix(".pub").unwrap_or(&base);
+    let pub_path = PathBuf::from(format!("{}.pub", base));
+
+    match fs::read_to_string(&pub_path).ok().and_then(|l| ssh_agent::public_key_blob(&l)) {
+        Some(blob) => Ok(ssh_agent::Granted::Only(blob)),
+        None => {
+            eprintln!(
+                "[!] --ssh-key names {} but {} is missing or unreadable, so the session is not\n\
+                 \x20   restricted to that key: every identity the agent holds can be used.\n\
+                 \x20   Adding or removing keys is still refused.",
+                key.display(),
+                pub_path.display()
+            );
+            Ok(ssh_agent::Granted::All)
+        }
+    }
+}
+
+/// What ssh needs in the guest: `known_hosts`, a generated config, and — only under
+/// `--ssh-copy-key` — the private keys themselves.
+///
+/// **`copy_keys` is false on the normal path.** With the agent forwarded there is no key to copy,
+/// and no `IdentityFile` lines either: the identities come from the agent, which is the whole
+/// point. What is still needed is everything about *the hosts being talked to*.
 pub(crate) fn collect_ssh_credentials(
     home: &Path,
     ssh_key: Option<&Path>,
+    copy_keys: bool,
 ) -> io::Result<Vec<(String, String)>> {
     let mut creds = Vec::new();
     let ssh_dir = home.join(".ssh");
@@ -1102,7 +1175,10 @@ pub(crate) fn collect_ssh_credentials(
     let mut found_any_key = false;
     let mut key_names = Vec::new();
 
-    if let Some(explicit_path) = ssh_key {
+    if !copy_keys {
+        // Nothing of the user's private material crosses; skip straight to the host knowledge.
+        found_any_key = true;
+    } else if let Some(explicit_path) = ssh_key {
         let resolved = if explicit_path.starts_with("~/") || explicit_path == Path::new("~") {
             if let Ok(stripped) = explicit_path.strip_prefix("~") {
                 home.join(stripped)
@@ -1218,6 +1294,20 @@ pub(crate) fn collect_ssh_credentials(
     Ok(creds)
 }
 
+/// How a session gets to use the host's SSH key.
+///
+/// **`Agent` is the default because `CopyKey` cannot be made safe.** A copied private key is
+/// readable by the agent inside the VM and stays valid long after the disposable VM is gone; a
+/// forwarded agent socket lets the guest *sign* and never hands over the key. The difference is
+/// permanent exposure against exposure bounded by the session, which is the honest claim —
+/// see `docs/plans/08-reenviar-agente-ssh.md`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum SshMode {
+    Off,
+    Agent,
+    CopyKey,
+}
+
 /// What this invocation is allowed to carry into the sandbox, and how far it may reach.
 ///
 /// Grouped rather than passed as four more arguments: they are one decision — how much of the
@@ -1226,9 +1316,9 @@ pub(crate) fn collect_ssh_credentials(
 pub(crate) struct SessionPolicy<'a> {
     /// Copy the invoked agent's credentials out of the user's home.
     pub(crate) credentials: bool,
-    /// Copy SSH private keys in as well. Implies `credentials`; see `Cli`.
-    pub(crate) ssh: bool,
-    /// Forward this key instead of the usual `~/.ssh/id_*`.
+    /// How the sandbox gets to use the host's SSH key, if at all. Implies `credentials`.
+    pub(crate) ssh: SshMode,
+    /// Restrict to this key instead of every identity the agent holds.
     pub(crate) ssh_key: Option<&'a Path>,
     /// Cut egress to the allowlist.
     pub(crate) restrict_net: bool,
@@ -1377,10 +1467,20 @@ fn execute_sandbox(
     };
     let proxy_port = proxy.as_ref().map(|(p, _)| p.port);
 
+    // Same reason as the proxy, one line up: the egress ruleset names this port and the guest's
+    // relay script dials it, and the port is whatever the OS handed the listener. Returns rather
+    // than exits — `SessionScratch` is live by now, and `Drop` does not run on `process::exit`.
+    let agent_relay = match forward_ssh {
+        SshMode::Agent => Some(start_agent_relay(&host_agent_socket()?, granted_key(ssh_key)?)?),
+        _ => None,
+    };
+    let agent_port = agent_relay.as_ref().map(|r| r.port);
+
     let plan = build_mount_script(
         &dirs,
         &cur_canon,
         &build_package_setup(packages),
+        &build_agent_relay(agent_port),
         &build_lockdown(proxy_port),
     );
 
@@ -1407,13 +1507,12 @@ fn execute_sandbox(
         _ => Vec::new(),
     };
 
-    // Returns rather than exits: `SessionScratch` is live by now, and `Drop` does not run on
-    // `process::exit`.
-    let ssh_credentials = if forward_ssh {
-        collect_ssh_credentials(&home, ssh_key)
-            .map_err(|e| io::Error::other(format!("reading SSH credentials: {}", e)))?
-    } else {
-        Vec::new()
+    let ssh_credentials = match forward_ssh {
+        SshMode::Off => Vec::new(),
+        // With the agent forwarded there is no key to copy — only what ssh still needs to know
+        // about the hosts it is talking to.
+        mode => collect_ssh_credentials(&home, ssh_key, mode == SshMode::CopyKey)
+            .map_err(|e| io::Error::other(format!("reading SSH credentials: {}", e)))?,
     };
 
     let mut credentials = agent_credentials.clone();
@@ -1424,7 +1523,14 @@ fn execute_sandbox(
         || !agent_credentials.is_empty();
 
     for warning in
-        session_warnings(agent, &cmd.program, has_credentials, forward_ssh, restrict_net)
+        session_warnings(
+            agent,
+            &cmd.program,
+            has_credentials,
+            forward_ssh != SshMode::Off,
+            forward_ssh == SshMode::CopyKey,
+            restrict_net,
+        )
     {
         eprintln!("{}", warning);
     }
@@ -1439,6 +1545,13 @@ fn execute_sandbox(
     if !proxy_env.is_empty() {
         env_exports.push('\n');
         env_exports.push_str(&proxy_env);
+    }
+    // Where the guest's ssh clients look for the agent. Exported only when the relay is running:
+    // a stale `SSH_AUTH_SOCK` makes ssh fail with a confusing error instead of falling back to
+    // asking for a key.
+    if agent_port.is_some() {
+        env_exports.push('\n');
+        env_exports.push_str(&format!("export SSH_AUTH_SOCK={}", shell_quote(AGENT_SOCKET)));
     }
     env_exports.push('\n');
     env_exports.push_str(&build_terminal_setup(
@@ -1462,6 +1575,7 @@ fn execute_sandbox(
         &credentials,
         &seed,
         proxy_port,
+        agent_port,
     );
     let iso = make_cloud_init_iso(
         &vm_share_dir,
@@ -1481,14 +1595,17 @@ fn execute_sandbox(
         }
         _ => "none".to_string(),
     };
-    let auth = if forward_ssh && !ssh_credentials.is_empty() {
-        if base_auth == "none" {
-            "SSH keys forwarded".to_string()
-        } else {
-            format!("{} + SSH", base_auth)
-        }
-    } else {
-        base_auth
+    // **The two modes must not read alike.** One of them copied a private key out of the user's
+    // home and the other did not, and the status block is where that is said.
+    let ssh_note = match forward_ssh {
+        SshMode::Agent => Some("ssh-agent forwarded · key stays on the host"),
+        SshMode::CopyKey => Some("SSH private key COPIED into the VM"),
+        SshMode::Off => None,
+    };
+    let auth = match (ssh_note, base_auth.as_str()) {
+        (None, _) => base_auth,
+        (Some(note), "none") => note.to_string(),
+        (Some(note), _) => format!("{} + {}", base_auth, note),
     };
     let net = match &proxy {
         Some((_, count)) => format!("restricted · {} domains allowed", count),
@@ -1806,7 +1923,7 @@ geli:ready\n";
         fs::write(ssh_dir.join("id_ed25519.pub"), "test_public_key").unwrap();
         fs::write(ssh_dir.join("known_hosts"), "github.com ssh-ed25519 AAAA...").unwrap();
 
-        let creds = collect_ssh_credentials(&temp, None).unwrap();
+        let creds = collect_ssh_credentials(&temp, None, true).unwrap();
         assert!(creds.iter().any(|(p, c)| p == ".ssh/id_ed25519" && c == "test_private_key"));
         assert!(creds.iter().any(|(p, c)| p == ".ssh/id_ed25519.pub" && c == "test_public_key"));
         assert!(creds.iter().any(|(p, c)| p == ".ssh/known_hosts" && c.contains("github.com")));
@@ -1823,12 +1940,12 @@ geli:ready\n";
         // Without it the alternative is a session hanging on a prompt nobody will answer, so
         // first contact is accepted — but only then, not as a blanket default.
         fs::remove_file(ssh_dir.join("known_hosts")).unwrap();
-        let lenient = config(&collect_ssh_credentials(&temp, None).unwrap());
+        let lenient = config(&collect_ssh_credentials(&temp, None, true).unwrap());
         assert!(lenient.contains("StrictHostKeyChecking accept-new"), "{}", lenient);
 
         // An empty known_hosts is no better than a missing one.
         fs::write(ssh_dir.join("known_hosts"), "\n  \n").unwrap();
-        let empty = config(&collect_ssh_credentials(&temp, None).unwrap());
+        let empty = config(&collect_ssh_credentials(&temp, None, true).unwrap());
         assert!(empty.contains("StrictHostKeyChecking accept-new"), "{}", empty);
 
         let _ = fs::remove_dir_all(&temp);
@@ -1841,7 +1958,7 @@ geli:ready\n";
         let key_file = temp.join("custom_deploy_key");
         fs::write(&key_file, "custom_secret").unwrap();
 
-        let creds = collect_ssh_credentials(&temp, Some(&key_file)).unwrap();
+        let creds = collect_ssh_credentials(&temp, Some(&key_file), true).unwrap();
         assert!(creds.iter().any(|(p, c)| p == ".ssh/custom_deploy_key" && c == "custom_secret"));
 
         let config_entry = creds.iter().find(|(p, _)| p == ".ssh/config").map(|(_, c)| c.as_str()).unwrap();

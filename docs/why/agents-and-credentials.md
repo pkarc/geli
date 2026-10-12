@@ -79,42 +79,89 @@ reason.
 `credential_warning` runs on the host *before* the VM boots rather than letting the user watch a
 dead console.
 
-## SSH keys (`--ssh`, `--ssh-key`)
+## SSH: the agent is forwarded, the key is not
 
-Off by default. With the flag the host's `~/.ssh/id_*` — or one named key — is copied in, along with
-`known_hosts` and a generated `~/.ssh/config`.
+Off by default. With `--ssh` the guest gets a socket at `/tmp/geli-agent.sock`, `SSH_AUTH_SOCK`
+points at it, and `socat` carries each connection to a relay thread inside geli at
+`10.0.2.2:<port>` — the same slirp host alias the egress proxy uses. The host's `ssh-agent` does
+the signing. `known_hosts` and a generated `~/.ssh/config` still cross; those describe the hosts
+being talked to, not the user.
 
-**This is a different order of risk from forwarding an agent credential, and the README says so
-plainly.** An agent credential leaks the account it belongs to; an SSH private key grants write
-access to every repository the user has, and it outlives the disposable VM that leaked it. `.ssh` is
-in `NEVER_COPY` precisely so a *recipe* can never ask for this quietly — the flag is a first-party,
-explicit decision instead, and the copied paths are named in the status block like any other.
+**A relay is required because 9p cannot carry a Unix socket.** Measured: the guest *can* `bind()`
+one on a 9p share and the host *does* see the inode —
 
-**The standing grant lives in the registry, never in the project.** `--ssh` on an interactive
-terminal offers to remember the answer for the workspace, and that goes to
-`~/.config/geli/workspaces/<name>.json`. It was `"ssh": true` in the project's `.geli.json` until it
-was noticed that the sandbox mounts that file with write access: the agent could grant itself the
-host's private keys for the next session, with no flag, and so could a cloned repository carrying
-the field. `migrate_local_config` reads that field only to tell the user it is being dropped.
-`privileged_fields_are_not_read_from_the_project` is the regression test.
+```
+srwxr-xr-x 1 pkarc pkarc 0 Oct 11 19:18 .geli-xsock
+```
+
+— but connecting to it from the host gives `ECONNREFUSED`. The inode crosses, the connection does
+not. Mounting the host's socket and being done with it does not work in either direction.
+
+**vsock was the better shape and was rejected on permissions.** `-device vhost-vsock-pci` would
+give a host↔guest channel with no network in it, invisible to the egress policy. But on an
+ordinary Ubuntu desktop `/dev/kvm` is `crw-rw----+` — udev puts an ACL on it for the session
+user — and `/dev/vhost-vsock` is `crw-rw----` with no ACL and no membership of `kvm`. Opening it
+gives `EACCES`. The device exists and does not work, which is the lesson `/dev/kvm` already
+taught; the difference is that there the answer was to degrade to emulation, and here there is no
+degradation — either the channel exists or the session cannot start.
+
+### The relay is a filter, and that is the point
+
+Forwarding an agent wholesale lets the far end enumerate every key you have loaded and delete them
+from your agent. `screen` passes only `REQUEST_IDENTITIES` and `SIGN_REQUEST`; add, remove,
+remove-all, lock, unlock, smartcard and constrained-add are answered with `SSH_AGENT_FAILURE`
+without the host's agent ever hearing them. Verified against a real agent: `ssh-add -D` inside the
+VM reports "Failed to remove all identities" and the host still holds its three keys.
+
+`--ssh-key` restricts further. The blob in a `.pub` file is the one the agent reports for that key,
+so `filter_identities` rewrites the listing to hold only it and sign requests for anything else are
+refused. Without that, `--ssh-key` would name one key and hand over all of them. The listing is
+rewritten rather than refused because `ssh` enumerates before it signs; refusing there would simply
+stop it finding the key it is allowed to use.
+
+**Refusing and reporting are two different things**, and conflating them was measured to be wrong.
+The first end-to-end run printed a refusal on every ordinary `ssh` connection, because ssh opens a
+forwarded-agent connection with `session-bind@openssh.com` and carries on happily when the agent
+says no. A warning that fires when nothing is wrong is one people learn to scroll past — and the
+one it would hide is the guest reshaping the user's agent. Extensions are refused silently;
+everything else is refused out loud.
+
+### What it does not give
+
+For as long as the session runs, the guest can ask for a signature over anything it can reach. It
+cannot steal the key, but it can act as you. This is the classic weakness of agent forwarding, and
+the recommendation has always been not to forward an agent to a machine you do not trust — which
+is literally geli's use case.
+
+So the claim is not "now it is safe". It is:
+
+> *the key stays yours forever* instead of *the key may end up someone else's*
+
+Permanent exposure becomes exposure bounded by the session. `ssh-add -c` is the cheap mitigation —
+it makes the agent ask before each signature — at the cost of any non-interactive use.
+
+### The flags
+
+**`--ssh-copy-key` is the old behaviour under a name that says what it does.** It copies
+`~/.ssh/id_*` in, and it warns every time, because a key in a VM outlives the VM. The status block
+distinguishes the two in words that cannot be mistaken for each other:
+`ssh-agent forwarded · key stays on the host` against `SSH private key COPIED into the VM`.
+
+**No agent means a refusal, never a quiet fallback.** `host_agent_socket` fails with the command to
+fix it. Falling to the weaker mode without saying so would leave the user unable to tell which one
+they got, which is the shape of failure the rest of this project exists to avoid.
+
+`.ssh` stays in `NEVER_COPY`, so a *recipe* can never ask for any of this quietly, and the standing
+grant lives in the registry rather than the project — see
+[`workspaces-and-session.md`](workspaces-and-session.md).
 
 **Host-key checking is strict when `known_hosts` came across, `accept-new` only when it did not** —
 and that case prints a line saying so. Blanket `accept-new` trusts whatever answers first, which is
 a poor default in the one environment where you least control what is running.
 
-**`--restrict-net` blocks SSH outright, and the warning must say so.** The egress ruleset is
-default-drop with a single rule for the proxy's port, and git over SSH does not read the proxy
-variables that curl and npm do. An earlier wording said connections "may be blocked unless
-connecting via port 443", which sends someone hunting for a configuration that does not exist. The
-keys remain useful under `--restrict-net` for local work such as commit signing.
-
-**Still open:** forwarding the *agent socket* rather than the key, so the guest can sign with the
-key but never read it. Designed, with the transport measured, in
-[`../plans/08-reenviar-agente-ssh.md`](../plans/08-reenviar-agente-ssh.md). The short version: geli
-already has the shape — the CONNECT proxy is a host thread the guest reaches at
-`10.0.2.2:<port>` — and it needs a relay in the guest because **9p cannot carry a Unix socket**
-(the inode crosses, the connection does not; measured, `ECONNREFUSED` from the host side).
-
-It is worth being plain about the size of the win. A forwarded agent still lets the guest ask for
-signatures over anything it can reach, for as long as the session runs. The change is not "now it
-is safe"; it is *the key stays yours forever* instead of *the key may end up someone else's*.
+**`--restrict-net` still blocks SSH outright**, and the warning must say so: the ruleset is
+default-drop and git over SSH does not read the proxy variables that curl and npm do. The agent
+remains useful there for the local half — signing commits — so the relay gets **its own nft rule**
+rather than a widened one, named explicitly like the proxy's. Measured in a restricted session:
+`ssh-add -l` lists the keys, `ssh git@github.com` cannot even resolve, and `ssh-keygen -Y sign`
+reaches the signing step.
