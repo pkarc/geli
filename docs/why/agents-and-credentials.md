@@ -109,5 +109,12 @@ connecting via port 443", which sends someone hunting for a configuration that d
 keys remain useful under `--restrict-net` for local work such as commit signing.
 
 **Still open:** forwarding the *agent socket* rather than the key, so the guest can sign with the
-key but never read it. geli already has the shape for it — the CONNECT proxy is a host thread the
-guest reaches at `10.0.2.2:<port>` — plus a relay in the guest to present a Unix socket.
+key but never read it. Designed, with the transport measured, in
+[`../plans/08-reenviar-agente-ssh.md`](../plans/08-reenviar-agente-ssh.md). The short version: geli
+already has the shape — the CONNECT proxy is a host thread the guest reaches at
+`10.0.2.2:<port>` — and it needs a relay in the guest because **9p cannot carry a Unix socket**
+(the inode crosses, the connection does not; measured, `ECONNREFUSED` from the host side).
+
+It is worth being plain about the size of the win. A forwarded agent still lets the guest ask for
+signatures over anything it can reach, for as long as the session runs. The change is not "now it
+is safe"; it is *the key stays yours forever* instead of *the key may end up someone else's*.

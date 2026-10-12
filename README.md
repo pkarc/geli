@@ -531,9 +531,15 @@ Done:
 
 Next:
 
-13. **macOS and Windows.** `execute_sandbox` is `#[cfg]`-gated and only the Linux implementation
+13. **[Forward the SSH agent, not the key](docs/plans/08-reenviar-agente-ssh.md).** Today `--ssh`
+    copies the private key file into the VM, where the agent can read it and where it stays valid
+    long after the VM is destroyed. Forwarding the agent socket lets the guest *sign* without ever
+    reading the key. Designed and the transport measured; not implemented. It does not make
+    forwarding safe — a forwarded agent still signs whatever the session asks, while it runs — but
+    it turns permanent exposure into exposure bounded by the session.
+14. **macOS and Windows.** `execute_sandbox` is `#[cfg]`-gated and only the Linux implementation
     exists; the others print "not yet implemented". This is the largest limitation geli has left.
-14. **`geli --prune`.** Cleaning up images no live chain references is manual today. geli says
+15. **`geli --prune`.** Cleaning up images no live chain references is manual today. geli says
     when it spots a pre-layers image but does not remove it.
 
 Rejected, with the reasoning written down rather than left to be re-litigated:
