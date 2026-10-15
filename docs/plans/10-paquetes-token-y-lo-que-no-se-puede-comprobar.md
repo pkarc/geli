@@ -1,4 +1,10 @@
-# Plan — los paquetes, el token, y lo que el relay no puede comprobar (2026-10-14)
+# Hecho — los paquetes, el token, y lo que el relay no puede comprobar (2026-10-14)
+
+**Las cinco fases están implementadas.** El diseño de abajo es el que se construyó, con tres
+cosas que solo aparecieron al medir: el dialer del shell de la fase 3 no funciona (ver «Lo que
+cambió al construir la fase 3»), `cargo audit` necesita `^0.22` y lee su configuración en
+`.cargo/audit.toml`, y el barrido de la fase 5 tenía que ir antes de los retornos tempranos de
+`run()` o no corría con `--list`.
 
 Cinco frentes abiertos después de `09`. Cuatro salen de una revisión externa; el de los
 certificados salió de comprobar esa revisión. El orden no es por gravedad sino por lo que rompe
@@ -220,3 +226,28 @@ buscará.
 - **No mueve la instalación de paquetes después del lockdown**, por lo dicho en la fase 1.
 - **No pone token en el proxy de egress**, aunque tenga el mismo agujero. Es un commit propio.
 - **No toca `--ssh-copy-key`.** Sigue siendo la opción débil y sigue avisando.
+
+
+---
+
+## Lo que cada fase dejó, y lo que la revisión de cada una encontró
+
+- **Fase 1.** El validador pasa a ser por gestor, y la revisión añadió lo que el plan no tenía: un
+  nombre que empieza por `-` tampoco es un paquete, es una opción (`apk add --allow-untrusted`).
+  Y un hueco propio: al principio la lista aprobada sombreaba a la declarada, así que denegar la
+  aprobación y luego conservar un paquete descubierto habría **borrado la lista del `.geli.json`**
+  del usuario. Son dos listas distintas y ahora son dos variables distintas.
+- **Fase 2.** Un certificado de CA se declina en silencio y se cuenta aparte de «el cliente no
+  vinculó nada». La frase de `09` se corrigió por tercera vez, que es el número de veces que ha
+  hecho falta para dejarla exacta.
+- **Fase 3.** Ocho arranques de VM para descubrir que anteponer bytes desde el shell no funciona
+  de dos maneras distintas. La solución —`PROXY:`— es menos código que el plan y no deja fichero
+  intermedio en el guest.
+- **Fase 4.** El ignore de RUSTSEC-2023-0071 se comprobó corriendo el auditor, no leyendo la
+  descripción: sin el fichero, falla; con él, pasa.
+- **Fase 5.** El barrido se midió matando una sesión con `SIGHUP`: los dos restos quedan, el
+  siguiente `geli` los recoge, y no queda ningún QEMU huérfano.
+
+**Y uno que no era de ninguna fase**: correr `cargo test -- --ignored` reescribía `agents/*.toml`.
+Era `dump_agents_as_toml`, el ayudante de cuando la tabla de agentes vivía en Rust; hoy solo
+borraba comentarios y el campo `version`. Eliminado.
