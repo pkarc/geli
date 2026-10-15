@@ -165,6 +165,19 @@ fn looks_like_a_path(name: &str) -> bool {
         || name.starts_with('~')
         || name.contains("..")
         || name.contains('/')
+        || looks_like_an_archive(name)
+}
+
+/// Whether a name with no slash in it would still be read as a file.
+///
+/// npm takes `x.tgz` and pip takes `x.whl` as something to install from disk, resolved against
+/// the working directory. The install runs from `/`, where the agent cannot write, so today this
+/// is already harmless — **but that is a property of where the script stands, not of what the
+/// name is allowed to be**, and the two should not be the same argument. One of them is checked
+/// here; the other is a `cd /` in the mount script, and both are cheap.
+fn looks_like_an_archive(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".tgz", ".tar", ".tar.gz", ".whl", ".zip"].iter().any(|ext| lower.ends_with(ext))
 }
 
 /// Whether `manager` would accept this name as the name of a package.
@@ -2018,6 +2031,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A name with no slash that is still a file: npm and pip resolve these against the working
+    /// directory. The mount script stands in `/` so it is already harmless, and relying on that
+    /// means relying on two things instead of one.
+    #[test]
+    fn a_package_name_may_not_be_an_archive() {
+        for archive in ["evil.tgz", "evil.tar", "evil.tar.gz", "evil.whl", "evil.zip", "EVIL.TGZ"] {
+            for manager in ["apk", "npm", "pip"] {
+                assert!(
+                    !valid_package_name(manager, archive),
+                    "{} accepted {:?} as a package",
+                    manager,
+                    archive
+                );
+            }
+        }
+
+        // A version is not an archive: `pkg==1.2.tar` is nobody's version, but `1.2.3` is, and
+        // `.tarball-cli` is a real npm package name.
+        assert!(valid_package_name("pip", "requests==2.31.0"));
+        assert!(valid_package_name("npm", "tar"));
+        assert!(valid_package_name("npm", "@scope/zip-stream"));
     }
 
     #[test]

@@ -226,6 +226,14 @@ pub(crate) fn recipe_hash(recipe: &str) -> String {
 /// Where the guest's ssh clients look for the agent.
 pub(crate) const AGENT_SOCKET: &str = "/tmp/geli-agent.sock";
 
+/// Where the user's credentials wait until the risky part of the boot is over.
+///
+/// **No `owner:` on what cloud-init writes here, which is the point.** `write_files` runs before
+/// `runcmd`, so anything it puts in `/home/sandbox` is readable by the first thing that runs —
+/// including a package's install script. Staged root-only and installed afterwards, those files
+/// exist for a shorter time and for fewer readers.
+pub(crate) const SECRETS_DIR: &str = "/etc/geli/secrets";
+
 /// The user half of the CONNECT credentials. Carries nothing: the token is the secret, and this
 /// only exists because `Proxy-Authorization: Basic` is shaped `user:pass`.
 pub(crate) const AGENT_PROXY_USER: &str = "geli";
@@ -273,6 +281,24 @@ pub(crate) fn build_agent_relay(relay: Option<(u16, &str)>) -> String {
     )
 }
 
+/// The order of this script is the session's security model in one place.
+///
+/// **Caches, packages, workspace, credentials, relay, lockdown — and each step is where it is for
+/// a reason that cost something to learn:**
+///
+/// - Packages go in while there is still a route. The lockdown deletes the default route, empties
+///   `resolv.conf` and loads a default-drop ruleset, and a package fetched after it fails
+///   *quietly*, since a missing one only warns.
+/// - **The workspace is mounted after them**, so a package's install script — which runs as root
+///   here, and which no approval can vouch for across versions — has no project to read. This was
+///   impossible until a package name stopped being allowed to be a path.
+/// - **The credentials are installed after that**, out of `/etc/geli/secrets`, for the same
+///   reason: `write_files` runs before `runcmd`, so anything left in the home by cloud-init is
+///   already there when the first install script runs.
+/// - The relay must be listening before the agent could ask it to sign, and before the ruleset
+///   that names its port.
+///
+/// → `docs/plans/11-el-orden-dentro-del-arranque.md`
 pub(crate) fn build_mount_script(
     dirs: &[PathBuf],
     current_canonical: &Path,
@@ -284,6 +310,7 @@ pub(crate) fn build_mount_script(
     let mut active_folder = String::new();
     let mut folders = Vec::new();
 
+    let mut workspace_mounts = String::new();
     for (i, dir) in dirs.iter().enumerate() {
         let tag = share_tag(i);
         let name = folder_name(dir);
@@ -293,7 +320,7 @@ pub(crate) fn build_mount_script(
             active_folder = name.clone();
         }
 
-        script.push_str(&format!(
+        workspace_mounts.push_str(&format!(
             "mkdir -p /workspace/{name}\nmount -t 9p -o {MOUNT_OPTS} {tag} /workspace/{name}\n"
         ));
     }
@@ -315,10 +342,11 @@ pub(crate) fn build_mount_script(
     ));
     script.push_str("rm -rf /etc/apk/cache\nln -s /var/cache/apk /etc/apk/cache\n");
 
-    // Declared tools, installed while there is still a route. The order below is load-bearing:
-    // the lockdown deletes the default route, empties resolv.conf and loads a default-drop
-    // ruleset, so anything fetched after it would fail — and fail quietly, since a missing
-    // package only warns. Mounts, then packages, then egress, then the marker.
+    // Declared tools, with a route to fetch them over, no project to read and no credentials on
+    // disk. The two lines that put those there come after. `cd /` because npm and pip read a
+    // name ending in .tgz or .whl as a file in the working directory, and a protection that
+    // depends on where a script happens to be standing is not one.
+    script.push_str("\ncd /\n");
     script.push_str(packages);
 
     // The baseline for "what did this session add", taken *after* the declared packages are in:
@@ -327,6 +355,19 @@ pub(crate) fn build_mount_script(
     // image built before it does not carry it.
     script.push_str(&format!(
         "\ncommand -v geli-packages >/dev/null && geli-packages snapshot > {PACKAGE_BASELINE}\n"
+    ));
+
+    // Now the project, and only now.
+    script.push('\n');
+    script.push_str(&workspace_mounts);
+
+    // And the user's credentials, staged by cloud-init where only root could read them.
+    script.push_str(&format!(
+        "\nif [ -d {SECRETS_DIR} ]; then\n\
+         \x20 (cd {SECRETS_DIR} && find . -type f -exec install -D -m 0600 \\\n\
+         \x20     -o sandbox -g sandbox {{}} /home/sandbox/{{}} \\;)\n\
+         \x20 rm -rf {SECRETS_DIR}\n\
+         fi\n"
     ));
 
     // Before the lockdown, like the packages: the relay has to be listening before the agent
@@ -593,9 +634,8 @@ pub(crate) fn build_credentials_entry(credentials: &[(String, String)]) -> Strin
         .iter()
         .map(|(path, contents)| {
             format!(
-                "  - path: /home/sandbox/{}\n    \
+                "  - path: {SECRETS_DIR}/{}\n    \
                  permissions: '0600'\n    \
-                 owner: sandbox:sandbox\n    \
                  content: |\n{}\n",
                 path,
                 indent_block(contents, 6)
@@ -973,6 +1013,42 @@ mod tests {
         assert!(!out.ends_with('\n'), "trailing newline breaks block scalars");
     }
 
+    /// **The order of the boot is the security model, so it is asserted as an order.**
+    ///
+    /// A package's install script runs as root with a route out, and an approval covers names,
+    /// not what a version does later. What it finds when it runs is decided here: no project
+    /// mounted yet, and no credentials on disk yet.
+    #[test]
+    fn nothing_a_package_could_read_exists_while_it_installs() {
+        let plan = build_mount_script(
+            &[PathBuf::from("/home/u/proj")],
+            Path::new("/home/u/proj"),
+            &build_package_setup(&Packages {
+                apk: vec!["ripgrep".into()],
+                ..Default::default()
+            }),
+            &build_agent_relay(Some((4242, "cafed00d"))),
+            &crate::net::build_lockdown(Some(45678)),
+        );
+        let at = |needle: &str| plan.script.find(needle).unwrap_or_else(|| panic!("no {}", needle));
+
+        let caches = at("npmcache");
+        let packages = at("apk add");
+        let workspace = at("projshare1");
+        let secrets = at(SECRETS_DIR);
+        let lockdown = at("ip route del default");
+        let ready = at(READY_MARKER);
+
+        assert!(caches < packages, "the caches are what make installing worth doing");
+        assert!(packages < workspace, "a package install script could read the project");
+        assert!(packages < secrets, "a package install script could read the credentials");
+        assert!(secrets < lockdown, "the agent would start without its credentials");
+        assert!(lockdown < ready, "the session was declared ready before egress was cut");
+
+        // npm and pip read a name ending in .tgz or .whl as a file in the working directory.
+        assert!(plan.script[..packages].contains("\ncd /\n"), "installing from an unknown cwd");
+    }
+
     /// The relay has to be listening before the agent could ask it for a signature, and before
     /// the lockdown, whose ruleset names its port.
     #[test]
@@ -1182,11 +1258,28 @@ mod tests {
         let yaml = build_cloud_init(&plan, "claude", "", &creds, &[], None, None);
 
         assert!(YamlLoader::load_from_str(&yaml).is_ok(), "{}", yaml);
-        assert!(yaml.contains("/home/sandbox/.claude/.credentials.json"));
         assert!(yaml.contains("accessToken"));
-        // Must not be world-readable inside the guest.
-        let block = yaml.split("/home/sandbox/.claude/.credentials.json").nth(1).unwrap();
+
+        // **Staged, not placed.** cloud-init writes before anything in `runcmd` runs, so a
+        // credential it drops straight into the home is readable by the first package install
+        // script of the boot. It waits in a root-only directory and the mount script installs it
+        // once the risky part is over.
+        let staged = format!("{}/.claude/.credentials.json", SECRETS_DIR);
+        assert!(yaml.contains(&staged), "the credential was not staged: {}", yaml);
+        assert!(
+            !yaml.contains("path: /home/sandbox/.claude/.credentials.json"),
+            "cloud-init still writes the credential into the home"
+        );
+
+        let block = yaml.split(&staged).nth(1).unwrap();
         assert!(block.contains("permissions: '0600'"));
+        // No owner either: `sandbox` must not be able to read it while it is waiting.
+        let entry = block.split("- path:").next().unwrap();
+        assert!(!entry.contains("owner: sandbox"), "the staged credential is the agent's early");
+
+        // And the mount script installs it, after the packages and before the lockdown.
+        let install = plan.script.find("/etc/geli/secrets").expect("nothing installs the secrets");
+        assert!(plan.script[install..].contains("0600"));
     }
 
     #[test]
