@@ -7,6 +7,26 @@ workspace's `~/.config/geli/workspaces/<name>.json` lists under `allow`. **Not t
 A CONNECT proxy runs on a thread inside geli, resolves on the host, and only dials port 443 — a
 proxy that reaches any port on an allowed host is a general tunnel, not a policy.
 
+## The proxy asks who is calling
+
+The listener is TCP on `127.0.0.1`, and **a TCP port has no permissions**. Until the session's
+token was required, any local user of the host could use geli's proxy as an open proxy to every
+destination the session was granted — and their requests landed in the closing
+`net: N allowed, M blocked` line as if the session had made them.
+
+The token goes in the proxy URL (`http://geli:TOKEN@10.0.2.2:<port>`), which is the one place
+every client that honours `HTTPS_PROXY` already looks: npm, pip, git and curl all parse it, and
+the agent's own runtime does too — measured, with a real `--restrict-net` session. A request
+without it gets `407` and is not counted, because the summary is about what the session did.
+
+It is the same check the ssh agent relay makes, and deliberately the same code: `authorised` and
+the session token live here, in `net.rs`, because a CONNECT is network business, and the relay
+imports them rather than the other way round.
+
+What it does not defend against is the guest, which can read the token in its own environment —
+that is correct, the guest is the intended client. What it defends against is everything else on
+the host.
+
 ## Why it is off by default
 
 Because the isolation geli promises is the VM, not the network, and the two should not be

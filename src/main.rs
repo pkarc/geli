@@ -1763,7 +1763,7 @@ fn execute_sandbox(
     env_exports.push('\n');
     env_exports.push_str(&format!("export PATH={}/bin:$PATH", USER_PREFIX));
 
-    let proxy_env = build_proxy_env(proxy.as_ref().map(|(p, _)| p.port));
+    let proxy_env = build_proxy_env(proxy.as_ref().map(|(p, _)| (p.port, p.token.as_str())));
     if !proxy_env.is_empty() {
         env_exports.push('\n');
         env_exports.push_str(&proxy_env);

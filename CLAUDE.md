@@ -221,13 +221,19 @@ answer so only that key is offered. **Refusing and reporting are separate**: an 
 is denied silently because `ssh` negotiates one on every connection, and a warning that fires when
 nothing is wrong hides the one that matters.
 
-**The relay listens on TCP loopback, which has no permissions, so it asks for a token first.** The
-host's own agent socket sits behind a `0700` directory; a port does not, and without this every
-local user of the host could sign as you for as long as a session runs. The token rides in a
-`CONNECT` with `Proxy-Authorization`, because **`socat` can send one and cannot prepend bytes to a
-stream** — a shell dialer that writes the token and then `cat`s was measured to deadlock `ssh-add`
-in two different ways. It keeps other users of the host out, not the guest, which is the intended
-client. → [`docs/plans/10-paquetes-token-y-lo-que-no-se-puede-comprobar.md`](docs/plans/10-paquetes-token-y-lo-que-no-se-puede-comprobar.md)
+**Both of geli's loopback listeners ask for the session's token, and the check is one piece of
+code** — `authorised` and `session_token` live in `net.rs`, because a CONNECT is network business,
+and the relay imports them rather than the other way round. **A TCP port has no permissions**,
+while the host's own agent socket sits behind a `0700` directory: without this, any local user
+could sign as you and use the proxy as an open proxy to every allowed destination, with their
+traffic landing in the closing `net:` line as if the session had made it.
+
+Both carry it as HTTP Basic on a `CONNECT`, for different reasons that land in the same place: the
+proxy because every client honouring `HTTPS_PROXY` already parses `http://geli:TOKEN@…`, and the
+relay because **`socat` can send a `CONNECT` and cannot prepend bytes to a stream** — a shell
+dialer that writes the token and then `cat`s was measured to deadlock `ssh-add` in two different
+ways. It keeps other users of the host out, not the guest, which is the intended client.
+→ [`docs/plans/10-paquetes-token-y-lo-que-no-se-puede-comprobar.md`](docs/plans/10-paquetes-token-y-lo-que-no-se-puede-comprobar.md)
 
 **A connection that says who it is talking to is held to it.** `session-bind@openssh.com` is
 accepted and its host signature *verified*; the method OpenSSH really uses is

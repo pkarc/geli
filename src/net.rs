@@ -193,11 +193,15 @@ pub(crate) fn build_egress_entry(proxy_port: Option<u16>, agent_port: Option<u16
 }
 
 /// Proxy variables for the guest. Lowercase forms too: several tools read only those.
-pub(crate) fn build_proxy_env(proxy_port: Option<u16>) -> String {
-    let Some(port) = proxy_port else {
+pub(crate) fn build_proxy_env(proxy: Option<(u16, &str)>) -> String {
+    let Some((port, token)) = proxy else {
         return String::new();
     };
-    let url = format!("http://{}:{}", GUEST_PROXY_HOST, port);
+    // The credentials ride in the URL because that is the one place every client that honours
+    // these variables already looks — npm, pip, git and curl all parse them, and none of them
+    // needs a flag for it.
+    let url =
+        format!("http://{}:{}@{}:{}", crate::guest::AGENT_PROXY_USER, token, GUEST_PROXY_HOST, port);
     [
         format!("export HTTP_PROXY={}", shell_quote(&url)),
         format!("export HTTPS_PROXY={}", shell_quote(&url)),
@@ -233,6 +237,9 @@ pub struct ProxyStats {
 
 pub struct Proxy {
     pub port: u16,
+    /// What a request must carry to be this session's. The guest gets it inside the proxy URL,
+    /// which is the one place every client that honours `HTTPS_PROXY` already looks.
+    pub token: String,
     pub stats: Arc<Mutex<ProxyStats>>,
 }
 
@@ -244,6 +251,8 @@ pub fn start_proxy(allow: Vec<String>, log_path: PathBuf) -> io::Result<Proxy> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let stats = Arc::new(Mutex::new(ProxyStats::default()));
+    let token = session_token()?;
+    let expected = Arc::new(token.clone());
 
     let log = Arc::new(Mutex::new(
         fs::OpenOptions::new().create(true).append(true).open(&log_path)?,
@@ -255,11 +264,145 @@ pub fn start_proxy(allow: Vec<String>, log_path: PathBuf) -> io::Result<Proxy> {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let (allow, log, stats) = (allow.clone(), log.clone(), thread_stats.clone());
-            std::thread::spawn(move || serve(stream, &allow, &log, &stats));
+            let expected = expected.clone();
+            std::thread::spawn(move || serve(stream, &allow, &log, &stats, &expected));
         }
     });
 
-    Ok(Proxy { port, stats })
+    Ok(Proxy { port, token, stats })
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Proving a connection is the session's, which both of geli's localhost listeners need.
+//
+// **A TCP listener on loopback has no permissions.** Every local user of the host can reach this
+// proxy and the ssh agent relay; the real agent socket, by contrast, sits behind a `0700`
+// directory. So each session mints a secret and both listeners ask for it, in the one shape a
+// `socat` address and an `HTTPS_PROXY` URL can both produce without help: HTTP Basic credentials
+// on a CONNECT. → `docs/plans/11-el-orden-dentro-del-arranque.md`
+// ---------------------------------------------------------------------------------------------
+
+/// Enough base64 to read a `.pub` file. A dependency for twenty lines of table lookup is a
+/// dependency to keep updated forever.
+pub(crate) fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a') as u32 + 26,
+            b'0'..=b'9' => (c - b'0') as u32 + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    };
+
+    let body: Vec<u8> = text.bytes().filter(|c| *c != b'=').collect();
+    let mut out = Vec::with_capacity(body.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for c in body {
+        acc = (acc << 6) | value(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// A secret for this session, from the kernel.
+///
+/// No dependency for this: `/dev/urandom` is the source the crates would use, geli is Linux-only
+/// where it matters, and a failure to read it is a failure to start the relay rather than a
+/// quietly weaker token.
+/// How many hex characters of token a connection must present before anything else.
+///
+/// 128 bits of it. What is being guarded is the right to sign as the user, and to reach the
+/// network the session was granted, for as long as it runs. Being generous costs nothing.
+pub(crate) const TOKEN_LEN: usize = 32;
+
+pub(crate) fn session_token() -> io::Result<String> {
+    let mut bytes = [0u8; TOKEN_LEN / 2];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// Whether the token presented matches, without leaking where it stopped matching.
+///
+/// A local attacker timing a loopback socket is a stretch; writing the comparison this way costs
+/// one line and removes the question.
+pub(crate) fn token_matches(presented: &[u8], expected: &str) -> bool {
+    if presented.len() != expected.len() {
+        return false;
+    }
+    presented.iter().zip(expected.as_bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+
+/// Whether a CONNECT carries this session's token.
+///
+/// Pure, and strict about the shape: `Proxy-Authorization: Basic <base64(geli:token)>`. The
+/// decoder is the one already here for `.pub` files — the alphabet is the same, and a second
+/// implementation would be a second thing to get wrong.
+pub(crate) fn authorised(request: &str, expected: &str) -> bool {
+    let want = format!("{}:{}", crate::guest::AGENT_PROXY_USER, expected);
+    request
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim().eq_ignore_ascii_case("proxy-authorization").then(|| value.trim())
+        })
+        .filter_map(|value| base64_decode(value.strip_prefix("Basic ")?.trim()))
+        .any(|decoded| token_matches(&decoded, &want))
+}
+
+/// What `socat`'s `PROXY:` address and an `HTTPS_PROXY` URL both put on the wire.
+///
+/// Here rather than in a test module so the relay's tests and the proxy's tests agree on what a
+/// session's client looks like — two copies would be two chances to test a shape nothing sends.
+#[cfg(test)]
+pub(crate) fn connect_request(token: &str) -> String {
+    let credentials = base64_encode(format!("geli:{}", token).as_bytes());
+    format!(
+        "CONNECT agent:1 HTTP/1.0\r\n\
+         Proxy-Authorization: Basic {}\r\n\
+         \r\n",
+        credentials
+    )
+}
+
+/// Read the relay's answer up to the blank line and no further: one byte past it would eat
+/// the first agent frame, which is exactly the bug this helper exists to avoid repeating.
+#[cfg(test)]
+pub(crate) fn read_established(stream: &mut impl Read) -> String {
+    let mut answer = Vec::new();
+    let mut byte = [0u8; 1];
+    while !answer.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("the relay said nothing");
+        answer.push(byte[0]);
+    }
+    String::from_utf8_lossy(&answer).into_owned()
+}
+
+#[cfg(test)]
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let mut block = [0u8; 3];
+        block[..chunk.len()].copy_from_slice(chunk);
+        let n = u32::from_be_bytes([0, block[0], block[1], block[2]]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i)) as usize & 0x3f] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// Error responses must say `Connection: close`.
@@ -282,7 +425,13 @@ pub(crate) fn note(log: &Mutex<File>, line: &str) {
     }
 }
 
-pub(crate) fn serve(mut client: TcpStream, allow: &[String], log: &Mutex<File>, stats: &Mutex<ProxyStats>) {
+pub(crate) fn serve(
+    mut client: TcpStream,
+    allow: &[String],
+    log: &Mutex<File>,
+    stats: &Mutex<ProxyStats>,
+    expected: &str,
+) {
     // A client that opens a connection and then stalls would otherwise hold a thread for the
     // life of the session. The timeout covers reading the request head only; once the tunnel
     // is established it is cleared, because an idle agent session is legitimately quiet.
@@ -305,7 +454,19 @@ pub(crate) fn serve(mut client: TcpStream, allow: &[String], log: &Mutex<File>, 
         }
     }
 
-    let request = parse_proxy_request(&String::from_utf8_lossy(&head));
+    let head_text = String::from_utf8_lossy(&head);
+
+    // Before the allowlist, and before the counters. **Anything on the host can reach this
+    // port**, and without the token it is an open proxy to everything the session was granted —
+    // and its traffic lands in the `net: N allowed` line as if the session had made it.
+    // Logged, never printed: a loopback port gets knocked on, and a warning per knock is noise.
+    if !authorised(&head_text, expected) {
+        note(log, "rejected a request with no valid proxy credentials");
+        refuse(&mut client, "407 Proxy Authentication Required");
+        return;
+    }
+
+    let request = parse_proxy_request(&head_text);
     let (host, port) = match request {
         ProxyRequest::Connect { host, port } => (host, port),
         ProxyRequest::Unsupported(line) => {
@@ -405,7 +566,7 @@ mod tests {
     // --- egress policy ---
 
     /// The proxy must survive being used more than once. A blocked host is enough to exercise
-    /// accept → parse → refuse without touching the real network.
+    /// accept → authenticate → parse → refuse without touching the real network.
     #[cfg(target_os = "linux")]
     #[test]
     fn proxy_serves_more_than_one_connection() {
@@ -419,13 +580,34 @@ mod tests {
             let mut c = std::net::TcpStream::connect(("127.0.0.1", proxy.port))
                 .unwrap_or_else(|e| panic!("connection {} refused: {}", attempt, e));
             c.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-            c.write_all(b"CONNECT blocked.example:443 HTTP/1.1\r\n\r\n").unwrap();
+            let credentials = connect_request(&proxy.token);
+            let authorization = credentials.lines().nth(1).expect("a credentials header");
+            c.write_all(
+                format!("CONNECT blocked.example:443 HTTP/1.1\r\n{}\r\n\r\n", authorization)
+                    .as_bytes(),
+            )
+            .unwrap();
 
             let mut buf = [0u8; 64];
             let n = c.read(&mut buf).unwrap_or(0);
             let reply = String::from_utf8_lossy(&buf[..n]).to_string();
             assert!(reply.contains("403"), "connection {} got {:?}", attempt, reply);
         }
+
+        // **Anything on the host can reach this port.** Without the token it would be an open
+        // proxy to everything the session was granted, and its traffic would land in the
+        // `net: N allowed` line as if the session had made it.
+        let mut stranger = std::net::TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
+        stranger.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        stranger.write_all(b"CONNECT allowed.example:443 HTTP/1.1\r\n\r\n").unwrap();
+        let mut buf = [0u8; 64];
+        let n = stranger.read(&mut buf).unwrap_or(0);
+        let reply = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(reply.contains("407"), "a stranger was proxied: {:?}", reply);
+
+        // And it is not counted: the summary is about what the session did.
+        let stats = proxy.stats.lock().unwrap();
+        assert_eq!((stats.allowed, stats.blocked), (0, 3));
 
         let _ = std::fs::remove_file(&log);
     }
@@ -497,7 +679,7 @@ mod tests {
     #[test]
     fn proxy_env_points_at_the_host_gateway() {
         assert_eq!(build_proxy_env(None), "");
-        let env = build_proxy_env(Some(45678));
+        let env = build_proxy_env(Some((45678, "cafed00d")));
         for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY"] {
             assert!(env.contains(key), "{} missing: some tools read only one form", key);
         }
@@ -608,5 +790,45 @@ mod tests {
         ]);
         assert_eq!(extended.len(), base.len() + 1, "case-folded duplicate or blank crept in");
         assert!(extended.contains(&"extra.example".to_string()));
+    }
+    /// The handshake the guest's `socat` performs, and the one thing it must prove.
+    #[test]
+    fn only_a_connect_carrying_the_session_token_is_let_through() {
+        let token = "7103a050414fe2ad2f563a761636a21f";
+        assert!(authorised(&connect_request(token), token));
+        assert!(!authorised(&connect_request("another session"), token));
+
+        // The header is the only thing that counts: no header, wrong scheme, or the token in the
+        // part of the request anyone can write, are all nothing.
+        assert!(!authorised("CONNECT agent:1 HTTP/1.0\r\n\r\n", token));
+        assert!(!authorised(&format!("CONNECT {} HTTP/1.0\r\n\r\n", token), token));
+        assert!(!authorised(
+            &format!("CONNECT agent:1 HTTP/1.0\r\nProxy-Authorization: Bearer {}\r\n\r\n", token),
+            token
+        ));
+
+        // Header names are case-insensitive on the wire, and socat's casing is not a contract.
+        let shouted = connect_request(token).replace("Proxy-Authorization", "PROXY-AUTHORIZATION");
+        assert!(authorised(&shouted, token));
+    }
+
+    /// The comparison that decides whether a connection is the guest's.
+    #[test]
+    fn a_token_matches_only_itself() {
+        assert!(token_matches(b"cafed00d", "cafed00d"));
+        assert!(!token_matches(b"cafed00e", "cafed00d"));
+        assert!(!token_matches(b"cafed00", "cafed00d"), "a prefix is not a match");
+        assert!(!token_matches(b"cafed00dd", "cafed00d"), "nor is a superstring");
+        assert!(!token_matches(b"", "cafed00d"));
+    }
+
+    /// Two sessions must not share a secret, and the secret must be the length it claims.
+    #[test]
+    fn each_session_gets_its_own_token() {
+        let one = session_token().expect("the kernel has randomness");
+        let two = session_token().expect("the kernel has randomness");
+        assert_eq!(one.len(), TOKEN_LEN);
+        assert_ne!(one, two);
+        assert!(one.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

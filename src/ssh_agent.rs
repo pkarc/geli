@@ -32,6 +32,9 @@ use signature::Verifier;
 use ssh_encoding::Decode;
 use ssh_key::known_hosts::{Entry, HostPatterns};
 use ssh_key::public::KeyData;
+use crate::net::{authorised, base64_decode, session_token};
+#[cfg(test)]
+use crate::net::{connect_request, read_established};
 use ssh_key::{Algorithm, HashAlg, Signature};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -407,34 +410,6 @@ pub(crate) fn public_key_blob(line: &str) -> Option<Vec<u8>> {
     base64_decode(line.split_whitespace().nth(1)?)
 }
 
-/// Enough base64 to read a `.pub` file. A dependency for twenty lines of table lookup is a
-/// dependency to keep updated forever.
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    let value = |c: u8| -> Option<u32> {
-        Some(match c {
-            b'A'..=b'Z' => (c - b'A') as u32,
-            b'a'..=b'z' => (c - b'a') as u32 + 26,
-            b'0'..=b'9' => (c - b'0') as u32 + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        })
-    };
-
-    let body: Vec<u8> = text.bytes().filter(|c| *c != b'=').collect();
-    let mut out = Vec::with_capacity(body.len() * 3 / 4);
-    let mut acc: u32 = 0;
-    let mut bits = 0;
-    for c in body {
-        acc = (acc << 6) | value(c)?;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
-}
 
 /// A length-prefixed agent frame, or `None` at a clean end of stream.
 fn read_frame(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
@@ -491,12 +466,6 @@ impl Signings {
     }
 }
 
-/// How many hex characters of token a connection must present before anything else.
-///
-/// 128 bits of it. The thing being guarded is the right to sign as the user for as long as the
-/// session lasts, and the cost of being generous here is nothing.
-const TOKEN_LEN: usize = 32;
-
 /// The most a CONNECT may be before it is something other than a CONNECT.
 const MAX_CONNECT: usize = 4096;
 
@@ -505,28 +474,6 @@ const MAX_CONNECT: usize = 4096;
 /// Without this, anything that connects and says nothing holds a thread for the length of the
 /// session — and the whole point of the token is that anything on the host can connect.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// A secret for this session, from the kernel.
-///
-/// No dependency for this: `/dev/urandom` is the source the crates would use, geli is Linux-only
-/// where it matters, and a failure to read it is a failure to start the relay rather than a
-/// quietly weaker token.
-fn session_token() -> io::Result<String> {
-    let mut bytes = [0u8; TOKEN_LEN / 2];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
-}
-
-/// Whether the token presented matches, without leaking where it stopped matching.
-///
-/// A local attacker timing a loopback socket is a stretch; writing the comparison this way costs
-/// one line and removes the question.
-fn token_matches(presented: &[u8], expected: &str) -> bool {
-    if presented.len() != expected.len() {
-        return false;
-    }
-    presented.iter().zip(expected.as_bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
-}
 
 /// The relay, as the session sees it.
 pub(crate) struct AgentRelay {
@@ -580,23 +527,6 @@ pub(crate) fn start_agent_relay(auth_sock: &Path, granted: Granted) -> io::Resul
     });
 
     Ok(AgentRelay { port, token, signings })
-}
-
-/// Whether a CONNECT carries this session's token.
-///
-/// Pure, and strict about the shape: `Proxy-Authorization: Basic <base64(geli:token)>`. The
-/// decoder is the one already here for `.pub` files — the alphabet is the same, and a second
-/// implementation would be a second thing to get wrong.
-fn authorised(request: &str, expected: &str) -> bool {
-    let want = format!("{}:{}", crate::guest::AGENT_PROXY_USER, expected);
-    request
-        .lines()
-        .filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.trim().eq_ignore_ascii_case("proxy-authorization").then(|| value.trim())
-        })
-        .filter_map(|value| base64_decode(value.strip_prefix("Basic ")?.trim()))
-        .any(|decoded| token_matches(&decoded, &want))
 }
 
 /// Read the CONNECT a connection opens with, before a single byte reaches the host's agent.
@@ -1204,88 +1134,6 @@ dbgUoJREdxnvrqTTobfwAAAAEmdlbGkgdGVzdCBob3N0IGtleQECAw==
             "the revocation went unsaid: {}",
             render_signings(&signings, &marked)
         );
-    }
-
-    /// What `socat`'s `PROXY:` address puts on the wire, as the relay will see it.
-    fn connect_request(token: &str) -> String {
-        let credentials = base64_encode(format!("geli:{}", token).as_bytes());
-        format!(
-            "CONNECT agent:1 HTTP/1.0\r\n\
-             Proxy-Authorization: Basic {}\r\n\
-             \r\n",
-            credentials
-        )
-    }
-
-    /// Read the relay's answer up to the blank line and no further: one byte past it would eat
-    /// the first agent frame, which is exactly the bug this helper exists to avoid repeating.
-    fn read_established(stream: &mut impl Read) -> String {
-        let mut answer = Vec::new();
-        let mut byte = [0u8; 1];
-        while !answer.ends_with(b"\r\n\r\n") {
-            stream.read_exact(&mut byte).expect("the relay said nothing");
-            answer.push(byte[0]);
-        }
-        String::from_utf8_lossy(&answer).into_owned()
-    }
-
-    fn base64_encode(bytes: &[u8]) -> String {
-        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::new();
-        for chunk in bytes.chunks(3) {
-            let mut block = [0u8; 3];
-            block[..chunk.len()].copy_from_slice(chunk);
-            let n = u32::from_be_bytes([0, block[0], block[1], block[2]]);
-            for i in 0..4 {
-                if i <= chunk.len() {
-                    out.push(ALPHABET[(n >> (18 - 6 * i)) as usize & 0x3f] as char);
-                } else {
-                    out.push('=');
-                }
-            }
-        }
-        out
-    }
-
-    /// The handshake the guest's `socat` performs, and the one thing it must prove.
-    #[test]
-    fn only_a_connect_carrying_the_session_token_is_let_through() {
-        let token = "7103a050414fe2ad2f563a761636a21f";
-        assert!(authorised(&connect_request(token), token));
-        assert!(!authorised(&connect_request("another session"), token));
-
-        // The header is the only thing that counts: no header, wrong scheme, or the token in the
-        // part of the request anyone can write, are all nothing.
-        assert!(!authorised("CONNECT agent:1 HTTP/1.0\r\n\r\n", token));
-        assert!(!authorised(&format!("CONNECT {} HTTP/1.0\r\n\r\n", token), token));
-        assert!(!authorised(
-            &format!("CONNECT agent:1 HTTP/1.0\r\nProxy-Authorization: Bearer {}\r\n\r\n", token),
-            token
-        ));
-
-        // Header names are case-insensitive on the wire, and socat's casing is not a contract.
-        let shouted = connect_request(token).replace("Proxy-Authorization", "PROXY-AUTHORIZATION");
-        assert!(authorised(&shouted, token));
-    }
-
-    /// The comparison that decides whether a connection is the guest's.
-    #[test]
-    fn a_token_matches_only_itself() {
-        assert!(token_matches(b"cafed00d", "cafed00d"));
-        assert!(!token_matches(b"cafed00e", "cafed00d"));
-        assert!(!token_matches(b"cafed00", "cafed00d"), "a prefix is not a match");
-        assert!(!token_matches(b"cafed00dd", "cafed00d"), "nor is a superstring");
-        assert!(!token_matches(b"", "cafed00d"));
-    }
-
-    /// Two sessions must not share a secret, and the secret must be the length it claims.
-    #[test]
-    fn each_session_gets_its_own_token() {
-        let one = session_token().expect("the kernel has randomness");
-        let two = session_token().expect("the kernel has randomness");
-        assert_eq!(one.len(), TOKEN_LEN);
-        assert_ne!(one, two);
-        assert!(one.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     /// **The listener is TCP on loopback, which has no permissions.** Anything running on the

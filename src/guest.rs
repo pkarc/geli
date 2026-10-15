@@ -1411,7 +1411,7 @@ mod tests {
         let env = format!(
             "{}\n{}\n{}",
             build_env_exports(&[("ANTHROPIC_API_KEY", "sk-fixed".to_string())]),
-            build_proxy_env(Some(45678)),
+            build_proxy_env(Some((45678, "cafed00d"))),
             build_terminal_setup("xterm-256color", "truecolor", Some((46, 190)))
         );
         let seed = vec![(".claude.json".to_string(), build_claude_config(&plan.folders, "sk-ant-fixed-0123456789"))];
