@@ -94,9 +94,14 @@ Workspace names are sanitized wherever they come from, and `.geli.json` is read 
 `LocalConfig` where a malformed file is an error.
 → [`docs/why/workspaces-and-session.md`](docs/why/workspaces-and-session.md)
 
-**`packages` is the one thing in that file that acts, so it is gated twice.** A name must be a
-package and not a *place* or an *option* — `npm install -g ./evil` runs that directory's install
-script as root, before the lockdown, and no shell quoting stops a path. The rules are per manager,
+**`packages` is the one thing in that file that acts, so it is gated twice and placed carefully.**
+A name must be a package and not a *place*, an *option* or an *archive* — `npm install -g ./evil`
+runs that directory's install script, before the lockdown, and no shell quoting stops a path.
+**Only apk installs as root** (Alpine signs it, and no recipe or `--allow-untrusted` gets past the
+validator); npm and pip run as `sandbox` into `/home/sandbox/.local`, which is on the exported
+`PATH`. **And they run before the workspace is mounted and before the credentials are installed**,
+so an install script has no project to read and no token to take — the order in
+`build_mount_script` is the security model, and a test asserts it as an order. The rules are per manager,
 because only npm needs `@scope/name`. And **the list lives in the project while the approval lives
 in the registry**: a changed list is asked about once, and `approved_packages` is keyed by
 directory so a project cannot approve itself. Not a terminal means not installing.

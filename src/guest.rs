@@ -226,6 +226,12 @@ pub(crate) fn recipe_hash(recipe: &str) -> String {
 /// Where the guest's ssh clients look for the agent.
 pub(crate) const AGENT_SOCKET: &str = "/tmp/geli-agent.sock";
 
+/// Where a session's own packages go, since npm and pip no longer install as root.
+///
+/// In the agent's home rather than `/usr/local`, which is what `npm -g` would pick: an unprivileged
+/// install cannot write there, and the point of the unprivileged install is that it cannot.
+pub(crate) const USER_PREFIX: &str = "/home/sandbox/.local";
+
 /// Where the user's credentials wait until the risky part of the boot is over.
 ///
 /// **No `owner:` on what cloud-init writes here, which is the point.** `write_files` runs before
@@ -409,10 +415,19 @@ pub(crate) fn build_mount_script(
 ///
 /// Three things here are not cosmetic:
 ///
-/// - **Each install runs as root but points at the sandbox user's cache.** The npm and pip caches
-///   arrive on 9p under `/home/sandbox/.cache`, and root's own cache is elsewhere — without the
-///   explicit flags every boot would re-download what is already on the host's disk, which is the
-///   whole reason those shares exist.
+/// - **npm and pip run as `sandbox`; only apk runs as root.** What apk installs is signed by
+///   Alpine and the validator will not let a recipe or `--allow-untrusted` through, so root buys
+///   something there. npm and pip install whatever their author published, and an install script
+///   with root runs *before the lockdown exists* — it could flush the ruleset, widen the sudoers,
+///   or simply undo the thing the status block is about to claim. Dropped to the agent's own
+///   user, the worst it can do is what the agent can already do. It does not protect the
+///   credentials: those are not in the home yet, which is `build_mount_script`'s doing.
+/// - **Each install points at the sandbox user's cache.** The npm and pip caches arrive on 9p
+///   under `/home/sandbox/.cache` — without the explicit flags every boot would re-download what
+///   is already on the host's disk, which is the whole reason those shares exist.
+/// - **`su`, not `doas` or `runuser`.** Measured in the guest: `runuser` does not exist, `doas` is
+///   there because the base recipe installs it, and `su` is busybox. Both set `HOME` correctly,
+///   so the one that cannot go missing wins.
 /// - **A failure warns and continues.** The contrast is with the egress ruleset, which powers the
 ///   VM off: there the status block has already claimed the session is restricted and running on
 ///   would make that a lie. Here nothing has been claimed — the agent is short a tool and will
@@ -429,32 +444,45 @@ pub(crate) fn build_package_setup(packages: &Packages) -> String {
     let mut script = String::from("\n");
     script.push_str(GUEST_RETRY.trim_end());
     script.push('\n');
+    script.push_str(&format!(
+        "install -d -o sandbox -g sandbox {USER_PREFIX} {USER_PREFIX}/bin\n"
+    ));
 
     // apk first: the other two are only as reliable as the toolchain underneath them, and a
     // project that declares a build dependency expects it present before npm reaches for it.
-    for (label, command, names) in [
-        ("apk", "apk add --no-progress", &packages.apk),
+    for (label, command, names, as_root) in [
+        ("apk", "apk add --no-progress".to_string(), &packages.apk, true),
         (
             "npm",
-            "npm install -g --cache /home/sandbox/.cache/npm --prefer-offline",
+            format!(
+                "npm install -g --prefix {USER_PREFIX} \
+                 --cache /home/sandbox/.cache/npm --prefer-offline"
+            ),
             &packages.npm,
+            false,
         ),
         (
             "pip",
             // Alpine marks its python externally managed, so a bare `pip install` refuses.
-            "pip install --break-system-packages --cache-dir /home/sandbox/.cache/pip",
+            "pip install --user --break-system-packages --cache-dir /home/sandbox/.cache/pip"
+                .to_string(),
             &packages.pip,
+            false,
         ),
     ] {
         if names.is_empty() {
             continue;
         }
         let quoted: Vec<String> = names.iter().map(|n| shell_quote(n)).collect();
+        // `retry` stays outside: it is a function of *this* shell, and the inner one would not
+        // have it. The names keep the quotes `shell_quote` gave them — they survive the double
+        // quotes around the command and are read by the inner shell, and no name the validator
+        // allows holds a `$` for those quotes to expose.
+        let line = format!("{} {}", command, quoted.join(" "));
+        let run = if as_root { line } else { format!("su sandbox -s /bin/sh -c \"{}\"", line) };
         script.push_str(&format!(
-            "retry {} {} || echo \"geli: {} install failed; the session continues without it\"\n",
-            command,
-            quoted.join(" "),
-            label
+            "retry {} || echo \"geli: {} install failed; the session continues without it\"\n",
+            run, label
         ));
     }
 
@@ -1011,6 +1039,53 @@ mod tests {
         let out = indent_block("a\n\nb", 4);
         assert_eq!(out, "    a\n\n    b");
         assert!(!out.ends_with('\n'), "trailing newline breaks block scalars");
+    }
+
+    /// **Only apk gets root.** What apk installs is signed by Alpine and the validator will not
+    /// let a repository or `--allow-untrusted` through. npm and pip install whatever their author
+    /// published, and an install script with root runs before the lockdown exists — it could
+    /// flush the ruleset the status block is about to claim.
+    #[test]
+    fn only_apk_installs_as_root() {
+        let script = build_package_setup(&Packages {
+            apk: vec!["ripgrep".into()],
+            npm: vec!["prettier".into()],
+            pip: vec!["ruff".into()],
+        });
+
+        let line = |needle: &str| {
+            script.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {}", needle))
+        };
+
+        assert!(!line("apk add").contains("su sandbox"), "apk needs root and says so");
+        assert!(line("npm install").contains("su sandbox -s /bin/sh"));
+        assert!(line("pip install").contains("su sandbox -s /bin/sh"));
+
+        // An unprivileged install cannot write to /usr/local, which is where `npm -g` would go.
+        assert!(line("npm install").contains(&format!("--prefix {}", USER_PREFIX)));
+        assert!(line("pip install").contains("--user"));
+
+        // The caches are the reason those 9p shares exist; dropping privileges must not lose them.
+        assert!(line("npm install").contains("/home/sandbox/.cache/npm"));
+        assert!(line("pip install").contains("/home/sandbox/.cache/pip"));
+
+        // `retry` is a function of the outer shell, so it stays outside the `su`.
+        assert!(line("npm install").trim_start().starts_with("retry su sandbox"));
+    }
+
+    /// Installing somewhere the agent cannot find is the same as not installing.
+    #[test]
+    fn what_a_session_installs_is_on_the_agents_path() {
+        let env = build_env_exports(&[("ANTHROPIC_API_KEY", "sk-test".to_string())]);
+        let with_path = format!("{}\nexport PATH={}/bin:$PATH", env, USER_PREFIX);
+        assert!(with_path.contains("/home/sandbox/.local/bin"));
+
+        // And the directory exists, owned by the user who installs into it.
+        let script = build_package_setup(&Packages {
+            npm: vec!["prettier".into()],
+            ..Default::default()
+        });
+        assert!(script.contains(&format!("install -d -o sandbox -g sandbox {}", USER_PREFIX)));
     }
 
     /// **The order of the boot is the security model, so it is asserted as an order.**

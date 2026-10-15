@@ -733,7 +733,10 @@ fn approved_packages(workspace: &str, dir: &Path, declared: &Packages) -> io::Re
     for (manager, name) in declared.listed() {
         eprintln!("    {} {}", manager, name);
     }
-    eprintln!("    They install as root, before the sandbox loses its network.");
+    // Accurate about who installs them, because that is the thing being consented to: apk is
+    // root and Alpine-signed, npm and pip run as the agent's own user.
+    eprintln!("    apk installs as root; npm and pip install as the agent's user.");
+    eprintln!("    All of them run before the sandbox loses its network.");
 
     if !io::stdin().is_terminal() {
         eprintln!("geli · not a terminal, so they are skipped. Run geli here once to approve.");
@@ -1638,8 +1641,8 @@ fn execute_sandbox(
              \x20   A name may hold letters, digits and - _ . + @ = — and must be a package: not\n\
              \x20   a place (no leading . / or ~, no path; npm may use one @scope/name slash),\n\
              \x20   and not an option (nothing starting with -).\n\
-             \x20   These are installed as root before the sandbox loses its network, so a local\n\
-             \x20   directory here would run its install script with both.",
+             \x20   These run their own install scripts while the sandbox still has a network,\n\
+             \x20   so a local directory here would be code geli fetched and ran for you.",
             LOCAL_CONFIG_FILE,
             cur.display(),
             rejected.join("\n      ")
@@ -1754,6 +1757,12 @@ fn execute_sandbox(
         ("ANTHROPIC_API_KEY", anthropic_key),
         ("OPENAI_API_KEY", openai_key),
     ]);
+    // Where npm and pip put a session's packages, now that neither installs as root. Unconditional
+    // because the agent may install something itself mid-session, and a tool that is on disk but
+    // not on PATH is indistinguishable from one that failed to install.
+    env_exports.push('\n');
+    env_exports.push_str(&format!("export PATH={}/bin:$PATH", USER_PREFIX));
+
     let proxy_env = build_proxy_env(proxy.as_ref().map(|(p, _)| p.port));
     if !proxy_env.is_empty() {
         env_exports.push('\n');
