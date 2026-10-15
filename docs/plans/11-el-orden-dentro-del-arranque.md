@@ -1,4 +1,7 @@
-# Plan — el orden dentro del arranque, y los dos puertos que quedan (2026-10-15)
+# Hecho — el orden dentro del arranque, y los dos puertos que quedan (2026-10-15)
+
+**Las cuatro fases están implementadas**, y el diseño es el de abajo. Lo que cambió al medir está
+al final.
 
 Cuatro fases que salen de revisar `10` con alguien de fuera. Ninguna arregla un fallo: arreglan
 *cuándo* pasan cosas que ya pasaban, que es donde queda el riesgo cuando lo demás está cerrado.
@@ -125,3 +128,34 @@ barrido deje en paz lo que no es del usuario.
   rechaza». Ese test se escribe el día que exista la política, que es cuando puede fallar.
 - **No añade un manejador de `SIGHUP`.** El barrido de `10` cubrió el caso medido, y un manejador
   no cubriría `SIGKILL` de todas formas.
+
+
+---
+
+## Lo que cambió al construirlo
+
+- **`runuser` no existe en Alpine**, como el plan anticipaba. Se usa `su` y no `doas`: los dos
+  ponen `HOME` bien —medido— y `su` es de busybox, así que no depende de que una receta lo
+  instale.
+- **El texto de la aprobación se quedó mintiendo.** Decía «se instalan como root», y con la fase 2
+  eso solo vale para apk. Ahora dice quién instala cada cosa, que es justo lo que se está
+  consintiendo.
+- **El `PATH` hace falta tanto como el cambio de usuario.** `npm config get prefix` es
+  `/usr/local`, donde un usuario sin privilegios no puede escribir; instalar en
+  `/home/sandbox/.local` sin exportar el `PATH` habría sido instalar en un sitio donde el agente
+  no mira, que se parece demasiado a no instalar.
+- **El proxy de egress aceptó credenciales en la URL a la primera**, incluido el runtime del
+  propio agente: una sesión `--restrict-net claude -p` da `18 allowed, 1 blocked`. Era el riesgo
+  de la fase 3 y no se materializó.
+- **`$XDG_RUNTIME_DIR` no sirve para todo.** Medido en esta máquina: `/tmp` es tmpfs de 16G y
+  `/run/user/1000` tiene 3.2G. El overlay vive bajo la raíz comprobada en `/tmp`, porque crece.
+- **El barrido mira en los dos sitios.** Con la raíz nueva, los restos de versiones anteriores se
+  habrían quedado en `/tmp` para siempre.
+
+## Lo verificado, contra VMs reales
+
+- `claude -p` sigue autenticando: las credenciales llegan al home después de los paquetes.
+- Un paquete npm declarado aparece en `/home/sandbox/.local/bin`, de `sandbox`, y en el `PATH` del
+  agente; uno de apk sigue llegando a `/usr/bin`.
+- `--restrict-net claude -p` funciona a través del proxy autenticado.
+- Una sesión normal arranca con todo colgando de `/tmp/geli-<uid>`, que queda en `0700`.
