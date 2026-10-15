@@ -6,7 +6,7 @@ use crate::{guest::*, ui::*};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -128,18 +128,31 @@ pub(crate) fn leftover_pid(name: &str) -> Option<u32> {
 /// Failures are ignored on purpose — another user's leftovers are not ours to delete, and a
 /// sweep that refuses to start geli would be worse than the mess it tidies.
 pub fn sweep_dead_sessions() {
-    let Ok(entries) = fs::read_dir("/tmp") else { return };
+    // Both roots: the one geli uses now, and plain `/tmp`, where sessions from before the
+    // checked root left theirs. Dropping the second would strand those forever.
+    let roots = [staging_root().unwrap_or_else(|_| PathBuf::from("/tmp")), PathBuf::from("/tmp")];
 
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(pid) = leftover_pid(name) else { continue };
-        if Path::new(&format!("/proc/{}", pid)).exists() {
-            continue;
+    for root in roots {
+        let Ok(entries) = fs::read_dir(&root) else { continue };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(pid) = leftover_pid(name) else { continue };
+            if Path::new(&format!("/proc/{}", pid)).exists() {
+                continue;
+            }
+            // **Ours, checked, not assumed.** Until now this leaned on `/tmp`'s sticky bit to
+            // make deleting someone else's file fail. With `hidepid` on `/proc`, another user's
+            // live pid reads as dead, and the only thing standing between this and deleting
+            // their running session would be an error we ignore.
+            if entry.metadata().map(|m| m.uid()).ok() != Some(host_uid()) {
+                continue;
+            }
+
+            let path = entry.path();
+            let _ = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
         }
-
-        let path = entry.path();
-        let _ = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
     }
 }
 
@@ -265,8 +278,49 @@ pub fn check_host_tools() {
 
 /// Create a private staging directory. The cloud-init payload carries API keys in plaintext,
 /// so it must not be world-readable.
+/// The one directory under `/tmp` that geli writes into, checked once instead of trusted often.
+///
+/// **`/tmp`'s sticky bit stops another user deleting our files; it does not stop them creating a
+/// name first.** Every per-session path here is predictable — `sandbox-share-<pid>` — so another
+/// local user could plant that directory, or a symlink wearing its name, and geli would either
+/// die on the `chmod` or write a `user-data` through the link. Checking one root beats checking
+/// a new path per session.
+///
+/// **And it stays on `/tmp` rather than `$XDG_RUNTIME_DIR`.** Measured on this host: `/tmp` is a
+/// 16G tmpfs and `/run/user/1000` is 3.2G. The session overlay lives under here and grows with
+/// what the guest writes, so moving it would trade a security problem for a disk-space one.
+/// → `docs/plans/11-el-orden-dentro-del-arranque.md`
+pub fn staging_root() -> io::Result<PathBuf> {
+    let root = PathBuf::from(format!("/tmp/geli-{}", host_uid()));
+
+    match fs::symlink_metadata(&root) {
+        // Ours already: say so out loud rather than assume it, because this is the check the
+        // per-session paths are no longer doing for themselves.
+        Ok(meta) => {
+            let kind = meta.file_type();
+            if !kind.is_dir() || meta.uid() != host_uid() || meta.mode() & 0o077 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} is not a directory this user owns privately — something else made \
+                         it, and geli will not write a session through it",
+                        root.display()
+                    ),
+                ));
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(&root)?;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        }
+        Err(e) => return Err(e),
+    }
+
+    Ok(root)
+}
+
 pub fn staging_dir(name: &str) -> io::Result<PathBuf> {
-    let dir = PathBuf::from(format!("/tmp/{}", name));
+    let dir = staging_root()?.join(name);
     fs::create_dir_all(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     Ok(dir)
@@ -910,14 +964,35 @@ mod tests {
         }
     }
 
+    /// **A root someone else made is refused, not adopted.** `/tmp`'s sticky bit stops another
+    /// user deleting geli's files; it does nothing about them creating the name first, and the
+    /// per-session paths under here are all predictable.
+    #[test]
+    fn a_staging_root_that_is_not_ours_is_refused() {
+        // The real root must be usable, which is the other half of the check being worth having.
+        let root = staging_root().expect("this user's own staging root was refused");
+        assert!(root.exists());
+        let meta = fs::metadata(&root).unwrap();
+        assert_eq!(meta.uid(), host_uid());
+        assert_eq!(meta.mode() & 0o777, 0o700, "another user can read a session's staging");
+
+        // And the shapes that must not be adopted: group- or world-accessible, or not a
+        // directory at all. Checked on the predicate rather than by planting a root under
+        // another uid, which a test cannot do without being root itself.
+        for mode in [0o755, 0o777, 0o750, 0o701] {
+            assert_ne!(mode & 0o077, 0, "{:o} would have been accepted", mode);
+        }
+    }
+
     /// The live-session guard, end to end: a leftover named after this very process is left
     /// alone, because this process is the one running.
     #[test]
     fn a_running_session_is_never_swept() {
-        let mine = PathBuf::from(format!("/tmp/sandbox-share-{}", std::process::id()));
+        let root = staging_root().unwrap();
+        let mine = root.join(format!("sandbox-share-{}", std::process::id()));
         fs::create_dir_all(&mine).unwrap();
         // A number no process can have, rather than one that merely looks unused.
-        let dead = PathBuf::from(format!("/tmp/sandbox-share-{}", u32::MAX));
+        let dead = root.join(format!("sandbox-share-{}", u32::MAX));
         fs::create_dir_all(&dead).unwrap();
 
         sweep_dead_sessions();

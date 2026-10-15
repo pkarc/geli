@@ -1661,7 +1661,9 @@ fn execute_sandbox(
     let to_install = approved_packages(ws, cur, packages)?;
 
     let vm_share_dir = staging_dir(&format!("sandbox-share-{}", pid))?;
-    let sandbox_img = PathBuf::from(format!("/tmp/sandbox-session-{}.qcow2", pid));
+    // Under the checked root like everything else: a predictable name in a world-writable
+    // directory is a name someone else can create first, and qemu-img would follow a symlink.
+    let sandbox_img = qemu::staging_root()?.join(format!("sandbox-session-{}.qcow2", pid));
     let scratch = SessionScratch {
         image: sandbox_img.clone(),
         share: vm_share_dir.clone(),
