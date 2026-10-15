@@ -58,6 +58,7 @@ src/main.rs     CLI, the workspace registry, the local config, orchestration
 src/agents.rs   the agents geli knows, parsed from agents/*.toml
 src/guest.rs    what the guest is told to be: cloud-init, recipes, mounts, boot
 src/net.rs      egress policy: the allowlist and the proxy that enforces it
+src/ssh_agent.rs  the agent relay: what the guest may ask the host's key to do
 src/qemu.rs     the Linux driver: images on disk, direct boot, the boot watch
 src/ui.rs       the status block and the loading line
 agents/*.toml   one recipe per agent
@@ -201,6 +202,18 @@ host's agent; adding, removing and locking are refused, and `--ssh-key` rewrites
 answer so only that key is offered. **Refusing and reporting are separate**: an extension request
 is denied silently because `ssh` negotiates one on every connection, and a warning that fires when
 nothing is wrong hides the one that matters.
+
+**A connection that says who it is talking to is held to it.** `session-bind@openssh.com` is
+accepted and its host signature *verified*; the method OpenSSH really uses is
+`publickey-hostbound-v00@openssh.com`, not `publickey`, and it carries the destination inside the
+signed data, so that is preferred over the binding and a disagreement between the two is refused.
+**Verifying proves possession, not identity** — a guest can mint a host key and bind with it; what
+it cannot do is claim a key it does not hold, and host keys are public. So **the report cannot
+hide a destination, only add invented ones**, and a name `known_hosts` recognises is worth more
+than a fingerprint that matches nothing. **A signature that is not an authentication is never tied
+to a connection** — it has none, and it is the only useful thing an agent does under
+`--restrict-net`. **None of this is policy**: where a session signed is reported when it ends,
+never blocked. → [`docs/plans/09-atar-la-firma-a-su-conexion.md`](docs/plans/09-atar-la-firma-a-su-conexion.md)
 
 **`--ssh-copy-key` is the old behaviour under a name that says what it does**, and it warns every
 time. A copied key is readable inside the VM and outlives it.

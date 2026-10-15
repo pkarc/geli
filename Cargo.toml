@@ -12,6 +12,21 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1.6"
 
+# Verifies the host signature inside `session-bind@openssh.com`, so where a session signed toward
+# is a proof rather than the guest's word for it. Also parses `known_hosts`, which is what turns a
+# host key back into a name. The one dependency here that carries a security claim:
+# see docs/plans/09-atar-la-firma-a-su-conexion.md.
+#
+# `crypto` is ed25519, rsa and the three NIST curves — every host key type an OpenSSH server can
+# present today. It is not on by default, and without it a binding signed by a perfectly ordinary
+# ed25519 host key is refused as "unsupported algorithm", which reads like a forgery. DSA is the
+# one left out, and OpenSSH dropped it too.
+ssh-key = { version = "0.6", features = ["crypto"] }
+# Direct dependencies only for their traits — `Decode` to read a wire-format key or signature,
+# `Verifier` to check one. Both are ssh-key's own, at the versions it already uses.
+ssh-encoding = "0.2"
+signature = "2.2"
+
 [dev-dependencies]
 yaml-rust2 = "0.13.0"
 

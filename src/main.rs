@@ -1158,6 +1158,21 @@ fn granted_key(ssh_key: Option<&Path>) -> io::Result<ssh_agent::Granted> {
     }
 }
 
+/// The user's `known_hosts`, for putting a name to a host key a session signed toward.
+///
+/// **Line by line, never all at once.** `KnownHosts::read_file` collects into one `Result`, so a
+/// single entry it cannot parse — a `ssh-dss` line left over from years ago is enough — throws
+/// away every other entry in the file. Measured: a two-line file with one such line yields an
+/// error and zero entries. The failure would be silent and would look like "geli cannot name
+/// anything", so each line is taken on its own and the ones that do not parse are dropped.
+#[cfg(target_os = "linux")]
+fn read_known_hosts(home: &Path) -> Vec<ssh_key::known_hosts::Entry> {
+    let Ok(text) = fs::read_to_string(home.join(".ssh").join("known_hosts")) else {
+        return Vec::new();
+    };
+    ssh_key::KnownHosts::new(&text).flatten().collect()
+}
+
 /// What ssh needs in the guest: `known_hosts`, a generated config, and — only under
 /// `--ssh-copy-key` — the private keys themselves.
 ///
@@ -1690,6 +1705,20 @@ fn execute_sandbox(
                 );
             } else {
                 eprintln!("geli · net: {} allowed, none blocked", stats.allowed);
+            }
+        }
+    }
+
+    // Where the session signed toward. Said at the end rather than as it happens, because the
+    // terminal belongs to the agent until it exits. Nothing was blocked for being there — this
+    // reports, it does not police. → docs/plans/09-atar-la-firma-a-su-conexion.md
+    if let Some(relay) = &agent_relay {
+        if let Ok(signings) = relay.signings.lock() {
+            if !signings.is_empty() {
+                eprintln!(
+                    "geli · ssh: {}",
+                    ssh_agent::render_signings(&signings, &read_known_hosts(&home))
+                );
             }
         }
     }

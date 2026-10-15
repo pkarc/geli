@@ -149,14 +149,33 @@ outright, and the agent still signs commits); `--ssh-key` with a deploy key scop
 repository (the blast radius becomes the repository being worked on); `ssh-add -c` (your agent asks
 before each signature, at the cost of unattended runs).
 
-**The structural fix is not obvious, which is why it is not here.** geli's relay sees every
-`SIGN_REQUEST` and could stop to ask — better than `ssh-add -c`, since it needs no askpass. Two
-things block it. There is no channel to ask on: `ttyS0` is `mon:stdio` with inherited stdio, so the
-terminal belongs to the agent for the length of the session, and writing a prompt there corrupts
-its TUI while reading steals its keystrokes. And even with a channel, **an SSH authentication
-signs the session identifier and a challenge, not the hostname** — geli could say "the sandbox
-wants to sign something" and no more. A prompt that cannot name the destination is one people learn
-to accept by reflex, which is worse than none.
+**The structural fix is not here yet, but one of the two things blocking it is gone.** geli's relay
+sees every `SIGN_REQUEST` and could stop to ask — better than `ssh-add -c`, since it needs no
+askpass. What blocked it was a channel and a name.
+
+The name is solved, and the protocol was carrying it all along. `ssh` opens every forwarded-agent
+connection with `session-bind@openssh.com`, which names the server's host key and proves it with
+that key's signature over the session identifier; the relay used to refuse it, so it was throwing
+away the only thing in the protocol that says who is on the other end. And the method every
+current OpenSSH asks an agent for — `publickey-hostbound-v00@openssh.com`, not `publickey` — puts
+the destination host key *inside the signed data*, where the guest gains nothing by lying, since
+the server it is talking to has to accept what was signed.
+
+**What that check is worth, stated exactly.** Verifying a binding proves whoever sent it holds
+that host key's private half; it does not prove the key belongs to a real server, and a guest can
+mint one and bind with it. What it stops is the cheap attack: claiming a key it does not hold —
+`github.com`'s is public — to dress a session up as something it is not. Put together with the
+hostbound method, the property is that **the report cannot hide a destination, only add invented
+ones**: a signature only spends against the server it names. A name `known_hosts` recognises is
+therefore worth believing; a fingerprint matching nothing may be the guest's own.
+
+None of it is policy: nothing is blocked for *where* it was going.
+→ `docs/plans/09-atar-la-firma-a-su-conexion.md`
+
+What is still missing is the channel. `ttyS0` is `mon:stdio` with inherited stdio, so the terminal
+belongs to the agent for the length of the session: writing a prompt there corrupts its TUI, and
+reading steals its keystrokes. A prompt needs somewhere else to live — an askpass window, or a
+second terminal — and that is a design, not a detail.
 
 So the claim is not "now it is safe". It is:
 
@@ -164,6 +183,14 @@ So the claim is not "now it is safe". It is:
 
 Permanent exposure becomes exposure bounded by the session. `ssh-add -c` is the cheap mitigation —
 it makes the agent ask before each signature — at the cost of any non-interactive use.
+
+**What a session signed is named when it ends**, next to the egress figures and for the same
+reason: a thing that happened is said out loud. A host key becomes a name only if `known_hosts`
+can supply one — written with `HashKnownHosts yes` it cannot be read backwards, and the
+fingerprint is then the honest answer rather than a degraded one. Signatures that are not
+authentications (a commit, a file) are counted apart, because they have no destination by nature;
+they are also the only useful thing an agent does under `--restrict-net`, which is why they are
+never tied to a connection.
 
 ### The flags
 
