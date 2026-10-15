@@ -1,0 +1,20 @@
+# What `cargo audit` is allowed to let past, and why. One entry, with its reasoning, because an
+# ignore list nobody can read is a list that grows.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack", a timing side channel in the `rsa` crate.
+    #
+    # It is reachable only through operations with a *private* key. geli holds no RSA private key
+    # and does one thing with this crate: verify a host's signature over a session identifier,
+    # with that host's public key (`read_binding`, src/ssh_agent.rs). The attack needs the victim
+    # to decrypt or sign, repeatedly, with a key the attacker is probing. Nothing here does.
+    #
+    # It cannot be dropped by narrowing features, either. `ssh-key`'s `crypto` is what lets the
+    # relay verify every host key type a server can present, and `ssh-rsa` is a quarter of the
+    # entries in an ordinary `known_hosts`. Without it those bindings would go unverifiable, and
+    # an unverifiable binding is a signature that cannot be named.
+    #
+    # There is no fixed version. Revisit when `rsa` publishes one.
+    "RUSTSEC-2023-0071",
+]

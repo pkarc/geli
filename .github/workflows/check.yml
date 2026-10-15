@@ -25,6 +25,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin
             target
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
@@ -44,6 +45,19 @@ jobs:
           layer_recipe
 
       - run: cargo clippy --locked --all-targets -- -D warnings
+
+      # Three dependencies became a hundred the day one of them started carrying a security
+      # claim (`ssh-key` verifies the host signature in a session binding). RustSec knows about
+      # those; nobody here is going to read their release notes. What is deliberately ignored,
+      # and why, is in `.cargo/audit.toml` next to the ignore itself — the path matters, a file
+      # at the repository root is read by nothing.
+      #
+      # 0.22 or newer: 0.21 cannot parse an advisory database that has CVSS 4.0 entries in it,
+      # and the database has had them since before this was added.
+      - name: Dependency advisories
+        run: |
+          cargo install cargo-audit --locked --version ^0.22
+          cargo audit
 
       # The downloaded image's name is spelled in two places that have to agree, or `--build-image`
       # looks for a file setup.sh never fetched.
