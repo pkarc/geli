@@ -158,9 +158,14 @@ Todos salieron de revisar lo construido, no de probarlo:
   verificar prueba *posesión* de esa clave privada, y el guest puede fabricarse una clave de host y
   firmar bindings con ella. Lo que sí impide es reclamar una clave que no tiene —y las de host son
   públicas, así que sin la comprobación podría haberse puesto el nombre de github.com encima de
-  cualquier cosa. La propiedad honesta: **el informe no puede ocultar un destino, solo añadir
-  inventados**, porque una firma solo sirve contra el servidor que nombra. Corregido en el código,
-  en `CLAUDE.md` y en `docs/why/`, y fijado con un test que lo dice en su nombre.
+  cualquier cosa. Corregido en el código, en `CLAUDE.md` y en `docs/why/`, y fijado con un test
+  que lo dice en su nombre.
+
+  **Y la formulación que se escribió entonces seguía siendo demasiado fuerte.** Decía «no puede
+  ocultar un destino, solo añadir inventados». La exacta, corregida en `10`: *no puede ocultar una
+  firma, pero una firma puede quedarse sin nombre, y eso queda contado*. `publickey` a secas es
+  obligatorio en el RFC 4252 y vincular es una extensión que el cliente elige mandar, así que
+  ningún servidor puede exigir que la firma llegue nombrada.
 - **El `known_hosts` se perdía entero por una línea.** `KnownHosts::read_file` colecciona en un
   solo `Result`: una línea `ssh-dss` vieja —un tipo que ni siquiera habilitamos— y se van las 128
   buenas. Medido con un fichero de dos líneas: error y cero entradas. Y el fallo era silencioso,

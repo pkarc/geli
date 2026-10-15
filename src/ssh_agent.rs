@@ -32,7 +32,7 @@ use signature::Verifier;
 use ssh_encoding::Decode;
 use ssh_key::known_hosts::{Entry, HostPatterns};
 use ssh_key::public::KeyData;
-use ssh_key::{HashAlg, Signature};
+use ssh_key::{Algorithm, HashAlg, Signature};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -110,7 +110,12 @@ pub(crate) struct Binding {
 
 /// Every binding one connection has sent. Empty for a client that never sent one.
 #[derive(Debug, Default)]
-pub(crate) struct Bindings(Vec<Binding>);
+pub(crate) struct Bindings {
+    proved: Vec<Binding>,
+    /// This connection said who it was talking to and geli could not check the key type. Kept
+    /// apart from "said nothing", because the two are different things to read in a report.
+    beyond_us: bool,
+}
 
 /// A connection binds once. The room above that is for a client doing something reasonable this
 /// code has not seen; past it, the guest is growing a list inside geli's own process, and
@@ -119,40 +124,75 @@ const MAX_BINDINGS: usize = 16;
 
 impl Bindings {
     fn remember(&mut self, binding: Binding) {
-        if !self.0.contains(&binding) {
-            self.0.push(binding);
+        if !self.proved.contains(&binding) {
+            self.proved.push(binding);
         }
     }
 
+    /// Note that this connection bound something geli has no way to check.
+    fn remember_uncheckable(&mut self) {
+        self.beyond_us = true;
+    }
+
     fn is_full(&self) -> bool {
-        self.0.len() >= MAX_BINDINGS
+        self.proved.len() >= MAX_BINDINGS
     }
 
     fn holding(&self, session_id: &[u8]) -> Option<&Binding> {
-        self.0.iter().find(|b| b.session_id == session_id)
+        self.proved.iter().find(|b| b.session_id == session_id)
     }
 
     fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.proved.is_empty()
     }
+}
+
+/// What came of reading a `session-bind@openssh.com` body.
+///
+/// **Three outcomes, not two, and the third is the one that was missing.** A host key signed by a
+/// certificate authority arrives as `ssh-ed25519-cert-v01@openssh.com`, which decodes as
+/// `KeyData::Other` and cannot be verified by anything here. Treating that as a failed check
+/// printed a loud refusal at a perfectly honest connection — any company that signs its host keys
+/// with a CA would see one — and a warning that fires when nothing is wrong hides the one that
+/// matters. That lesson is already written down twice (`Screen::Unsupported`, and
+/// `docs/why/agents-and-credentials.md`); this is the third place it applies.
+enum Bound {
+    /// Signed by a key we can check, and it checks out.
+    Verified(Binding),
+    /// A key type this build cannot verify. Not suspicious, just beyond us: the connection goes
+    /// on unbound, silently, exactly like a client that never sent a binding.
+    Uncheckable,
+    /// Malformed, or a signature that does not match. Nothing honest produces this.
+    Bad,
 }
 
 /// Read a `session-bind@openssh.com` body and check the host's signature over the session id.
 ///
-/// `None` for anything that does not parse or does not verify — the caller turns that into a
-/// refusal. **The verification is the whole point.** Without it the body is a claim by the guest,
-/// and a guest that can claim a host key can put any name it likes in front of the user.
-fn verified_binding(body: &[u8]) -> Option<Binding> {
-    let (host_key, rest) = ssh_string(body)?;
-    let (session_id, rest) = ssh_string(rest)?;
-    let (signature, rest) = ssh_string(rest)?;
-    let (&is_forwarding, _) = rest.split_first()?;
+/// **The verification is the whole point.** Without it the body is a claim by the guest, and a
+/// guest can claim any host key it likes, since host keys are public. What it buys and what it
+/// does not is spelled out on [`Binding`].
+fn read_binding(body: &[u8]) -> Bound {
+    let Some((host_key, rest)) = ssh_string(body) else { return Bound::Bad };
+    let Some((session_id, rest)) = ssh_string(rest) else { return Bound::Bad };
+    let Some((signature, rest)) = ssh_string(rest) else { return Bound::Bad };
+    let Some((&is_forwarding, _)) = rest.split_first() else { return Bound::Bad };
 
-    let key = KeyData::decode(&mut &host_key[..]).ok()?;
-    let signature = Signature::decode(&mut &signature[..]).ok()?;
-    key.verify(session_id, &signature).ok()?;
+    let Ok(key) = KeyData::decode(&mut &host_key[..]) else { return Bound::Bad };
+    let Ok(parsed) = Signature::decode(&mut &signature[..]) else { return Bound::Bad };
 
-    Some(Binding {
+    // Asked before verifying, because `verify` cannot tell the two apart: it says no both to a
+    // forgery and to a key type it has never heard of.
+    if matches!(key.algorithm(), Algorithm::Other(_))
+        || matches!(parsed.algorithm(), Algorithm::Other(_))
+    {
+        return Bound::Uncheckable;
+    }
+
+    if key.verify(session_id, &parsed).is_err() {
+        return Bound::Bad;
+    }
+
+    Bound::Verified(Binding {
         host_key: host_key.to_vec(),
         session_id: session_id.to_vec(),
         is_forwarding: is_forwarding != 0,
@@ -240,6 +280,10 @@ pub(crate) enum Screen {
     /// A binding that checked out. Answered by this relay, not by the host's agent, which has no
     /// use for it: the connection it describes is this one.
     Bind(Binding),
+    /// A binding naming a key type geli cannot verify — a host key signed by a certificate
+    /// authority is the ordinary case. Declined in the same silence as anything unimplemented:
+    /// the connection carries on unbound, and nothing is wrong.
+    Uncheckable,
     /// Refused, and said out loud: the guest asked for something it had no business asking.
     Refuse(&'static str),
     /// Refused in silence: geli does not implement it and the client copes.
@@ -249,7 +293,7 @@ pub(crate) enum Screen {
 /// Decide a single client request without touching the host's agent.
 ///
 /// Pure, so the policy is testable without a running `ssh-agent`, a VM, or a socket. The crypto in
-/// `verified_binding` is part of the decision and stays inside it, for the same reason.
+/// `read_binding` is part of the decision and stays inside it, for the same reason.
 pub(crate) fn screen(payload: &[u8], granted: &Granted, bound: &Bindings) -> Screen {
     let Some((&kind, rest)) = payload.split_first() else {
         return Screen::Refuse("empty request");
@@ -289,9 +333,12 @@ pub(crate) fn screen(payload: &[u8], granted: &Granted, bound: &Bindings) -> Scr
             Some((SESSION_BIND, _)) if bound.is_full() => {
                 Screen::Refuse("connection binding itself over and over")
             }
-            Some((SESSION_BIND, body)) => match verified_binding(body) {
-                Some(binding) => Screen::Bind(binding),
-                None => Screen::Refuse("session binding whose host signature does not check out"),
+            Some((SESSION_BIND, body)) => match read_binding(body) {
+                Bound::Verified(binding) => Screen::Bind(binding),
+                Bound::Uncheckable => Screen::Uncheckable,
+                Bound::Bad => {
+                    Screen::Refuse("session binding whose host signature does not check out")
+                }
             },
             // Every other extension, silently: ssh negotiates what it is perfectly happy to be
             // denied, and a warning that fires when nothing is wrong is one people learn to skip.
@@ -422,6 +469,10 @@ pub(crate) struct Signings {
     pub(crate) toward: Vec<(Vec<u8>, usize)>,
     /// Authentications by a client that bound no connection, so there is nothing to name.
     pub(crate) unbound: usize,
+    /// Authentications on a connection that *did* say where it was going, in a key type geli
+    /// cannot verify. Counted apart from `unbound`: one is the client saying nothing, the other
+    /// is geli not understanding what it said, and only the second is geli's shortcoming.
+    pub(crate) unchecked: usize,
     /// Signatures that are not an authentication: commits, files. No destination by nature.
     pub(crate) local: usize,
 }
@@ -435,7 +486,7 @@ impl Signings {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.toward.is_empty() && self.unbound == 0 && self.local == 0
+        self.toward.is_empty() && self.unbound == 0 && self.unchecked == 0 && self.local == 0
     }
 }
 
@@ -494,6 +545,10 @@ fn serve(
                 // is not on the other end of.
                 write_frame(&mut guest, &[AGENT_SUCCESS])?;
             }
+            Screen::Uncheckable => {
+                bound.remember_uncheckable();
+                write_frame(&mut guest, &[AGENT_FAILURE])?;
+            }
             Screen::Unsupported => write_frame(&mut guest, &[AGENT_FAILURE])?,
             Screen::Refuse(reason) => {
                 eprintln!("[!] ssh agent relay refused a {}", reason);
@@ -534,9 +589,10 @@ fn account(request: &[u8], reply: &[u8], bound: &Bindings, signings: &mut Signin
         // The host key the signature itself names comes first: it is the one the server being
         // talked to has to accept, so it is the one a guest gains nothing by lying about.
         Some(auth) => {
-            let bound = bound.holding(auth.session_id).map(|b| &b.host_key[..]);
-            match auth.host_key.or(bound) {
+            let proved = bound.holding(auth.session_id).map(|b| &b.host_key[..]);
+            match auth.host_key.or(proved) {
                 Some(key) => signings.record(key),
+                None if bound.beyond_us => signings.unchecked += 1,
                 None => signings.unbound += 1,
             }
         }
@@ -555,6 +611,12 @@ pub(crate) fn render_signings(signings: &Signings, known: &[Entry]) -> String {
         .collect();
     if signings.unbound > 0 {
         parts.push(format!("{} unnamed, the client bound no connection", signings.unbound));
+    }
+    if signings.unchecked > 0 {
+        parts.push(format!(
+            "{} unnamed, geli cannot verify that host key type",
+            signings.unchecked
+        ));
     }
     if signings.local > 0 {
         parts.push(format!("{} not an authentication", signings.local));
@@ -637,6 +699,15 @@ dbgUoJREdxnvrqTTobfwAAAAEmdlbGkgdGVzdCBob3N0IGtleQECAw==
         out.extend(string(claimed));
         out.extend_from_slice(&honest[at + real.len()..]);
         out
+    }
+
+    /// A host key in the shape a certificate authority signs: the algorithm name says `-cert-`,
+    /// and no amount of crypto features makes that verifiable here.
+    fn certificate_host_key() -> Vec<u8> {
+        let name = b"ssh-ed25519-cert-v01@openssh.com";
+        let mut blob = string(name);
+        blob.extend(string(&[7u8; 32]));
+        blob
     }
 
     /// A key that is structurally fine and belongs to nobody here: the test key with its material
@@ -921,6 +992,35 @@ dbgUoJREdxnvrqTTobfwAAAAEmdlbGkgdGVzdCBob3N0IGtleQECAw==
             screen(&claimed, &Granted::All, &loose),
             Screen::Refuse("session binding whose host signature does not check out")
         );
+    }
+
+    /// **A host key signed by a CA is the ordinary case, not an attack.** It arrives as
+    /// `ssh-ed25519-cert-v01@openssh.com`, decodes as `KeyData::Other`, and nothing here can
+    /// verify it. Calling that a failed check printed a loud refusal at every honest connection
+    /// to a company that signs its host keys — the exact failure the silent branch exists for.
+    #[test]
+    fn a_host_key_geli_cannot_check_is_declined_in_silence() {
+        let loose = Bindings::default();
+        let certificate = session_bind_claiming(b"session-one", &certificate_host_key());
+
+        assert_eq!(screen(&certificate, &Granted::All, &loose), Screen::Uncheckable);
+
+        // And the connection carries on exactly like one that never bound: the signature is
+        // forwarded, and the report says why it has no name rather than inventing one.
+        let mut bound = Bindings::default();
+        bound.remember_uncheckable();
+        let request = sign_request_over(b"key-a", &signed_authentication(b"session-one", None));
+        assert_eq!(screen(&request, &Granted::All, &bound), Screen::Forward);
+
+        let mut signings = Signings::default();
+        account(&request, &[SIGN_RESPONSE, 0], &bound, &mut signings);
+        assert_eq!((signings.unchecked, signings.unbound), (1, 0));
+        assert!(render_signings(&signings, &[]).contains("cannot verify that host key type"));
+
+        // A client that said nothing is still counted apart: that one is not geli's shortcoming.
+        let mut quiet = Signings::default();
+        account(&request, &[SIGN_RESPONSE, 0], &Bindings::default(), &mut quiet);
+        assert_eq!((quiet.unchecked, quiet.unbound), (0, 1));
     }
 
     /// A connection binds once. Growing a list inside geli's process is not something a guest gets

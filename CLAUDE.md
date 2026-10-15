@@ -217,11 +217,15 @@ accepted and its host signature *verified*; the method OpenSSH really uses is
 signed data, so that is preferred over the binding and a disagreement between the two is refused.
 **Verifying proves possession, not identity** — a guest can mint a host key and bind with it; what
 it cannot do is claim a key it does not hold, and host keys are public. So **the report cannot
-hide a destination, only add invented ones**, and a name `known_hosts` recognises is worth more
-than a fingerprint that matches nothing. **A signature that is not an authentication is never tied
-to a connection** — it has none, and it is the only useful thing an agent does under
-`--restrict-net`. **None of this is policy**: where a session signed is reported when it ends,
-never blocked. → [`docs/plans/09-atar-la-firma-a-su-conexion.md`](docs/plans/09-atar-la-firma-a-su-conexion.md)
+hide a signature, but a signature can go unnamed, and that is counted**: plain `publickey` is
+mandatory in the protocol and binding is not, so a client that chooses neither leaves nothing to
+name. **A key type geli cannot verify is declined in silence, never refused out loud** — a host
+key signed by a CA is the ordinary case, and it is counted apart from a client that bound nothing.
+**A signature that is not an authentication is never tied to a connection** — it has none, and it
+is the only useful thing an agent does under `--restrict-net`. **None of this is policy**: where a
+session signed is reported when it ends, never blocked — and when it does become policy, an
+unbound authentication is refused by default, because the client in this image always binds.
+→ [`docs/plans/09-atar-la-firma-a-su-conexion.md`](docs/plans/09-atar-la-firma-a-su-conexion.md)
 
 **`--ssh-copy-key` is the old behaviour under a name that says what it does**, and it warns every
 time. A copied key is readable inside the VM and outlives it.

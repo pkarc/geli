@@ -164,10 +164,25 @@ the server it is talking to has to accept what was signed.
 **What that check is worth, stated exactly.** Verifying a binding proves whoever sent it holds
 that host key's private half; it does not prove the key belongs to a real server, and a guest can
 mint one and bind with it. What it stops is the cheap attack: claiming a key it does not hold —
-`github.com`'s is public — to dress a session up as something it is not. Put together with the
-hostbound method, the property is that **the report cannot hide a destination, only add invented
-ones**: a signature only spends against the server it names. A name `known_hosts` recognises is
-therefore worth believing; a fingerprint matching nothing may be the guest's own.
+`github.com`'s is public — to dress a session up as something it is not. A name `known_hosts`
+recognises is therefore worth believing; a fingerprint matching nothing may be the guest's own.
+
+And the report's limit, which is narrower than it first looks:
+
+> it cannot hide a signature, but a signature can go unnamed, and that is counted
+
+Plain `publickey` is mandatory in RFC 4252 and `session-bind` is an OpenSSH extension the client
+chooses to send, so **no server can require a signature to arrive named**. A client written to
+avoid both leaves nothing to name and shows up as unnamed. In this image that client does not
+exist — geli picks it, and current OpenSSH always binds — which is why the decision for the day
+this becomes policy is already made: an unbound authentication is refused, with an explicit way
+to allow one. Deciding it later would leave "unbound" as a hole rather than a choice.
+
+Separately, and not the same thing: a host key signed by a certificate authority arrives as
+`ssh-ed25519-cert-v01@openssh.com` and cannot be verified here at all. **That is declined in
+silence**, like any unimplemented extension, and counted apart. Treating it as a failed check
+printed a loud refusal at every honest connection to a CA-signed host — the same mistake, in a
+third place, as warning on `session-bind` itself.
 
 None of it is policy: nothing is blocked for *where* it was going.
 → `docs/plans/09-atar-la-firma-a-su-conexion.md`
