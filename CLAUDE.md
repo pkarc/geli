@@ -148,6 +148,11 @@ print "not yet implemented". A VM per invocation, keyed by host PID to avoid col
 of the session may exit the process.** `main` is a thin wrapper that prints the error and exits;
 everything under it returns `Result`. → [`docs/why/workspaces-and-session.md`](docs/why/workspaces-and-session.md)
 
+**Nor does `Drop` run on a signal, so every invocation starts by sweeping.** `sweep_dead_sessions`
+deletes `/tmp` leftovers whose pid belongs to no running process — and *only* those, because
+several sessions share `/tmp` and a live one must survive it. The sweep comes before a signal
+handler on purpose: it also covers `SIGKILL`, which no handler can, and costs no dependency.
+
 **A session's writes to `HOST_EXECUTED_PATHS` are named when it ends** — `.git/hooks`,
 `.git/config`, `.envrc`, `.vscode/tasks.json` run on the *host*, outside any sandbox. The
 comparison and the line come before `offer_to_persist_packages`, and nothing geli writes itself may

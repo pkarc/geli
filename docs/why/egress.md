@@ -7,6 +7,23 @@ workspace's `~/.config/geli/workspaces/<name>.json` lists under `allow`. **Not t
 A CONNECT proxy runs on a thread inside geli, resolves on the host, and only dials port 443 — a
 proxy that reaches any port on an allowed host is a general tunnel, not a policy.
 
+## Why it is off by default
+
+Because the isolation geli promises is the VM, not the network, and the two should not be
+confused. A session with no egress cannot `npm install`, cannot clone, cannot read documentation,
+cannot talk to the model it *is* — which is most of what an agent is asked to do. Shipping that as
+the default would mean most invocations start by turning it off, and a default everybody disables
+teaches people to disable things.
+
+The bound that always holds is the mount set: an agent sees the directories it was given and
+nothing else, with or without the flag. `--restrict-net` narrows a second, different thing — where
+it can send what it read — and that is worth choosing deliberately, per workspace, with an `allow`
+list that says what the work actually needs.
+
+The honest consequence, which the status block states rather than hides: without the flag, a
+session can post the contents of its workspace anywhere. `net open · unrestricted` is that
+sentence in three words.
+
 ## Do not reach for `restrict=on` + `guestfwd`
 
 Measured on QEMU 8.2.2: a guestfwd forwards exactly one connection and then times out forever, with

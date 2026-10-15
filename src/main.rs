@@ -254,6 +254,14 @@ fn main() {
 fn run() -> io::Result<()> {
     let args = Cli::parse();
 
+    // Every invocation, before anything else — including `--list`, which is often the one people
+    // run when something went wrong. The leftovers being cleared belong to runs that never got
+    // to end: a session killed by SIGHUP or SIGKILL skips `SessionScratch`'s `Drop`, so this is
+    // the only thing that ever collects those. It only touches names whose pid is gone, which is
+    // what keeps it safe while other sessions are running.
+    #[cfg(target_os = "linux")]
+    qemu::sweep_dead_sessions();
+
     if args.list {
         display_active_workspaces()?;
         return Ok(());

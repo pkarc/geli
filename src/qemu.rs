@@ -90,6 +90,59 @@ pub fn lock_holder_alive(path: &Path) -> bool {
     }
 }
 
+/// The leftovers a session can have on disk, as name prefixes under `/tmp`, each followed by the
+/// pid of the geli that owns it.
+///
+/// Everything per-session is pid-keyed so that several sessions can run at once; that is also
+/// what makes them sweepable, because a pid tells you whether anyone still wants the file.
+const SESSION_LEFTOVERS: &[&str] =
+    &["sandbox-session-", "sandbox-share-", "geli-stage-", "geli-out-"];
+
+/// The pid a leftover is named after, if that is what the name is.
+///
+/// Pure, so the thing that decides what gets deleted is testable without creating files to
+/// delete. The pid runs to the end of the name or to the next `-`: the session overlay is
+/// `sandbox-session-<pid>.qcow2` and a build's staging is `geli-stage-<pid>-<instance>`.
+pub(crate) fn leftover_pid(name: &str) -> Option<u32> {
+    let rest = SESSION_LEFTOVERS.iter().find_map(|prefix| name.strip_prefix(prefix))?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let tail = &rest[digits.len()..];
+    // Anything else between the pid and the end is not one of ours: `sandbox-share-12x` is not
+    // a session, and deleting it because it starts the same way would be guessing.
+    if digits.is_empty() || !(tail.is_empty() || tail.starts_with('-') || tail.starts_with('.')) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Delete what sessions whose geli is gone left behind.
+///
+/// **`Drop` is the plan; this is what happens when there was no plan.** `SessionScratch` clears up
+/// on every path that returns, but `SIGHUP` — the terminal closing — and `SIGKILL` do not return
+/// anywhere, and each one leaves a 20 GiB-capable overlay and a share directory in `/tmp`. A
+/// signal handler would cover the first and could never cover the second, so the sweep comes
+/// first and costs no dependency.
+///
+/// **A live session must survive this**, which is the only hard part: several geli processes
+/// share `/tmp`, so nothing is removed unless the pid in its name belongs to no running process.
+/// Failures are ignored on purpose — another user's leftovers are not ours to delete, and a
+/// sweep that refuses to start geli would be worse than the mess it tidies.
+pub fn sweep_dead_sessions() {
+    let Ok(entries) = fs::read_dir("/tmp") else { return };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = leftover_pid(name) else { continue };
+        if Path::new(&format!("/proc/{}", pid)).exists() {
+            continue;
+        }
+
+        let path = entry.path();
+        let _ = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+    }
+}
+
 /// Wait out another geli's build of the same image.
 ///
 /// Returns when the lock is gone — either the build finished, or its holder died and the lock was
@@ -829,5 +882,48 @@ mod tests {
             assert_eq!(mem, "2G", "1G worked but left a trivial task at 57% of the ceiling");
         }
         assert!(mem.ends_with('G') || mem.ends_with('M'), "QEMU needs a unit: {}", mem);
+    }
+
+    /// **The sweep decides what to delete from a name, so the deciding is tested on names.** The
+    /// risk it carries is the opposite of the mess it cleans: a session that is still running
+    /// must never be swept, and several of them share /tmp.
+    #[test]
+    fn only_a_sessions_own_leftovers_are_recognised() {
+        assert_eq!(leftover_pid("sandbox-session-4242.qcow2"), Some(4242));
+        assert_eq!(leftover_pid("sandbox-share-4242"), Some(4242));
+        assert_eq!(leftover_pid("geli-stage-4242-claude"), Some(4242));
+        assert_eq!(leftover_pid("geli-out-4242-base"), Some(4242));
+
+        // Not ours, or not a pid. Each of these is something in /tmp that merely starts the same
+        // way, and deleting it would be guessing with someone else's files.
+        for other in [
+            "sandbox-share",
+            "sandbox-share-",
+            "sandbox-share-12x",
+            "sandbox-sessions-1",
+            "geli-base.qcow2",
+            "geli-stage-abc",
+            "systemd-private-1234",
+            "",
+        ] {
+            assert_eq!(leftover_pid(other), None, "{:?} was taken for a session", other);
+        }
+    }
+
+    /// The live-session guard, end to end: a leftover named after this very process is left
+    /// alone, because this process is the one running.
+    #[test]
+    fn a_running_session_is_never_swept() {
+        let mine = PathBuf::from(format!("/tmp/sandbox-share-{}", std::process::id()));
+        fs::create_dir_all(&mine).unwrap();
+        // A number no process can have, rather than one that merely looks unused.
+        let dead = PathBuf::from(format!("/tmp/sandbox-share-{}", u32::MAX));
+        fs::create_dir_all(&dead).unwrap();
+
+        sweep_dead_sessions();
+
+        assert!(mine.exists(), "the sweep deleted a running session's share directory");
+        assert!(!dead.exists(), "a leftover with no process was left behind");
+        let _ = fs::remove_dir_all(&mine);
     }
 }
