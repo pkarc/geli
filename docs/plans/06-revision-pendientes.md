@@ -78,6 +78,7 @@ una función pura, así que se prueba sin VM.
 
 - CLAUDE.md es excelente como historia, pero se carga entero en cada sesión. La narrativa de cómo
   se llegó a cada decisión puede vivir en `docs/` y dejar en CLAUDE.md la regla y un enlace.
-  **Sin hacer, a propósito**: es una decisión sobre cómo se documenta el proyecto, no un pendiente
-  de código, y mezclarla con las seis fases la habría enterrado.
+  **Hecho después, por separado** (`3f0f89e`): quedaba fuera de las seis fases a propósito —es una
+  decisión sobre cómo se documenta el proyecto, no un pendiente de código, y mezclarla con ellas la
+  habría enterrado. La regla y el enlace viven ahora en CLAUDE.md; el razonamiento, en `docs/why/`.
 - `display_active_workspaces` imprimía «BINBOX», un nombre antiguo. **Hecho.**

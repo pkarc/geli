@@ -248,6 +248,10 @@ se declara no falla: desaparece— así que el commit lleva el conteo antes y de
   fase 3 de raíz —el guest firma y nunca lee la clave— y geli ya tiene la forma: el proxy CONNECT
   es un hilo del host que el guest alcanza en `10.0.2.2:<puerto>`. Falta un relay en el guest que
   presente un socket Unix. Queda para su propio plan.
+  **Hecho en `08-reenviar-agente-ssh.md`** (`fbb8da8`): el relay filtra, `--ssh` reenvía el agente
+  y copiar la clave pasó a llamarse `--ssh-copy-key`.
 - **No toca CLAUDE.md como fichero.** La idea de mover la narrativa a `docs/` y dejar la regla con
   un enlace es buena, pero es una decisión sobre cómo se documenta el proyecto, no un pendiente de
   código, y mezclarla con estas seis fases la enterraría.
+  **Hecho después, por separado** (`3f0f89e`): la regla se quedó en CLAUDE.md y el razonamiento se
+  fue a `docs/why/`.

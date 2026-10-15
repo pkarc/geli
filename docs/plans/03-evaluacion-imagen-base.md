@@ -45,8 +45,10 @@ módulos 9p:
 mount: /workspace/geli-boot: unknown filesystem type '9p'
 ```
 
-Sin 9p no hay workspace, que es la razón de ser de geli. Queda pendiente probar
-`debian-13-generic` (sin el sufijo «cloud»), que usa kernel completo y sí debería traerlos.
+Sin 9p no hay workspace, que es la razón de ser de geli. Quedaba por probar `debian-13-generic`
+(sin el sufijo «cloud»), que usa kernel completo y sí debería traerlos — **sin probar y ya sin
+objeto**: la base adoptada es Alpine, y volver a Debian sería otra evaluación entera, no este
+hueco.
 
 ## Alpine 3.22 — adoptada
 
@@ -104,11 +106,16 @@ Alpine se descartó dos veces por razonamiento antes de medirla. Los tres argume
 —segunda receta, autologin por inittab, musl— cayeron al probarlos. El de la "segunda receta"
 nunca fue real: es una receta en cualquier caso, solo que distinta.
 
-## Pendiente
+## Pendiente — **cerrado**
 
-Sobre la base adoptada:
+Las tres palancas que quedaban sobre la base adoptada están aplicadas:
 
-- El arranque pasa por SeaBIOS → iPXE → SYSLINUX antes de tocar el kernel. Un arranque directo
-  (`-kernel`/`-initrd`) se los salta enteros, y es la palanca mayor que queda.
-- La ROM de arranque por red de iPXE añade tiempo de BIOS y no se usa: `romfile=` la quita.
-- Los 4 GB de RAM asignados están holgados — el invitado usa 476 MB.
+- ~~El arranque pasa por SeaBIOS → iPXE → SYSLINUX antes de tocar el kernel. Un arranque directo
+  (`-kernel`/`-initrd`) se los salta enteros, y es la palanca mayor que queda.~~ **Hecho**: las
+  sesiones arrancan el kernel extraído directamente, y `boot_cmdline` reescribe la línea de
+  órdenes de la propia imagen en vez de inventarse una.
+- ~~La ROM de arranque por red de iPXE añade tiempo de BIOS y no se usa: `romfile=` la quita.~~
+  **Hecho**: `src/qemu.rs` pasa `virtio-net-pci,netdev=net0,romfile=`.
+- ~~Los 4 GB de RAM asignados están holgados — el invitado usa 476 MB.~~ **Hecho**: el techo por
+  defecto es 2 GiB, con `GELI_MEMORY` para subirlo. Y no es una reserva: el RSS máximo sigue al
+  techo, no a la carga.
