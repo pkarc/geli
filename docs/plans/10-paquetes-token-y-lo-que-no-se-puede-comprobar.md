@@ -121,8 +121,8 @@ las conexiones simultáneas y no toca la plomería — las mismas razones por la
 ya tiene esta forma.
 
 **El detalle que casi se nos pasa.** El guest llega al relay con `socat` plano
-(`build_agent_relay`, `src/guest.rs:239`), y `socat` no puede anteponer bytes a la conexión. Hace
-falta un intermediario de tres líneas:
+(`build_agent_relay`, `src/guest.rs:239`), y `socat` no puede anteponer bytes a la conexión. El
+plan proponía un intermediario de tres líneas:
 
 ```sh
 #!/bin/sh
@@ -130,9 +130,8 @@ falta un intermediario de tres líneas:
 { printf '%s' "$GELI_AGENT_TOKEN"; cat; } | socat - TCP:10.0.2.2:PUERTO
 ```
 
-con el `socat UNIX-LISTEN` llamando a eso por `EXEC:`. El camino de vuelta sale por la salida
-estándar del script. **Es la parte a medir, no a razonar**: funciona en el papel, y el papel ya se
-equivocó una vez con el método de autenticación.
+**Es la parte a medir, no a razonar**: funciona en el papel, y el papel ya se equivocó una vez con
+el método de autenticación. Se midió, y no funcionaba — ver abajo.
 
 **Lo que el token defiende y lo que no**, y la nota tiene que decirlo: protege de otros usuarios
 del host. No protege del guest, que es quien lee el token en `/etc/geli/env` — y está bien, porque
@@ -147,6 +146,34 @@ hablar con el agente del host; con el token correcto se comporta igual que hoy. 
 que es el que cuenta: una sesión con `--ssh` sigue autenticando.
 
 ---
+
+### Lo que cambió al construir la fase 3
+
+El intermediario del shell **no funciona**, y costó ocho arranques de VM averiguar por qué. Con el
+`printf` del shell, el token se queda en el búfer del subshell hasta que la conexión se cierra: el
+host lo recibe exactamente al final, medido en 4.99s para un cliente que aguantaba 5s. Con un
+`printf` externo el token sale en 36µs, pero entonces la **petición** que va detrás se queda
+atascada igual, y `ssh-add` se cuelga lo mismo. Los dos fallos se ven idénticos desde dentro, que
+es lo que los hace caros de distinguir: un cliente que no responde.
+
+Lo que lo resuelve es dejar de pelear con el shell y hablarle a `socat` un protocolo que ya sabe
+hablar: **`PROXY:`**, que escribe un `CONNECT` con `Proxy-Authorization` él solo, en un proceso, y
+antes de cualquier dato. El host ya conoce esa conversación porque el proxy de egress es la misma,
+y hasta el decodificador de base64 estaba escrito. El guest vuelve a ser una línea de `socat`, sin
+fichero intermedio:
+
+```
+socat UNIX-LISTEN:/tmp/geli-agent.sock,fork,mode=0600,user=sandbox \
+      PROXY:10.0.2.2:agent:1,proxyport=PUERTO,proxyauth=geli:TOKEN
+```
+
+Dos detalles que el diseño original no tenía y que salieron de medir:
+
+- **La respuesta se lee hasta la línea en blanco, no por longitud.** Contar los bytes del
+  `200 Connection established` se equivocó por uno y se comió el primer frame del agente, que es
+  un fallo que parece del protocolo del agente y no lo es.
+- **El handshake se lee byte a byte.** Un lector con búfer se tragaría los primeros frames en un
+  búfer que esta función descarta al volver.
 
 ## Fase 4 — Auditar las dependencias en CI
 

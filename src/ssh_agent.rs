@@ -38,6 +38,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The guest asks the agent which keys it holds.
 const REQUEST_IDENTITIES: u8 = 11;
@@ -490,11 +491,52 @@ impl Signings {
     }
 }
 
+/// How many hex characters of token a connection must present before anything else.
+///
+/// 128 bits of it. The thing being guarded is the right to sign as the user for as long as the
+/// session lasts, and the cost of being generous here is nothing.
+const TOKEN_LEN: usize = 32;
+
+/// The most a CONNECT may be before it is something other than a CONNECT.
+const MAX_CONNECT: usize = 4096;
+
+/// How long a connection has to present its token.
+///
+/// Without this, anything that connects and says nothing holds a thread for the length of the
+/// session — and the whole point of the token is that anything on the host can connect.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A secret for this session, from the kernel.
+///
+/// No dependency for this: `/dev/urandom` is the source the crates would use, geli is Linux-only
+/// where it matters, and a failure to read it is a failure to start the relay rather than a
+/// quietly weaker token.
+fn session_token() -> io::Result<String> {
+    let mut bytes = [0u8; TOKEN_LEN / 2];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// Whether the token presented matches, without leaking where it stopped matching.
+///
+/// A local attacker timing a loopback socket is a stretch; writing the comparison this way costs
+/// one line and removes the question.
+fn token_matches(presented: &[u8], expected: &str) -> bool {
+    if presented.len() != expected.len() {
+        return false;
+    }
+    presented.iter().zip(expected.as_bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
 /// The relay, as the session sees it.
 pub(crate) struct AgentRelay {
     /// Port on the host's loopback. The guest reaches it at slirp's `10.0.2.2:<port>`, the same
     /// alias the egress proxy uses.
     pub(crate) port: u16,
+    /// What a connection must present first. **The listener is TCP on loopback, which has no
+    /// permissions**: the host's own agent socket sits behind a `0700` directory, so without this
+    /// the relay would widen who can sign as the user from "this uid" to "any local uid".
+    pub(crate) token: String,
     /// Shared with every connection thread, like the proxy's own stats.
     pub(crate) signings: Arc<Mutex<Signings>>,
 }
@@ -507,13 +549,27 @@ pub(crate) fn start_agent_relay(auth_sock: &Path, granted: Granted) -> io::Resul
     let granted = Arc::new(granted);
     let signings = Arc::new(Mutex::new(Signings::default()));
     let shared = signings.clone();
+    let token = session_token()?;
+    let expected = Arc::new(token.clone());
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let (auth_sock, granted) = (auth_sock.clone(), granted.clone());
-            let signings = shared.clone();
+            let (signings, expected) = (shared.clone(), expected.clone());
             std::thread::spawn(move || {
+                let mut stream = stream;
+                                match greeted(&mut stream, &expected) {
+                    Ok(true) => {}
+                    // Said nothing, or said the wrong thing. No answer and no line: on a
+                    // loopback port anything can knock, and a warning per knock is noise that
+                    // buries the refusals that mean something.
+                    Ok(false) => return,
+                    Err(e) => {
+                        eprintln!("[!] ssh agent relay: {}", e);
+                        return;
+                    }
+                }
                 if let Err(e) = serve(stream, &auth_sock, &granted, &signings) {
                     // One failed connection is not a failed session: ssh retries, and a dead
                     // relay thread must not take the agent down with it.
@@ -523,7 +579,56 @@ pub(crate) fn start_agent_relay(auth_sock: &Path, granted: Granted) -> io::Resul
         }
     });
 
-    Ok(AgentRelay { port, signings })
+    Ok(AgentRelay { port, token, signings })
+}
+
+/// Whether a CONNECT carries this session's token.
+///
+/// Pure, and strict about the shape: `Proxy-Authorization: Basic <base64(geli:token)>`. The
+/// decoder is the one already here for `.pub` files — the alphabet is the same, and a second
+/// implementation would be a second thing to get wrong.
+fn authorised(request: &str, expected: &str) -> bool {
+    let want = format!("{}:{}", crate::guest::AGENT_PROXY_USER, expected);
+    request
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim().eq_ignore_ascii_case("proxy-authorization").then(|| value.trim())
+        })
+        .filter_map(|value| base64_decode(value.strip_prefix("Basic ")?.trim()))
+        .any(|decoded| token_matches(&decoded, &want))
+}
+
+/// Read the CONNECT a connection opens with, before a single byte reaches the host's agent.
+///
+/// The timeout is cleared on success: an agent connection is idle for most of a session, and a
+/// deadline that outlived the handshake would cut the guest off mid-task.
+fn greeted(stream: &mut TcpStream, expected: &str) -> io::Result<bool> {
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+
+    // Byte at a time so the agent protocol behind the blank line is left untouched: a buffered
+    // reader would swallow the first frames into a buffer this function then throws away.
+    let mut request = Vec::new();
+    let mut byte = [0u8; 1];
+    while !request.ends_with(b"\r\n\r\n") && !request.ends_with(b"\n\n") {
+        if request.len() >= MAX_CONNECT {
+            return Ok(false);
+        }
+        match stream.read(&mut byte) {
+            Ok(0) => return Ok(false),
+            Ok(_) => request.push(byte[0]),
+            Err(_) => return Ok(false),
+        }
+    }
+
+    if !authorised(&String::from_utf8_lossy(&request), expected) {
+        return Ok(false);
+    }
+
+    stream.write_all(b"HTTP/1.0 200 Connection established\r\n\r\n")?;
+    stream.flush()?;
+    stream.set_read_timeout(None)?;
+    Ok(true)
 }
 
 fn serve(
@@ -1101,6 +1206,122 @@ dbgUoJREdxnvrqTTobfwAAAAEmdlbGkgdGVzdCBob3N0IGtleQECAw==
         );
     }
 
+    /// What `socat`'s `PROXY:` address puts on the wire, as the relay will see it.
+    fn connect_request(token: &str) -> String {
+        let credentials = base64_encode(format!("geli:{}", token).as_bytes());
+        format!(
+            "CONNECT agent:1 HTTP/1.0\r\n\
+             Proxy-Authorization: Basic {}\r\n\
+             \r\n",
+            credentials
+        )
+    }
+
+    /// Read the relay's answer up to the blank line and no further: one byte past it would eat
+    /// the first agent frame, which is exactly the bug this helper exists to avoid repeating.
+    fn read_established(stream: &mut impl Read) -> String {
+        let mut answer = Vec::new();
+        let mut byte = [0u8; 1];
+        while !answer.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).expect("the relay said nothing");
+            answer.push(byte[0]);
+        }
+        String::from_utf8_lossy(&answer).into_owned()
+    }
+
+    fn base64_encode(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let mut block = [0u8; 3];
+            block[..chunk.len()].copy_from_slice(chunk);
+            let n = u32::from_be_bytes([0, block[0], block[1], block[2]]);
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(ALPHABET[(n >> (18 - 6 * i)) as usize & 0x3f] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// The handshake the guest's `socat` performs, and the one thing it must prove.
+    #[test]
+    fn only_a_connect_carrying_the_session_token_is_let_through() {
+        let token = "7103a050414fe2ad2f563a761636a21f";
+        assert!(authorised(&connect_request(token), token));
+        assert!(!authorised(&connect_request("another session"), token));
+
+        // The header is the only thing that counts: no header, wrong scheme, or the token in the
+        // part of the request anyone can write, are all nothing.
+        assert!(!authorised("CONNECT agent:1 HTTP/1.0\r\n\r\n", token));
+        assert!(!authorised(&format!("CONNECT {} HTTP/1.0\r\n\r\n", token), token));
+        assert!(!authorised(
+            &format!("CONNECT agent:1 HTTP/1.0\r\nProxy-Authorization: Bearer {}\r\n\r\n", token),
+            token
+        ));
+
+        // Header names are case-insensitive on the wire, and socat's casing is not a contract.
+        let shouted = connect_request(token).replace("Proxy-Authorization", "PROXY-AUTHORIZATION");
+        assert!(authorised(&shouted, token));
+    }
+
+    /// The comparison that decides whether a connection is the guest's.
+    #[test]
+    fn a_token_matches_only_itself() {
+        assert!(token_matches(b"cafed00d", "cafed00d"));
+        assert!(!token_matches(b"cafed00e", "cafed00d"));
+        assert!(!token_matches(b"cafed00", "cafed00d"), "a prefix is not a match");
+        assert!(!token_matches(b"cafed00dd", "cafed00d"), "nor is a superstring");
+        assert!(!token_matches(b"", "cafed00d"));
+    }
+
+    /// Two sessions must not share a secret, and the secret must be the length it claims.
+    #[test]
+    fn each_session_gets_its_own_token() {
+        let one = session_token().expect("the kernel has randomness");
+        let two = session_token().expect("the kernel has randomness");
+        assert_eq!(one.len(), TOKEN_LEN);
+        assert_ne!(one, two);
+        assert!(one.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// **The listener is TCP on loopback, which has no permissions.** Anything running on the
+    /// host can connect to it; the host's own agent socket cannot be reached that way, because it
+    /// sits behind a `0700` directory. Without this check the relay would hand the right to sign
+    /// as the user to every local uid for as long as a session runs.
+    ///
+    /// Needs a real agent to prove the positive half, so it is `#[ignore]`d with the other one.
+    #[test]
+    #[ignore]
+    fn a_connection_without_the_token_gets_nowhere() {
+        use std::io::ErrorKind;
+        use std::net::TcpStream;
+
+        let sock = std::env::var("SSH_AUTH_SOCK").expect("no agent: run ssh-add first");
+        let relay = start_agent_relay(Path::new(&sock), Granted::All).unwrap();
+
+        // The wrong secret: the connection is dropped without an answer.
+        let mut stranger = TcpStream::connect(("127.0.0.1", relay.port)).unwrap();
+        stranger.write_all(connect_request("not the token").as_bytes()).unwrap();
+        write_frame(&mut stranger, &[REQUEST_IDENTITIES]).unwrap();
+        match read_frame(&mut stranger) {
+            Ok(None) => {}
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
+            other => panic!("a stranger got an answer: {:?}", other),
+        }
+
+        // The session's own token: business as usual, after the 200.
+        let mut guest = TcpStream::connect(("127.0.0.1", relay.port)).unwrap();
+        guest.write_all(connect_request(&relay.token).as_bytes()).unwrap();
+        assert!(read_established(&mut guest).contains("200"));
+        write_frame(&mut guest, &[REQUEST_IDENTITIES]).unwrap();
+        let reply = read_frame(&mut guest).unwrap().expect("no reply");
+        assert_eq!(reply[0], IDENTITIES_ANSWER);
+    }
+
     /// Against the host's real `ssh-agent`, which CI does not have — so it is `#[ignore]`d and
     /// run by hand:
     ///
@@ -1119,6 +1340,8 @@ dbgUoJREdxnvrqTTobfwAAAAEmdlbGkgdGVzdCBob3N0IGtleQECAw==
         let relay = start_agent_relay(Path::new(&sock), Granted::All).unwrap();
 
         let mut client = TcpStream::connect(("127.0.0.1", relay.port)).unwrap();
+        client.write_all(connect_request(&relay.token).as_bytes()).unwrap();
+        read_established(&mut client);
         write_frame(&mut client, &[REQUEST_IDENTITIES]).unwrap();
         let reply = read_frame(&mut client).unwrap().expect("no reply");
         assert_eq!(reply[0], IDENTITIES_ANSWER);

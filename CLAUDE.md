@@ -211,6 +211,14 @@ answer so only that key is offered. **Refusing and reporting are separate**: an 
 is denied silently because `ssh` negotiates one on every connection, and a warning that fires when
 nothing is wrong hides the one that matters.
 
+**The relay listens on TCP loopback, which has no permissions, so it asks for a token first.** The
+host's own agent socket sits behind a `0700` directory; a port does not, and without this every
+local user of the host could sign as you for as long as a session runs. The token rides in a
+`CONNECT` with `Proxy-Authorization`, because **`socat` can send one and cannot prepend bytes to a
+stream** — a shell dialer that writes the token and then `cat`s was measured to deadlock `ssh-add`
+in two different ways. It keeps other users of the host out, not the guest, which is the intended
+client. → [`docs/plans/10-paquetes-token-y-lo-que-no-se-puede-comprobar.md`](docs/plans/10-paquetes-token-y-lo-que-no-se-puede-comprobar.md)
+
 **A connection that says who it is talking to is held to it.** `session-bind@openssh.com` is
 accepted and its host signature *verified*; the method OpenSSH really uses is
 `publickey-hostbound-v00@openssh.com`, not `publickey`, and it carries the destination inside the

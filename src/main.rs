@@ -1666,12 +1666,13 @@ fn execute_sandbox(
         _ => None,
     };
     let agent_port = agent_relay.as_ref().map(|r| r.port);
+    let agent_dial = agent_relay.as_ref().map(|r| (r.port, r.token.as_str()));
 
     let plan = build_mount_script(
         &dirs,
         &cur_canon,
         &build_package_setup(&to_install),
-        &build_agent_relay(agent_port),
+        &build_agent_relay(agent_dial),
         &build_lockdown(proxy_port),
     );
 

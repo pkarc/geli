@@ -226,6 +226,10 @@ pub(crate) fn recipe_hash(recipe: &str) -> String {
 /// Where the guest's ssh clients look for the agent.
 pub(crate) const AGENT_SOCKET: &str = "/tmp/geli-agent.sock";
 
+/// The user half of the CONNECT credentials. Carries nothing: the token is the secret, and this
+/// only exists because `Proxy-Authorization: Basic` is shaped `user:pass`.
+pub(crate) const AGENT_PROXY_USER: &str = "geli";
+
 /// The guest half of the agent relay: a Unix socket that forwards to geli's listener on the host.
 ///
 /// **A relay is needed because 9p cannot carry a Unix socket.** Measured: the guest can `bind()`
@@ -236,18 +240,36 @@ pub(crate) const AGENT_SOCKET: &str = "/tmp/geli-agent.sock";
 ///
 /// Owned by `sandbox`, mode 0600: the agent runs as that user, and nothing else in the guest has
 /// any business asking the host to sign.
-pub(crate) fn build_agent_relay(agent_port: Option<u16>) -> String {
-    let Some(port) = agent_port else {
+///
+/// **The session's token rides in a CONNECT, because `socat` can send one and cannot prepend
+/// bytes.** geli's listener is TCP on the host's loopback, and a TCP listener has no permissions:
+/// every local user of the host can reach it, where the real agent socket sits behind a `0700`
+/// directory. So the relay wants a secret before it will talk.
+///
+/// Getting that secret in front of the stream is the whole design question, and it was measured
+/// the hard way. A shell dialer — `{ printf TOKEN; cat; } | socat - TCP:…` — looks obvious and
+/// does not work: with the shell's builtin `printf` the token sits in the subshell's buffer until
+/// the connection closes, and with an external one the token leaves at once but the *request*
+/// behind it does not. Both failures look identical from the guest: `ssh-add` hangs.
+///
+/// `PROXY:` sidesteps all of it. socat writes `CONNECT` with `Proxy-Authorization` itself, in one
+/// process, before any data — and the host already knows this shape, because the egress proxy is
+/// the same conversation. → `docs/plans/10-paquetes-token-y-lo-que-no-se-puede-comprobar.md`
+pub(crate) fn build_agent_relay(relay: Option<(u16, &str)>) -> String {
+    let Some((port, token)) = relay else {
         return String::new();
     };
     format!(
         "\n# --- ssh agent relay ---\n\
          rm -f {socket}\n\
          setsid socat UNIX-LISTEN:{socket},fork,mode=0600,user=sandbox \\\n\
-         \x20   TCP:{host}:{port} >/dev/null 2>&1 &\n",
+         \x20   PROXY:{host}:agent:1,proxyport={port},proxyauth={user}:{token} \\\n\
+         \x20   >/dev/null 2>&1 &\n",
         socket = AGENT_SOCKET,
         host = crate::net::GUEST_PROXY_HOST,
         port = port,
+        user = AGENT_PROXY_USER,
+        token = token,
     )
 }
 
@@ -959,7 +981,7 @@ mod tests {
             &[PathBuf::from("/home/u/proj")],
             Path::new("/home/u/proj"),
             "",
-            &build_agent_relay(Some(4242)),
+            &build_agent_relay(Some((4242, "cafed00d"))),
             &crate::net::build_lockdown(Some(45678)),
         );
 
@@ -972,7 +994,16 @@ mod tests {
         // Owned by the user the agent runs as, and reachable at the slirp host alias.
         assert!(plan.script.contains("user=sandbox"));
         assert!(plan.script.contains("mode=0600"));
-        assert!(plan.script.contains("TCP:10.0.2.2:4242"));
+        assert!(plan.script.contains("proxyport=4242"));
+
+        // The token goes in the CONNECT socat sends, because socat can send one and cannot
+        // prepend bytes to a stream. It keeps other users of the *host* out of a TCP port that
+        // has no permissions; the guest is the intended client and has the socket already.
+        assert!(
+            plan.script.contains("PROXY:10.0.2.2:agent:1"),
+            "the relay must ask through a CONNECT, not dial the port raw"
+        );
+        assert!(plan.script.contains("proxyauth=geli:cafed00d"), "the CONNECT carries no token");
     }
 
     /// A session without `--ssh` must not have a relay, a socket, or a line about one.
