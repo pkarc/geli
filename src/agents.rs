@@ -394,29 +394,6 @@ mod tests {
         }
     }
 
-    /// Not a real test: writes the agent table out as TOML so the files that replace it are
-    /// byte-faithful to what the Rust version said.
-    #[ignore]
-    #[test]
-    fn dump_agents_as_toml() {
-        for a in agents() {
-            let mut out = String::new();
-            out.push_str(&format!("command = {:?}\n", a.command));
-            out.push_str(&format!("binary = {:?}\n", a.binary));
-            out.push_str(&format!("label = {:?}\n", a.label));
-            out.push_str(&format!(
-                "credentials = [{}]\n",
-                a.credentials.iter().map(|c| format!("{:?}", c)).collect::<Vec<_>>().join(", ")
-            ));
-            out.push_str(&format!(
-                "hosts = [\n{}\n]\n",
-                a.hosts.iter().map(|h| format!("  {:?},", h)).collect::<Vec<_>>().join("\n")
-            ));
-            out.push_str(&format!("install = '''\n{}'''\n", a.install));
-            std::fs::write(format!("agents/{}.toml", a.command), out).unwrap();
-        }
-    }
-
     /// `credentials` means "copied out of the user's home", and the status block says so. A path
     /// that geli synthesises must not be declared there, or the recipe misleads whoever reads it
     /// to audit what leaves their machine.
